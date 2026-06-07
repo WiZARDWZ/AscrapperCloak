@@ -1,0 +1,10 @@
+[
+  {
+    "full_text": "\nwindow.KPSDK={};KPSDK.now=typeof performance!=='undefined'&&performance.now?performance.now.bind(performance):Date.now.bind(Date);KPSDK.start=KPSDK.now();",
+    "id": "text_0"
+  },
+  {
+    "full_text": "\nwindow.KPSDK={};KPSDK.now=typeof performance!=='undefined'&&performance.now?performance.now.bind(performance):Date.now.bind(Date);KPSDK.start=KPSDK.now();",
+    "id": "text_0"
+  }
+]

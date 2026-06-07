@@ -1,0 +1,33 @@
+2026-01-07 01:00:40,032 | INFO | Logging to: rea_debug\run_20260107_010040.log
+2026-01-07 01:00:44,661 | INFO | ================================================================================
+2026-01-07 01:00:44,661 | INFO | [page_1] Loading URL: https://www.realestate.com.au/buy/in-sydney+olympic+park,+nsw+2127/
+2026-01-07 01:00:45,299 | INFO | [console:error] Failed to load resource: the server responded with a status of 404 ()
+2026-01-07 01:00:45,631 | INFO | [page_1] goto status: 404
+2026-01-07 01:00:49,678 | INFO | [console:error] Failed to load resource: the server responded with a status of 429 ()
+2026-01-07 01:00:49,679 | INFO | [console:log] Error
+2026-01-07 01:00:49,679 | INFO | [console:log] Error
+2026-01-07 01:00:49,679 | INFO | [console:log] Error
+2026-01-07 01:00:52,288 | INFO | [console:log] Error
+2026-01-07 01:00:53,495 | INFO | [page_1] Final URL: https://www.realestate.com.au/
+2026-01-07 01:00:53,495 | INFO | [page_1] Title: ''
+2026-01-07 01:00:53,495 | INFO | [page_1] HTML length: 734
+2026-01-07 01:00:53,580 | INFO | [page_1] Saved: rea_debug\page_1.html
+2026-01-07 01:00:53,581 | INFO | [page_1] Saved: rea_debug\page_1.png
+2026-01-07 01:00:53,581 | INFO | [page_1] Saved: rea_debug\page_1.meta.txt
+2026-01-07 01:00:53,581 | WARNING | [page_1] Detected possible error/block/challenge page (red flag matched).
+2026-01-07 01:00:53,581 | INFO | ================================================================================
+2026-01-07 01:00:53,581 | INFO | [page_2] Loading URL: https://www.realestate.com.au/buy/in-sydney+olympic+park,+nsw+2127/list-2
+2026-01-07 01:00:53,979 | INFO | [console:error] Failed to load resource: the server responded with a status of 429 ()
+2026-01-07 01:00:54,589 | INFO | [console:log] Error
+2026-01-07 01:00:54,604 | INFO | [console:log] Error
+2026-01-07 01:00:54,604 | INFO | [console:log] Error
+2026-01-07 01:00:55,102 | INFO | [page_2] goto status: 429
+2026-01-07 01:00:55,164 | INFO | [console:log] Error
+2026-01-07 01:01:01,587 | INFO | [page_2] Final URL: https://www.realestate.com.au/buy/in-sydney+olympic+park,+nsw+2127/list-2
+2026-01-07 01:01:01,587 | INFO | [page_2] Title: ''
+2026-01-07 01:01:01,587 | INFO | [page_2] HTML length: 734
+2026-01-07 01:01:01,622 | INFO | [page_2] Saved: rea_debug\page_2.html
+2026-01-07 01:01:01,622 | INFO | [page_2] Saved: rea_debug\page_2.png
+2026-01-07 01:01:01,622 | INFO | [page_2] Saved: rea_debug\page_2.meta.txt
+2026-01-07 01:01:01,622 | WARNING | [page_2] Detected possible error/block/challenge page (red flag matched).
+2026-01-07 01:01:01,622 | INFO | Network log saved: rea_debug\network_20260107_010040.jsonl

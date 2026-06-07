@@ -1,0 +1,9 @@
+[
+  {
+    "id": "nextdata_page_1",
+    "page_number": 1,
+    "scraped_at": "2026-01-07T00:50:08",
+    "note": "__NEXT_DATA__ found (raw saved)",
+    "raw_next_data_preview": "{\"props\":{\"pageProps\":{}},\"page\":\"/\",\"query\":{},\"buildId\":\"tr9q8beDSvfH3lPdgfZVK\",\"nextExport\":true,\"autoExport\":true,\"isFallback\":false,\"scriptLoader\":[]}"
+  }
+]
