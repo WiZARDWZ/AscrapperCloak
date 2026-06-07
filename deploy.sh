@@ -185,6 +185,8 @@ ensure_env_file() {
   ensure_env_key "BROWSER_BLOCK_GRACE_SECONDS" "30"
   ensure_env_key "BROWSER_BLOCK_POLL_SECONDS" "1.0"
   ensure_env_key "BROWSER_NO_RESULTS_STABLE_SECONDS" "1.0"
+  ensure_env_key "BROWSER_KPSDK_SAME_SESSION_RECHECKS" "2"
+  ensure_env_key "BROWSER_KPSDK_SETTLE_SECONDS" "10"
   ensure_env_key "BROWSER_PAGE_STATE_DEBUG" "0"
   run_as_user "chmod 600 '$ENV_FILE'"
 }

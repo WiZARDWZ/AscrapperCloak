@@ -129,6 +129,43 @@ def _stop_page_loading(driver) -> None:
         pass
 
 
+_KPSDK_RECHECK_BLOCK_STATES = {
+    PageState.BLOCKED_KPSDK,
+    PageState.BLOCKED_HTTP_429,
+    PageState.BLOCKED_ACCESS_DENIED,
+}
+
+
+def _same_session_kpsdk_recheck(driver, url: str, timeout: int | float, min_cards: int, state_result, cards, log):
+    if state_result.state != PageState.BLOCKED_KPSDK:
+        return state_result, cards
+
+    rechecks = max(0, int(getattr(config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2)))
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+
+    for attempt in range(1, rechecks + 1):
+        if settle_seconds:
+            time.sleep(settle_seconds)
+        safe_get(driver, url)
+        state_result, cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=min_cards)
+        log(
+            "Module1 KPSDK same-session recheck attempt={attempt} state={state} cards_found={cards} "
+            "html_length={html_len} body_text_length={body_len}".format(
+                attempt=attempt,
+                state=state_result.state,
+                cards=state_result.cards_count,
+                html_len=state_result.html_length,
+                body_len=state_result.body_text_length,
+            )
+        )
+        if state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}:
+            return state_result, cards
+        if state_result.state not in _KPSDK_RECHECK_BLOCK_STATES:
+            return state_result, cards
+
+    return state_result, cards
+
+
 def _collect_network_debug(driver) -> dict:
     request_meta = {}
     request_bytes = defaultdict(int)
@@ -696,6 +733,15 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                     body_len=state_result.body_text_length,
                 )
             )
+            state_result, cards = _same_session_kpsdk_recheck(
+                driver=driver,
+                url=page_url,
+                timeout=effective_timeout,
+                min_cards=1,
+                state_result=state_result,
+                cards=cards,
+                log=log,
+            )
             if state_result.state == PageState.LISTINGS:
                 break
             if state_result.state == PageState.NO_RESULTS:
@@ -859,6 +905,15 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                         html_len=state_result.html_length,
                         body_len=state_result.body_text_length,
                     )
+                )
+                state_result, cards = _same_session_kpsdk_recheck(
+                    driver=driver,
+                    url=url,
+                    timeout=timeout,
+                    min_cards=1,
+                    state_result=state_result,
+                    cards=cards,
+                    log=log,
                 )
                 if state_result.state == PageState.LISTINGS:
                     break
