@@ -68,6 +68,8 @@ Module1, Module2, and Module3 share a KPSDK same-session recheck helper. A first
 
 Scan trust is explicit across monitoring: `listings` and stable DOM-confirmed `no_results` are trusted, while `blocked_*`, `blank_render`, `render_timeout`, and `unknown` are untrusted. Untrusted scans do not complete baselines, do not represent zero listings, and must not drive missing/removed lifecycle transitions.
 
+Smoke tools now isolate browser profiles and Module2 checkpoints by default. Explicit `--profile-dir` overrides `CHROME_PROFILE_DIR`, `CLOAK_PROFILE_DIR`, `MODULE2_PROFILE_BASE_DIR`, and runtime profile state for the smoke run. Module2 `--max-windows` and pipeline `--module2-max-windows` are test-only limits and do not change production price inference math.
+
 ## Files Changed
 
 - `cloak_browser_helper.py`: new CloakBrowser adapter with Selenium-like project API.

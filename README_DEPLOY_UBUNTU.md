@@ -106,6 +106,8 @@ KPSDK shells are allowed to settle in the same browser session before profile ro
 
 Treat scan trust explicitly: `listings` and DOM-confirmed `no_results` are trusted; `blocked_*`, `blank_render`, `render_timeout`, and `unknown` are untrusted. Untrusted scans must go retry-wait or technical retry and must not be interpreted as zero listings or used for lifecycle removal.
 
+Smoke tools support explicit isolation flags. Use `--fresh-profile` to create a per-run browser profile, or `--profile-dir output/cloak_tests/my_profile` to force a specific profile and bypass runtime profile state. Module2 smoke tools default to fresh checkpoints; pass `--resume` only when intentionally validating checkpoint resume. `--max-windows` / `--module2-max-windows` are smoke-test limits only and produce `partial_test_limit` when they stop a sweep early.
+
 Keep permissions restricted:
 
 ```bash

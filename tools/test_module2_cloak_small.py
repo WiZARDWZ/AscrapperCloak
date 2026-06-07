@@ -4,6 +4,7 @@ import os
 
 import module1_list_scraper as module1
 import module2_infer_prices as module2
+from tools.cloak_smoke_common import add_checkpoint_args, add_profile_args, apply_profile_dir, resolve_profile_dir, smoke_checkpoint_path
 
 
 DEFAULT_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
@@ -43,15 +44,19 @@ def main() -> int:
     parser.add_argument("--max-high", type=int, default=1500000)
     parser.add_argument("--max-pages-per-window", type=int, default=1)
     parser.add_argument("--max-windows", type=int, default=3)
+    add_profile_args(parser)
+    add_checkpoint_args(parser)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    effective_profile_dir = apply_profile_dir(resolve_profile_dir(args, args.out_dir, "module2_profile"), module2=True)
+    checkpoint_mode = "resume" if args.resume else "fresh"
+    checkpoint_path = None if args.resume else smoke_checkpoint_path(args.out_dir, "module2_price_checkpoint_smoke")
     input_file = args.input_file
     if not input_file:
         rows = module1.scrape_search(args.url, max_pages=1, timeout=25)
         _csv, input_file = module1.save_results(rows, out_dir=args.out_dir)
 
-    module2.config.MODULE2_MAX_WINDOWS_PER_RUN = int(args.max_windows)
     logs = []
     csv_path, json_path = module2.module2_run(
         args.url,
@@ -63,6 +68,9 @@ def main() -> int:
         max_pages_per_window=args.max_pages_per_window,
         target_mode="all",
         sweep_mode="setup_full_sweep",
+        test_max_windows=args.max_windows,
+        checkpoint_path_override=checkpoint_path,
+        resume_checkpoint=args.resume,
         on_log=logs.append,
     )
     rows_out = _load_rows(json_path) if json_path else []
@@ -78,6 +86,10 @@ def main() -> int:
         "last_result": getattr(module2.module2_run, "last_result", {}),
         "logs_tail": logs[-30:],
         "max_windows": args.max_windows,
+        "effective_profile_dir": effective_profile_dir,
+        "checkpoint_path": checkpoint_path or getattr(module2.module2_run, "last_result", {}).get("checkpoint_path"),
+        "checkpoint_resumed": bool((getattr(module2.module2_run, "last_result", {}) or {}).get("checkpoint_resumed")),
+        "checkpoint_mode": checkpoint_mode,
     }
     summary_path = os.path.join(args.out_dir, "module2_cloak_small_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:

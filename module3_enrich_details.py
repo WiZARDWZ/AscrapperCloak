@@ -932,11 +932,11 @@ def module3_run(
 
     done = set(ck.get("done_listing_ids", []))
     start_from = int(ck.get("last_index", -1)) + 1
-    log(f"🔁 Resume: done={len(done)} start_from_index={start_from}")
+    log(f"Resume: done={len(done)} start_from_index={start_from}")
 
     driver = None
     consecutive_get_failures = 0
-    profile_dir_current = config.CHROME_PROFILE_DIR
+    profile_dir_current = config.get_effective_browser_profile_dir("module3")
     rotations_used = 0
 
     try:
@@ -944,7 +944,7 @@ def module3_run(
 
         for idx in range(start_from, len(rows)):
             if getattr(cancel_token, "is_set", lambda: False)():
-                log("⏸ Cancel requested in module3.")
+                log("Cancel requested in module3.")
                 return None, None
 
             if on_progress:
@@ -982,14 +982,14 @@ def module3_run(
                 consecutive_get_failures += 1
 
                 if err and is_internet_disconnected(err):
-                    log("🌐 اینترنت قطع شده. checkpoint ذخیره شد. بعداً دوباره اجرا کن تا ادامه بده.")
+                    log("Network interrupted. Checkpoint saved; rerun to resume.")
                     ck["last_index"] = idx
                     save_checkpoint(ck_path, ck)
                     return None, None
 
-                log("   ↳ GET failed/timeout (renderer).")
+                log("   -> GET failed/timeout (renderer).")
                 if consecutive_get_failures >= 2:
-                    log("   ↳ Restarting driver ...")
+                    log("   -> Restarting driver ...")
                     driver = restart_driver(driver)
                     consecutive_get_failures = 0
 
@@ -1085,7 +1085,7 @@ def module3_run(
             try:
                 wait_for_detail_ready(driver, timeout=wait_timeout)
             except TimeoutException:
-                log("   ↳ Detail not ready (timeout). Will retry once.")
+                log("   -> Detail not ready (timeout). Will retry once.")
                 # یک بار رفرش
                 try:
                     driver.refresh()
@@ -1104,7 +1104,7 @@ def module3_run(
             if (not data) or all((v is None or v == "" or v == []) for v in data.values()):
                 if empty_retry > 0:
                     try:
-                        log("   ↳ Empty extract. Refresh + retry...")
+                        log("   -> Empty extract. Refresh + retry...")
                         driver.refresh()
                         wait_for_detail_ready(driver, timeout=wait_timeout)
                         data = extract_detail_data(driver)
@@ -1133,7 +1133,7 @@ def module3_run(
 
         # خروجی FULL
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
-        log("\n✅ Module3 done. FULL files saved:")
+        log("\nModule3 done. FULL files saved:")
         log(f" - {out_csv}")
         log(f" - {out_json}")
 
@@ -1192,8 +1192,8 @@ def enrich_detail_rows(
             except Exception:
                 pass
 
-    driver = build_driver(profile_dir_override=config.CHROME_PROFILE_DIR)
-    profile_dir_current = config.CHROME_PROFILE_DIR
+    profile_dir_current = config.get_effective_browser_profile_dir("module3")
+    driver = build_driver(profile_dir_override=profile_dir_current)
     rotations_used = 0
     enriched: list[dict] = []
     try:

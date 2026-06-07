@@ -7,6 +7,7 @@ import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from cloak_browser_helper import By, WebDriverWait, TimeoutException, debug_page_snapshot
 from realestate_page_state import classify_search_page
+from tools.cloak_smoke_common import add_profile_args, apply_profile_dir, resolve_profile_dir
 
 
 DEFAULT_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
@@ -35,8 +36,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Open one realestate.com.au page with CloakBrowser and write diagnostics.")
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--out-dir", default=os.path.join("output", "cloak_tests"))
-    parser.add_argument("--profile-dir", default=None)
-    parser.add_argument("--fresh-profile", action="store_true")
+    add_profile_args(parser)
     parser.add_argument("--disable-http2", action="store_true")
     parser.add_argument("--wait", type=int, default=15)
     args = parser.parse_args()
@@ -45,9 +45,7 @@ def main() -> int:
     if args.disable_http2:
         config.CLOAK_DISABLE_HTTP2 = True
 
-    profile_dir = args.profile_dir
-    if args.fresh_profile:
-        profile_dir = os.path.join(args.out_dir, f"cloak_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    profile_dir = apply_profile_dir(resolve_profile_dir(args, args.out_dir, "cloak_profile"))
 
     driver = None
     try:
@@ -64,6 +62,7 @@ def main() -> int:
         snapshot["network_reason"] = page_state.network_reason
         snapshot["requested_url"] = args.url
         snapshot["profile_dir"] = getattr(driver, "profile_dir", profile_dir)
+        snapshot["effective_profile_dir"] = profile_dir
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         html_path = os.path.join(args.out_dir, f"cloak_single_page_{ts}.html")

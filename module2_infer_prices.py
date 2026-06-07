@@ -651,6 +651,7 @@ def infer_prices_window_based_with_checkpoint(
     on_progress=None,
     sweep_windows: list[tuple[int, int, int]] | None = None,
     max_windows_per_run: int | None = None,
+    test_limit_mode: bool = False,
 ):
     inferred = ck.get("inferred_map", ck.get("inferred", {})) or {}
     remaining = set(target_ids) - set(inferred.keys())
@@ -670,11 +671,11 @@ def infer_prices_window_based_with_checkpoint(
 
     effective_max_windows = int(config.MODULE2_MAX_WINDOWS_PER_RUN if max_windows_per_run is None else max_windows_per_run)
     checked_this_run = 0
-    log_func(f"🔁 Resume: inferred={len(inferred)} remaining={len(remaining)} window_cursor={window_cursor} window_idx={window_idx}")
+    log_func(f"Resume: inferred={len(inferred)} remaining={len(remaining)} window_cursor={window_cursor} window_idx={window_idx}")
 
     while window_cursor < len(sweep_windows) and remaining and (effective_max_windows <= 0 or checked_this_run < effective_max_windows):
         if getattr(cancel_token, "is_set", lambda: False)():
-            log_func("⏸ Cancel requested in module2.")
+            log_func("Cancel requested in module2.")
             return inferred, driver, "cancelled"
         low, high, current_step = sweep_windows[window_cursor]
         window_cursor += 1
@@ -689,7 +690,7 @@ def infer_prices_window_based_with_checkpoint(
         ck["current_window_low"] = low
         ck["current_window_high"] = high
         ck["profile_generation"] = profile_generation
-        ck["current_profile_dir"] = ck.get("current_profile_dir") or config.MODULE2_PROFILE_BASE_DIR
+        ck["current_profile_dir"] = ck.get("current_profile_dir") or config.get_effective_browser_profile_dir("module2")
         ck["profile_rotations"] = profile_rotations
         ck["updated_at"] = datetime.now().isoformat()
         ck["consecutive_get_failures"] = consecutive_get_failures
@@ -703,13 +704,13 @@ def infer_prices_window_based_with_checkpoint(
 
         for page in range(1, max_pages_per_window + 1):
             if getattr(cancel_token, "is_set", lambda: False)():
-                log_func("⏸ Cancel requested in module2 page loop.")
+                log_func("Cancel requested in module2 page loop.")
                 return inferred, driver, "cancelled"
             if detected_max_pages is not None and page > detected_max_pages:
                 break
 
             url = build_between_url(base_list_url, low, high, page=page)
-            log_func(f"🪟 Window {window_idx}: between-{low}-{high} | page {page} | remaining={len(remaining)}")
+            log_func(f"Window {window_idx}: between-{low}-{high} | page {page} | remaining={len(remaining)}")
             if on_progress:
                 on_progress(
                     "module2_progress",
@@ -728,16 +729,16 @@ def infer_prices_window_based_with_checkpoint(
                     ck["stopped_reason"] = "retry_wait_network_interrupted"
                     ck["browser_recovery_action"] = ck.get("browser_recovery_action")
                     save_checkpoint(ck_path, ck)
-                    log_func("🌐 اینترنت قطع شده. checkpoint ذخیره شد. دوباره اجرا کن تا ادامه بده.")
+                    log_func("Network interrupted. Checkpoint saved; rerun to resume.")
                     return inferred, driver, "retry_wait_network_interrupted"
 
-                log_func("   ↳ GET failed/timeout (renderer).")
+                log_func("   -> GET failed/timeout (renderer).")
                 if consecutive_get_failures >= 2:
-                    log_func("   ↳ Repeated GET failures. Triggering shared browser/profile recovery ...")
+                    log_func("   -> Repeated GET failures. Triggering shared browser/profile recovery ...")
                     try:
                         driver, new_rotations, profile_dir, recovery_status = recover_browser_after_429(
                             driver=driver,
-                            current_profile_dir=ck.get("current_profile_dir") or config.MODULE2_PROFILE_BASE_DIR,
+                            current_profile_dir=ck.get("current_profile_dir") or config.get_effective_browser_profile_dir("module2"),
                             build_driver_func=build_driver,
                             rotations_used=int(ck.get("profile_rotations", 0)),
                             max_rotations=config.MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN,
@@ -761,12 +762,12 @@ def infer_prices_window_based_with_checkpoint(
             # ✅ اگر ریدایرکت شد (list-2 خواستی ولی برگشت list-1) قطع paging
             actual_page = _parse_list_page(driver.current_url or "")
             if actual_page is not None and page > 1 and actual_page != page:
-                log_func(f"   ↳ Redirected to list-{actual_page} while requesting list-{page}. No more pages.")
+                log_func(f"   -> Redirected to list-{actual_page} while requesting list-{page}. No more pages.")
                 break
 
             # ✅ URL تکراری => پایان paging
             if prev_url and (driver.current_url == prev_url):
-                log_func("   ↳ Same URL as previous page. Stop paging this window.")
+                log_func("   -> Same URL as previous page. Stop paging this window.")
                 break
             prev_url = driver.current_url
 
@@ -819,7 +820,7 @@ def infer_prices_window_based_with_checkpoint(
                 save_checkpoint(ck_path, ck)
                 return inferred, driver, ("429_retry_same_window" if retry_page1_after_rotate else "429")
             if state_result.state == PageState.NO_RESULTS:
-                log_func("   â†³ No results page. Skip remaining pages of this window.")
+                log_func("   -> No results page. Skip remaining pages of this window.")
                 break
             if state_result.state != PageState.LISTINGS:
                 ck["stopped_reason"] = state_result.state if state_result.state != PageState.UNKNOWN else "render_timeout"
@@ -829,10 +830,10 @@ def infer_prices_window_based_with_checkpoint(
                 ck["updated_at"] = datetime.now().isoformat()
                 save_checkpoint(ck_path, ck)
                 if page == 1:
-                    log_func("   â†³ Render timeout/no usable search content on page 1. Skipping this window.")
+                    log_func("   -> Render timeout/no usable search content on page 1. Saving checkpoint for retry.")
                     window_timed_out = True
                     return inferred, driver, ck["stopped_reason"]
-                log_func("   â†³ Render timeout/no usable search content on page > 1. Stop paging this window.")
+                log_func("   -> Render timeout/no usable search content on page > 1. Stop paging this window.")
                 break
 
             # ✅ روی page1 تعداد صفحات را استخراج کن تا page اضافی نزنیم
@@ -848,15 +849,15 @@ def infer_prices_window_based_with_checkpoint(
             except TimeoutException:
                 # اگر page1 تایم‌اوت شد، این window را skip کن
                 if page == 1:
-                    log_func("   ↳ Timeout waiting for cards/no-results on page 1. Skipping this window.")
+                    log_func("   -> Timeout waiting for cards/no-results on page 1. Skipping this window.")
                     window_timed_out = True
                     break
                 # اگر page>1 تایم‌اوت شد، paging را قطع کن
-                log_func("   ↳ Timeout on page > 1. Stop paging this window.")
+                log_func("   -> Timeout on page > 1. Stop paging this window.")
                 break
 
             if status == "no_results":
-                log_func("   ↳ No results page. Skip remaining pages of this window.")
+                log_func("   -> No results page. Skip remaining pages of this window.")
                 break
 
             cards = payload
@@ -868,7 +869,7 @@ def infer_prices_window_based_with_checkpoint(
             # ✅ اگر صفحه جدید هیچ listing جدیدی نداشت => ادامه نده
             new_ids = ids_in_page - window_seen_ids
             if page > 1 and not new_ids:
-                log_func("   ↳ No new listings on this page. Stop paging this window.")
+                log_func("   -> No new listings on this page. Stop paging this window.")
                 break
             window_seen_ids.update(ids_in_page)
 
@@ -913,7 +914,7 @@ def infer_prices_window_based_with_checkpoint(
                 break
             time.sleep(random.uniform(config.MODULE2_SLEEP_BETWEEN_PAGES_MIN, config.MODULE2_SLEEP_BETWEEN_PAGES_MAX))
 
-        log_func(f"✅ Remaining after window: {len(remaining)}")
+        log_func(f"Remaining after window: {len(remaining)}")
         if window_timed_out:
             consecutive_timeout_windows += 1
         else:
@@ -936,6 +937,16 @@ def infer_prices_window_based_with_checkpoint(
         ck["consecutive_timeout_windows"] = consecutive_timeout_windows
         save_checkpoint(ck_path, ck)
         time.sleep(random.uniform(config.MODULE2_SLEEP_BETWEEN_WINDOWS_MIN, config.MODULE2_SLEEP_BETWEEN_WINDOWS_MAX))
+
+    if test_limit_mode and remaining and effective_max_windows > 0 and checked_this_run >= effective_max_windows and window_cursor < len(sweep_windows):
+        ck["stopped_reason"] = "max_windows_test_limit"
+        ck["updated_at"] = datetime.now().isoformat()
+        ck["inferred_map"] = inferred
+        ck["remaining_ids"] = sorted(remaining)
+        ck["consecutive_get_failures"] = consecutive_get_failures
+        ck["consecutive_timeout_windows"] = consecutive_timeout_windows
+        save_checkpoint(ck_path, ck)
+        return inferred, driver, "max_windows_test_limit"
 
     return inferred, driver, "done"
 
@@ -1024,6 +1035,9 @@ def module2_run(
     cancel_token=None,
     on_log=None,
     on_progress=None,
+    test_max_windows: int | None = None,
+    checkpoint_path_override: str | None = None,
+    resume_checkpoint: bool = True,
 ):
     def log(msg: str) -> None:
         print(msg)
@@ -1073,7 +1087,7 @@ def module2_run(
             if lid and price_needs_inference(price):
                 target_ids.add(lid)
 
-    log(f"📌 Rows: {len(rows)} | Target price inference count: {len(target_ids)} | target_mode={normalized_target_mode}")
+    log(f"Rows: {len(rows)} | Target price inference count: {len(target_ids)} | target_mode={normalized_target_mode}")
 
     if not target_ids:
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
@@ -1118,11 +1132,11 @@ def module2_run(
         "module2_max_high": max_high,
     }
 
-    ck_path = checkpoint_path(out_dir, base_list_url)
-    ck = load_checkpoint(ck_path)
+    ck_path = checkpoint_path_override or checkpoint_path(out_dir, base_list_url)
+    ck = load_checkpoint(ck_path) if resume_checkpoint else None
 
     if ck and not checkpoint_is_compatible(ck, base_list_url, input_file, params, target_ids):
-        log("⚠️ checkpoint موجود است ولی با ورودی/پارامترهای فعلی سازگار نیست. از نو شروع می‌کنیم.")
+        log("Checkpoint exists but is not compatible with current input/parameters. Starting fresh.")
         ck = None
 
     if not ck:
@@ -1142,7 +1156,7 @@ def module2_run(
             "consecutive_get_failures": 0,
             "consecutive_timeout_windows": 0,
             "profile_generation": 0,
-            "current_profile_dir": config.MODULE2_PROFILE_BASE_DIR,
+            "current_profile_dir": config.get_effective_browser_profile_dir("module2"),
             "profile_rotations": 0,
             "browser_recovery_action": None,
             "stopped_reason": "",
@@ -1152,7 +1166,7 @@ def module2_run(
     checkpoint_resumed = bool(ck and int(ck.get("window_idx", 0) or 0) > 0)
     driver = None
     try:
-        profile_dir_current = ck.get("current_profile_dir") or config.MODULE2_PROFILE_BASE_DIR
+        profile_dir_current = ck.get("current_profile_dir") or config.get_effective_browser_profile_dir("module2")
         try:
             driver = build_driver(profile_dir_override=profile_dir_current)
         except Exception as driver_exc:
@@ -1229,7 +1243,8 @@ def module2_run(
                 log_func=log,
                 on_progress=on_progress,
                 sweep_windows=sweep_windows,
-                max_windows_per_run=0 if plan["sweep_mode"] in {"setup_full_sweep", "fallback_full_for_missing"} else None,
+                max_windows_per_run=int(test_max_windows) if test_max_windows is not None else (0 if plan["sweep_mode"] in {"setup_full_sweep", "fallback_full_for_missing"} else None),
+                test_limit_mode=test_max_windows is not None,
             )
             if not str(status).startswith("429"):
                 break
@@ -1249,7 +1264,7 @@ def module2_run(
                 return None, None
             driver, new_rotations, profile_dir, recovery_status = recover_browser_after_429(
                 driver=driver,
-                current_profile_dir=ck.get("current_profile_dir") or config.MODULE2_PROFILE_BASE_DIR,
+                current_profile_dir=ck.get("current_profile_dir") or config.get_effective_browser_profile_dir("module2"),
                 build_driver_func=build_driver,
                 rotations_used=rotations,
                 max_rotations=config.MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN,
@@ -1284,6 +1299,7 @@ def module2_run(
             "end_high": end_high,
             "step_profile": plan["step_profile"],
             "windows_checked": windows_checked,
+            "checkpoint_path": ck_path,
             "target_mode": normalized_target_mode,
             "target_count": len(target_ids),
             "remaining_count": len(remaining_after),
@@ -1294,13 +1310,17 @@ def module2_run(
             "stopped_early_all_targets_found": stopped_early,
             "status": status,
             "checkpoint_resumed": checkpoint_resumed,
+            "stopped_reason": ck.get("stopped_reason"),
             "browser_profile_used": ck.get("current_profile_dir"),
             "browser_recovery_action": ck.get("browser_recovery_action"),
             **_target_listing_debug(rows, remaining_after),
         })
-        log(f"🎯 Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")
+        log(f"Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")
 
-        if status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit", "render_timeout", "blank_render", "unknown"}:
+        if status == "max_windows_test_limit":
+            module2_run.last_result["status"] = "partial_test_limit"
+            module2_run.last_result["stopped_reason"] = "max_windows_test_limit"
+        elif status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit", "render_timeout", "blank_render", "unknown"}:
             module2_run.last_result["status"] = "interrupted_checkpoint_saved" if status == "timeout_limit" else status
             module2_run.last_result["skipped_reason"] = None
             return None, None
@@ -1333,7 +1353,7 @@ def module2_run(
             r["PriceInferenceLastAttemptAt"] = datetime.now().isoformat()
 
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
-        log("\n💾 Saved:")
+        log("\nSaved:")
         log(f" - {out_csv}")
         log(f" - {out_json}")
 

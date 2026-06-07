@@ -680,7 +680,7 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
     effective_timeout = timeout or 25
     driver = None
     rows = []
-    profile_dir_current = config.CHROME_PROFILE_DIR
+    profile_dir_current = config.get_effective_browser_profile_dir("module1")
     rotations_used = 0
 
     def log(msg: str) -> None:
@@ -830,7 +830,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
     driver = None
     all_rows = []
     seen_ids = set()
-    profile_dir_current = config.CHROME_PROFILE_DIR
+    profile_dir_current = config.get_effective_browser_profile_dir("module1")
     rotations_used = 0
     scrape_search.last_result = {"status": "running", "rows": 0, "stop_reason": None, "page_state": None}
 
@@ -851,7 +851,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
     try:
         if is_linux() and is_headless_enabled():
-            log("⚠️ Ubuntu headless may fail. Recommended: HEADLESS=0 + xvfb-run")
+            log("Warning: Ubuntu headless may fail. Recommended: HEADLESS=0 + xvfb-run")
         driver = setup_driver(profile_dir_override=profile_dir_current)
 
         page = 1
@@ -860,13 +860,13 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
         while page <= hard_cap:
             if getattr(cancel_token, "is_set", lambda: False)():
-                log("⏸ Cancel requested in module1.")
+                log("Cancel requested in module1.")
                 break
             if isinstance(max_pages, int) and max_pages > 0 and page > max_pages:
                 break
 
             url = make_list_url(base_url, page)
-            log(f"\n🌐 Page {page}: {url}")
+            log(f"\nPage {page}: {url}")
             safe_get(driver, url)
             page_429_retries = 0
             while True:
@@ -944,7 +944,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 cards = wait_for_cards(driver, timeout=timeout, min_cards=1)
             except TimeoutException:
                 raise_if_realestate_blocked(driver)
-                log("⚠️ No cards found (timeout). Stop.")
+                log("Warning: No cards found (timeout). Stop.")
                 break
 
             WebDriverWait(driver, timeout).until(
@@ -956,10 +956,10 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
             if page == 1:
                 total_pages = get_total_pages(driver)
                 if total_pages:
-                    log(f"📌 Total pages detected: {total_pages}")
+                    log(f"Total pages detected: {total_pages}")
 
             page_source = driver.page_source
-            log(f"✅ Found {len(cards)} cards")
+            log(f"Found {len(cards)} cards")
 
             page_count = 0
             for card in cards:
@@ -977,7 +977,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 page_count += 1
                 time.sleep(0.03)
 
-            log(f"📦 Extracted {page_count} rows from this page (total={len(all_rows)})")
+            log(f"Extracted {page_count} rows from this page (total={len(all_rows)})")
             net_summary = _collect_network_debug(driver)
             log("Page network summary:")
             log(
@@ -1000,11 +1000,11 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
             # شرط توقف
             if total_pages and page >= total_pages:
-                log("🏁 Reached last page (by pagination).")
+                log("Reached last page (by pagination).")
                 break
 
             has_next = detect_next(driver)
-            log(f"➡️ Next detected: {has_next}")
+            log(f"Next detected: {has_next}")
 
             if not has_next and not total_pages:
                 break

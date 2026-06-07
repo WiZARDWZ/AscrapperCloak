@@ -137,6 +137,78 @@ class Module2BlockDetectionTests(unittest.TestCase):
         wait_cards.assert_not_called()
         self.assertTrue(any("Module2 trusted_window=False state=render_timeout" in msg for msg in logs))
 
+    def test_test_max_windows_limits_setup_full_sweep(self):
+        driver = FakeDriver()
+        ck = {"inferred_map": {}, "remaining_ids": ["target-1"], "next_window_index": 0, "window_idx": 0, "profile_rotations": 0}
+        states = [_state(PageState.LISTINGS, cards=1, html_length=50000, body_text_length=1200) for _ in range(3)]
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(module2_infer_prices, "get_with_retries", return_value=(driver, True, None)), \
+             mock.patch.object(module2_infer_prices, "wait_for_search_page_state", side_effect=[(s, [object()]) for s in states]), \
+             mock.patch.object(module2_infer_prices, "wait_for_cards_or_no_results", return_value=("cards", [object()])), \
+             mock.patch.object(module2_infer_prices, "extract_listing_ids_from_cards", return_value=set()), \
+             mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_PAGES_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_PAGES_MAX", 0):
+            inferred, _driver, status = module2_infer_prices.infer_prices_window_based_with_checkpoint(
+                driver=driver,
+                base_list_url="https://www.realestate.com.au/buy/in-test/list-1",
+                target_ids={"target-1"},
+                window_width=100,
+                step=100,
+                start_low=0,
+                max_high=500,
+                max_pages_per_window=1,
+                wait_timeout=1,
+                ck_path=f"{tmp}/ck.json",
+                ck=ck,
+                log_func=lambda _msg: None,
+                sweep_windows=[(0, 100, 100), (100, 200, 100), (200, 300, 100), (300, 400, 100), (400, 500, 100)],
+                max_windows_per_run=3,
+                test_limit_mode=True,
+            )
+
+        self.assertEqual(status, "max_windows_test_limit")
+        self.assertLessEqual(int(ck["window_idx"]), 3)
+        self.assertEqual(inferred, {})
+        self.assertEqual(ck["remaining_ids"], ["target-1"])
+
+    def test_without_test_max_windows_setup_full_sweep_keeps_existing_behavior(self):
+        driver = FakeDriver()
+        ck = {"inferred_map": {}, "remaining_ids": ["target-1"], "next_window_index": 0, "window_idx": 0, "profile_rotations": 0}
+        states = [_state(PageState.LISTINGS, cards=1, html_length=50000, body_text_length=1200) for _ in range(5)]
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(module2_infer_prices, "get_with_retries", return_value=(driver, True, None)), \
+             mock.patch.object(module2_infer_prices, "wait_for_search_page_state", side_effect=[(s, [object()]) for s in states]), \
+             mock.patch.object(module2_infer_prices, "wait_for_cards_or_no_results", return_value=("cards", [object()])), \
+             mock.patch.object(module2_infer_prices, "extract_listing_ids_from_cards", return_value=set()), \
+             mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_PAGES_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_PAGES_MAX", 0):
+            _inferred, _driver, status = module2_infer_prices.infer_prices_window_based_with_checkpoint(
+                driver=driver,
+                base_list_url="https://www.realestate.com.au/buy/in-test/list-1",
+                target_ids={"target-1"},
+                window_width=100,
+                step=100,
+                start_low=0,
+                max_high=500,
+                max_pages_per_window=1,
+                wait_timeout=1,
+                ck_path=f"{tmp}/ck.json",
+                ck=ck,
+                log_func=lambda _msg: None,
+                sweep_windows=[(0, 100, 100), (100, 200, 100), (200, 300, 100), (300, 400, 100), (400, 500, 100)],
+                max_windows_per_run=0,
+                test_limit_mode=False,
+            )
+
+        self.assertEqual(status, "done")
+        self.assertEqual(int(ck["window_idx"]), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

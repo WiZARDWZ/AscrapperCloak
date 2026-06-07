@@ -1244,6 +1244,20 @@ class MonitoringRefactorTests(unittest.TestCase):
         finally:
             job_queue.disable_in_memory_store()
 
+    def test_blocked_light_check_does_not_mark_search_checked(self):
+        job = {"JobType": job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, "SearchID": 7, "UserAreaID": 42}
+        sub = {"UserAreaID": 42, "SearchID": 7, "SearchURL": "https://example.test/search"}
+        blocked = {"scan_status": "blocked_rate_limited", "blocked_reason": "blocked_kpsdk", "stop_reason": "blocked_kpsdk", "trusted_scan": False}
+        with mock.patch.object(monitoring_scheduler, "_load_search_subscription", return_value=sub), \
+             mock.patch.object(monitoring_scheduler, "_search_is_active_for_monitoring", return_value=True), \
+             mock.patch.object(monitoring_scheduler, "light_check_area", return_value=blocked), \
+             mock.patch.object(monitoring_scheduler.db_layer, "mark_search_light_checked") as mark_checked:
+            result = monitoring_scheduler.execute_job(job, send_telegram=False)
+
+        self.assertEqual(result["status"], "retry_wait")
+        self.assertEqual(result["reason"], "blocked_kpsdk")
+        mark_checked.assert_not_called()
+
     def test_scheduler_does_not_count_inactive_search_as_ready(self):
         now = monitoring_scheduler._utcnow()
         job_queue.enable_in_memory_store()

@@ -9,7 +9,7 @@ from realestate_errors import RealEstateBlockedError
 
 LIGHT_CHECK_DEFAULT_MAX_PAGES = config.LIGHT_CHECK_DEFAULT_MAX_PAGES
 LIGHT_CHECK_HARD_MAX_PAGES = config.LIGHT_CHECK_HARD_MAX_PAGES
-BLOCKED_PAGE_STATES = {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied"}
+BLOCKED_PAGE_STATES = {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied", "partial_blocked"}
 TECHNICAL_PAGE_STATES = {"render_timeout", "blank_render", "unknown"}
 
 

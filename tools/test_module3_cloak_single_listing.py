@@ -1,10 +1,12 @@
 import argparse
 import json
 import os
+import re
 from datetime import datetime
 
 import module1_list_scraper as module1
 import module3_enrich_details as module3
+from tools.cloak_smoke_common import add_profile_args, apply_profile_dir, resolve_profile_dir
 
 
 DEFAULT_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
@@ -44,9 +46,11 @@ def main() -> int:
     parser.add_argument("--input-file", default=None)
     parser.add_argument("--out-dir", default=os.path.join("output", "cloak_tests"))
     parser.add_argument("--wait", type=int, default=25)
+    add_profile_args(parser)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    effective_profile_dir = apply_profile_dir(resolve_profile_dir(args, args.out_dir, "module3_profile"))
     input_file = args.input_file
     if not input_file:
         rows = module1.scrape_search(args.url, max_pages=1, timeout=25)
@@ -74,11 +78,20 @@ def main() -> int:
     )
     rows_out = _load_rows(json_path) if json_path else []
     present_detail_keys = sorted({key for key in DETAIL_KEYS if any(row.get(key) not in (None, "", [], {}) for row in rows_out)})
+    page_state = None
+    for item in reversed(logs):
+        match = re.search(r"page_state=([a-z0-9_]+)", str(item))
+        if match:
+            page_state = match.group(1)
+            break
     summary = {
         "input_file": input_file,
         "csv_path": csv_path,
         "json_path": json_path,
         "rows": len(rows_out),
+        "page_state": page_state or next((row.get("StatusReason") or row.get("page_state") for row in rows_out if row), None),
+        "detail_status": next((row.get("ListingLifecycleStatus") or row.get("current_status") or row.get("detail_extraction_quality") for row in rows_out if row), None),
+        "effective_profile_dir": effective_profile_dir,
         "present_detail_keys": present_detail_keys,
         "logs_tail": logs[-30:],
     }
@@ -91,4 +104,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

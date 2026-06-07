@@ -1767,7 +1767,7 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         elif str(result.get("status") or "").startswith("retry_wait"):
             retry_after_seconds = int(result.get("retry_after_seconds") or int(getattr(config, "DETAIL_REFRESH_INTERVAL_HOURS", 1)) * 3600)
             retry_reason = str(result.get("reason") or "")
-            if retry_reason.startswith("realestate_rate_limited_or_blocked") or retry_reason in {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied", "blocked_rate_limited"}:
+            if retry_reason.startswith("realestate_rate_limited_or_blocked") or retry_reason in {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied", "blocked_rate_limited", "partial_blocked"}:
                 job_queue.mark_job_retry_wait(int(job["JobID"]), result.get("reason") or result, retry_after_seconds=retry_after_seconds)
             else:
                 job_queue.mark_job_failed(int(job["JobID"]), result.get("reason") or result, retryable=True, retry_after_seconds=retry_after_seconds)

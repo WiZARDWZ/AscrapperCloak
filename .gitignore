@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+output/
+runtime/
+rea_profile*/
+chrome_profiles/
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+logs/

@@ -3,6 +3,7 @@ import json
 import os
 
 import module1_list_scraper as module1
+from tools.cloak_smoke_common import add_profile_args, apply_profile_dir, resolve_profile_dir
 
 
 DEFAULT_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
@@ -36,9 +37,11 @@ def main() -> int:
     parser.add_argument("--url", default=DEFAULT_URL)
     parser.add_argument("--out-dir", default=os.path.join("output", "cloak_tests"))
     parser.add_argument("--timeout", type=int, default=25)
+    add_profile_args(parser)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    effective_profile_dir = apply_profile_dir(resolve_profile_dir(args, args.out_dir, "module1_profile"))
     logs = []
     rows = module1.scrape_search(args.url, max_pages=1, timeout=args.timeout, on_log=logs.append)
     csv_path, json_path = module1.save_results(rows, out_dir=args.out_dir)
@@ -54,6 +57,7 @@ def main() -> int:
         "json_path": json_path,
         "module1_last_result": getattr(module1.scrape_search, "last_result", {}),
         "logs_tail": logs[-20:],
+        "effective_profile_dir": effective_profile_dir,
     }
     summary_path = os.path.join(args.out_dir, "module1_cloak_one_page_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:

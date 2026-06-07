@@ -48,6 +48,9 @@ Production uses SQL Server through ODBC. Prefer these env vars: `DB_HOST`, `DB_P
 
 Default driver: `ODBC Driver 18 for SQL Server`.
 
+## Runtime files
+`.env`, browser profiles, checkpoints, logs, local databases, `output/`, `runtime/`, virtualenvs, and Python cache files are runtime-only and are ignored by Git. Keep shareable defaults in `.env.example`; never commit real secrets or live browser profiles.
+
 ## Local debug (low bandwidth + persistent profile)
 - برای کاهش مصرف اینترنت در دیباگ لوکال، پروژه به‌صورت پیش‌فرض از **persistent Chrome profile** استفاده می‌کند (`rea_profile`).
 - اجرای اول ممکن است کمی مصرف بالاتر داشته باشد تا cache/service worker/static assets ساخته شود.

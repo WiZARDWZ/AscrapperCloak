@@ -43,6 +43,13 @@ class AreaLightCheckerTrustTests(unittest.TestCase):
         self.assertEqual(result["blocked_reason"], "blocked_kpsdk")
         ingest.assert_not_called()
 
+    def test_partial_blocked_is_untrusted(self):
+        result, ingest = self._run([], {"stop_reason": "partial_blocked", "page_state": "blocked_kpsdk", "has_next_page": False})
+
+        self.assertFalse(result["trusted_scan"])
+        self.assertEqual(result["scan_status"], "blocked_rate_limited")
+        ingest.assert_not_called()
+
     def test_render_timeout_is_untrusted_technical_failure(self):
         result, ingest = self._run([], {"stop_reason": "render_timeout", "page_state": "render_timeout", "has_next_page": False})
 

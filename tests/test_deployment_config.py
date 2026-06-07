@@ -9,6 +9,7 @@ sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **k
 
 import config
 import db_layer
+from tools import cloak_smoke_common
 
 
 class DeploymentConfigTests(unittest.TestCase):
@@ -53,6 +54,36 @@ class DeploymentConfigTests(unittest.TestCase):
                 self.assertFalse(reloaded.CLOAK_DISABLE_HTTP2)
             finally:
                 importlib.reload(config)
+
+    def test_effective_profile_respects_chrome_and_cloak(self):
+        with mock.patch.object(config, "BROWSER_ENGINE", "cloak"), \
+             mock.patch.object(config, "CLOAK_PROFILE_DIR", "cloak-profile"), \
+             mock.patch.object(config, "CHROME_PROFILE_DIR", "chrome-profile"), \
+             mock.patch.object(config, "MODULE2_PROFILE_BASE_DIR", None):
+            self.assertEqual(config.get_effective_browser_profile_dir("module1"), "cloak-profile")
+        with mock.patch.object(config, "BROWSER_ENGINE", "chrome"), \
+             mock.patch.object(config, "CHROME_PROFILE_DIR", "chrome-profile"):
+            self.assertEqual(config.get_effective_browser_profile_dir("module3"), "chrome-profile")
+
+    def test_module2_profile_base_overrides_module2_only(self):
+        with mock.patch.object(config, "BROWSER_ENGINE", "cloak"), \
+             mock.patch.object(config, "CLOAK_PROFILE_DIR", "cloak-profile"), \
+             mock.patch.object(config, "MODULE2_PROFILE_BASE_DIR", "module2-profile"):
+            self.assertEqual(config.get_effective_browser_profile_dir("module2"), "module2-profile")
+            self.assertEqual(config.get_effective_browser_profile_dir("module1"), "cloak-profile")
+
+    def test_tool_profile_dir_overrides_env_config(self):
+        args = types.SimpleNamespace(profile_dir="output/cloak_tests/my_profile", fresh_profile=False)
+        with mock.patch.object(config, "CHROME_PROFILE_DIR", "chrome-profile"), \
+             mock.patch.object(config, "CLOAK_PROFILE_DIR", "cloak-profile"), \
+             mock.patch.object(config, "MODULE2_PROFILE_BASE_DIR", "module2-profile"), \
+             mock.patch.object(config, "BROWSER_USE_RUNTIME_PROFILE_STATE", True):
+            effective = cloak_smoke_common.apply_profile_dir(cloak_smoke_common.resolve_profile_dir(args, "output/cloak_tests", "x"), module2=True)
+            self.assertTrue(effective.endswith(os.path.join("output", "cloak_tests", "my_profile")))
+            self.assertEqual(config.CHROME_PROFILE_DIR, effective)
+            self.assertEqual(config.CLOAK_PROFILE_DIR, effective)
+            self.assertEqual(config.MODULE2_PROFILE_BASE_DIR, effective)
+            self.assertFalse(config.BROWSER_USE_RUNTIME_PROFILE_STATE)
 
     def test_sqlserver_connection_string_uses_db_env_shape(self):
         patches = [

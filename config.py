@@ -243,6 +243,20 @@ RESET_CHROME_PROFILE_EACH_RUN = False
 NETWORK_THROTTLE_ENABLED = False
 NETWORK_THROTTLE_DOWNLOAD_KBPS = 300
 NETWORK_THROTTLE_UPLOAD_KBPS = 100
+
+
+def get_effective_browser_profile_dir(module_name: str | None = None, explicit_override: str | None = None) -> str:
+    """Resolve the configured persistent browser profile before runtime state overrides."""
+    if explicit_override and str(explicit_override).strip():
+        return str(explicit_override).strip()
+    normalized_module = str(module_name or "").strip().lower()
+    if normalized_module == "module2" and MODULE2_PROFILE_BASE_DIR:
+        return MODULE2_PROFILE_BASE_DIR
+    if BROWSER_ENGINE == "cloak":
+        return CLOAK_PROFILE_DIR or CHROME_PROFILE_DIR or BROWSER_PROFILE_BASE_DIR
+    return CHROME_PROFILE_DIR or BROWSER_PROFILE_BASE_DIR
+
+
 CHROME_BINARY_PATH = _env_first(
     "CHROME_BINARY_PATH",
     "GOOGLE_CHROME_BIN",
