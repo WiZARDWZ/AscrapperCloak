@@ -25,7 +25,12 @@ def _bool_env(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
         return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    text = value.strip().lower()
+    if text in {"", "0", "false", "no", "n", "off"}:
+        return False
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    return default
 
 
 def _optional_int_env(name: str, default: int | None = None) -> int | None:
@@ -141,7 +146,7 @@ MODULE2_MAX_PAGES_PER_WINDOW = 5
 MODULE2_ROTATE_PROFILE_ON_429 = True
 MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN = 2
 MODULE2_COOLDOWN_ON_429_SECONDS = 60
-MODULE2_PROFILE_BASE_DIR = "rea_profile"
+MODULE2_PROFILE_BASE_DIR = os.getenv("MODULE2_PROFILE_BASE_DIR", "").strip() or None
 MODULE2_PROFILE_BACKUP_PREFIX = "rea_profile_429_backup_"
 MODULE2_SLEEP_BETWEEN_WINDOWS_MIN = 3
 MODULE2_SLEEP_BETWEEN_WINDOWS_MAX = 7
@@ -170,7 +175,7 @@ BROWSER_PROFILE_BACKUP_PREFIX = "rea_profile_429_backup_"
 BROWSER_PROFILE_GENERATED_PREFIX = "rea_profile_gen_"
 BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN = 2
 BROWSER_COOLDOWN_ON_429_SECONDS = 60
-BROWSER_USE_RUNTIME_PROFILE_STATE = True
+BROWSER_USE_RUNTIME_PROFILE_STATE = _bool_env("BROWSER_USE_RUNTIME_PROFILE_STATE", True)
 BROWSER_PROFILE_STATE_PATH = "output/browser_profile_state.json"
 BROWSER_KILL_CHROME_ON_RECOVERY = False
 REA_RATE_LIMIT_BACKOFF_SECONDS = int(os.getenv("REA_RATE_LIMIT_BACKOFF_SECONDS", "21600"))
@@ -179,7 +184,7 @@ BROWSER_BLOCK_POLL_SECONDS = float(os.getenv("BROWSER_BLOCK_POLL_SECONDS", "1.0"
 BROWSER_NO_RESULTS_STABLE_SECONDS = float(os.getenv("BROWSER_NO_RESULTS_STABLE_SECONDS", "1.0"))
 BROWSER_KPSDK_SAME_SESSION_RECHECKS = int(os.getenv("BROWSER_KPSDK_SAME_SESSION_RECHECKS", "2"))
 BROWSER_KPSDK_SETTLE_SECONDS = float(os.getenv("BROWSER_KPSDK_SETTLE_SECONDS", "10"))
-BROWSER_PAGE_STATE_DEBUG = _bool_env("BROWSER_PAGE_STATE_DEBUG", False)
+BROWSER_PAGE_STATE_DEBUG = _bool_env("BROWSER_PAGE_STATE_DEBUG", True)
 
 MODULE3_SLEEP_BETWEEN = 0.35
 MODULE3_WAIT_TIMEOUT = 25
@@ -209,7 +214,7 @@ CLOAK_VIEWPORT_WIDTH = int(os.getenv("CLOAK_VIEWPORT_WIDTH", "1365"))
 CLOAK_VIEWPORT_HEIGHT = int(os.getenv("CLOAK_VIEWPORT_HEIGHT", "768"))
 CLOAK_LOCALE = os.getenv("CLOAK_LOCALE", "en-AU")
 CLOAK_TIMEZONE = os.getenv("CLOAK_TIMEZONE", "Australia/Sydney")
-CLOAK_DISABLE_HTTP2 = _bool_env("CLOAK_DISABLE_HTTP2", False)
+CLOAK_DISABLE_HTTP2 = _bool_env("CLOAK_DISABLE_HTTP2", True)
 CLOAK_USE_PERSISTENT_CONTEXT = _bool_env("CLOAK_USE_PERSISTENT_CONTEXT", True)
 CLOAK_CONTEXT_REUSE_MODE = os.getenv("CLOAK_CONTEXT_REUSE_MODE", "per_driver")
 CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", _bool_env("HEADLESS", False))

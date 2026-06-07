@@ -170,9 +170,10 @@ ensure_env_file() {
   ensure_env_key "CLOAK_VIEWPORT_HEIGHT" "768"
   ensure_env_key "CLOAK_LOCALE" "en-AU"
   ensure_env_key "CLOAK_TIMEZONE" "Australia/Sydney"
-  ensure_env_key "CLOAK_DISABLE_HTTP2" "0"
+  ensure_env_key "CLOAK_DISABLE_HTTP2" "1"
   ensure_env_key "CLOAK_USE_PERSISTENT_CONTEXT" "1"
   ensure_env_key "CLOAK_HEADLESS" "0"
+  ensure_env_key "MODULE2_PROFILE_BASE_DIR" ""
   ensure_env_key "LOW_BANDWIDTH_MODE" "0"
   ensure_env_key "BLOCK_HEAVY_RESOURCES" "0"
   ensure_env_key "BLOCK_TRACKERS" "0"
@@ -187,7 +188,8 @@ ensure_env_file() {
   ensure_env_key "BROWSER_NO_RESULTS_STABLE_SECONDS" "1.0"
   ensure_env_key "BROWSER_KPSDK_SAME_SESSION_RECHECKS" "2"
   ensure_env_key "BROWSER_KPSDK_SETTLE_SECONDS" "10"
-  ensure_env_key "BROWSER_PAGE_STATE_DEBUG" "0"
+  ensure_env_key "BROWSER_PAGE_STATE_DEBUG" "1"
+  ensure_env_key "BROWSER_USE_RUNTIME_PROFILE_STATE" "1"
   run_as_user "chmod 600 '$ENV_FILE'"
 }
 

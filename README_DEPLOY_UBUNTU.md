@@ -70,9 +70,10 @@ CLOAK_VIEWPORT_WIDTH=1365
 CLOAK_VIEWPORT_HEIGHT=768
 CLOAK_LOCALE=en-AU
 CLOAK_TIMEZONE=Australia/Sydney
-CLOAK_DISABLE_HTTP2=0
+CLOAK_DISABLE_HTTP2=1
 CLOAK_USE_PERSISTENT_CONTEXT=1
 CLOAK_HEADLESS=0
+MODULE2_PROFILE_BASE_DIR=
 LOW_BANDWIDTH_MODE=0
 BLOCK_HEAVY_RESOURCES=0
 BLOCK_TRACKERS=0
@@ -85,7 +86,10 @@ BLOCK_ANALYTICS=0
 BROWSER_BLOCK_GRACE_SECONDS=30
 BROWSER_BLOCK_POLL_SECONDS=1.0
 BROWSER_NO_RESULTS_STABLE_SECONDS=1.0
-BROWSER_PAGE_STATE_DEBUG=0
+BROWSER_KPSDK_SAME_SESSION_RECHECKS=2
+BROWSER_KPSDK_SETTLE_SECONDS=10
+BROWSER_PAGE_STATE_DEBUG=1
+BROWSER_USE_RUNTIME_PROFILE_STATE=1
 ```
 
 Optional compatibility names are still accepted by the app: `SQLSERVER_DRIVER`, `SQLSERVER_SERVER`, `SQLSERVER_DATABASE`, `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD`, `SQLSERVER_ENCRYPT`, and `SQLSERVER_TRUST_SERVER_CERTIFICATE`. Prefer the `DB_*` names for Ubuntu production.
@@ -96,7 +100,11 @@ CloakBrowser uses a persistent Playwright-style context. The profile path above 
 
 Do not add a homepage warm-up by default. The verified Ubuntu CloakBrowser test loaded the target list page successfully, while the extra homepage request produced an unrelated 429.
 
-Page-state classification is DOM-first. If listing cards or normal detail content are present, network-only `HTTP 429` or `x-kpsdk` entries do not trigger recovery. Use `BROWSER_PAGE_STATE_DEBUG=1` temporarily to log `page_state`, `cards_found`, `network_reason`, `html_length`, and `body_text_length`.
+Page-state classification is DOM-first. If listing cards or normal detail content are present, network-only `HTTP 429` or `x-kpsdk` entries do not trigger recovery. Keep `BROWSER_PAGE_STATE_DEBUG=1` while stabilizing Ubuntu runs so logs include `page_state`, `cards_found`, `network_reason`, `html_length`, and `body_text_length`.
+
+KPSDK shells are allowed to settle in the same browser session before profile rotation. Module1, Module2, and Module3 wait `BROWSER_KPSDK_SETTLE_SECONDS`, reload the same URL with the same profile, and reclassify up to `BROWSER_KPSDK_SAME_SESSION_RECHECKS` times. Recovery/profile rotation runs only if the page remains blocked after those rechecks.
+
+Treat scan trust explicitly: `listings` and DOM-confirmed `no_results` are trusted; `blocked_*`, `blank_render`, `render_timeout`, and `unknown` are untrusted. Untrusted scans must go retry-wait or technical retry and must not be interpreted as zero listings or used for lifecycle removal.
 
 Keep permissions restricted:
 

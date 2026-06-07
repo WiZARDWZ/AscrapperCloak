@@ -17,6 +17,7 @@ sys.modules.setdefault(
         is_429_page=lambda *a, **k: False,
         raise_if_realestate_blocked=lambda *a, **k: None,
         recover_browser_after_429=lambda *a, **k: None,
+        same_session_kpsdk_recheck=lambda **kwargs: (kwargs.get("initial_result"), kwargs.get("initial_payload")),
     ),
 )
 try:
@@ -357,6 +358,11 @@ class MonitoringRefactorTests(unittest.TestCase):
         self.assertEqual(statuses.count("unknown_pending_retry"), 19)
         self.assertEqual(outcome["result"]["status"], "ready")
         self.assertEqual(outcome["result"]["unknown_price_count"], 19)
+
+    def test_module2_render_states_are_retryable_interruptions(self):
+        self.assertTrue(monitoring_scheduler._module2_interrupted({"status": "render_timeout"}))
+        self.assertTrue(monitoring_scheduler._module2_interrupted({"status": "blank_render"}))
+        self.assertTrue(monitoring_scheduler._module2_interrupted({"status": "unknown"}))
 
     def test_enrich_single_listing_perf_modes_do_not_raise_and_persist(self):
         row = {"listing_id": "42", "url": "https://example.test/42", "price": "$900,000", "address": "A"}

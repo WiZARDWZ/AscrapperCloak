@@ -18,7 +18,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import is_429_page, recover_browser_after_429
+from browser_recovery import is_429_page, recover_browser_after_429, same_session_kpsdk_recheck
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -117,6 +117,13 @@ def get_with_retries(driver, url, tries=2):
             time.sleep(0.6)
 
     return driver, False, last_err
+
+
+def _same_driver_get(driver, url: str):
+    _driver, ok, err = get_with_retries(driver, url, tries=2)
+    if not ok and err:
+        raise err
+    return ok
 
 
 # =========================
@@ -682,7 +689,7 @@ def infer_prices_window_based_with_checkpoint(
         ck["current_window_low"] = low
         ck["current_window_high"] = high
         ck["profile_generation"] = profile_generation
-        ck["current_profile_dir"] = config.MODULE2_PROFILE_BASE_DIR
+        ck["current_profile_dir"] = ck.get("current_profile_dir") or config.MODULE2_PROFILE_BASE_DIR
         ck["profile_rotations"] = profile_rotations
         ck["updated_at"] = datetime.now().isoformat()
         ck["consecutive_get_failures"] = consecutive_get_failures
@@ -769,7 +776,7 @@ def infer_prices_window_based_with_checkpoint(
                 pass
             state_result, cards = wait_for_search_page_state(driver, timeout=wait_timeout, min_cards=1)
             log_func(
-                "   page_state={state} cards_found={cards} network_reason={network} block_reason={reason} "
+                "   Module2 page_state={state} cards_found={cards} network_reason={network} block_reason={reason} "
                 "no_results_detected={no_results} current_url={url} html_length={html_len} body_text_length={body_len}".format(
                     state=state_result.state,
                     cards=state_result.cards_count,
@@ -781,6 +788,20 @@ def infer_prices_window_based_with_checkpoint(
                     body_len=state_result.body_text_length,
                 )
             )
+            state_result, cards = same_session_kpsdk_recheck(
+                driver=driver,
+                url=url,
+                wait_func=wait_for_search_page_state,
+                safe_get_func=_same_driver_get,
+                log_func=log_func,
+                module_name="Module2",
+                timeout=wait_timeout,
+                min_cards=1,
+                initial_result=state_result,
+                initial_payload=cards,
+            )
+            trusted_window = state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}
+            log_func(f"   Module2 trusted_window={trusted_window} state={state_result.state}")
             if state_result.is_blocked:
                 retry_page1_after_rotate = page == 1 and int(ck.get("last_429_page1_window_idx", -1)) != window_idx
                 if page == 1:
@@ -794,6 +815,7 @@ def infer_prices_window_based_with_checkpoint(
                 ck["remaining_ids"] = sorted(remaining)
                 ck["page_state"] = state_result.state
                 ck["network_reason"] = state_result.network_reason
+                ck["trusted_window"] = False
                 save_checkpoint(ck_path, ck)
                 return inferred, driver, ("429_retry_same_window" if retry_page1_after_rotate else "429")
             if state_result.state == PageState.NO_RESULTS:
@@ -803,12 +825,13 @@ def infer_prices_window_based_with_checkpoint(
                 ck["stopped_reason"] = state_result.state if state_result.state != PageState.UNKNOWN else "render_timeout"
                 ck["page_state"] = state_result.state
                 ck["network_reason"] = state_result.network_reason
+                ck["trusted_window"] = False
                 ck["updated_at"] = datetime.now().isoformat()
                 save_checkpoint(ck_path, ck)
                 if page == 1:
                     log_func("   â†³ Render timeout/no usable search content on page 1. Skipping this window.")
                     window_timed_out = True
-                    break
+                    return inferred, driver, ck["stopped_reason"]
                 log_func("   â†³ Render timeout/no usable search content on page > 1. Stop paging this window.")
                 break
 
@@ -1119,7 +1142,7 @@ def module2_run(
             "consecutive_get_failures": 0,
             "consecutive_timeout_windows": 0,
             "profile_generation": 0,
-            "current_profile_dir": _module2_job_profile_dir(out_dir, checkpoint_search_id) if checkpoint_search_id is not None else config.MODULE2_PROFILE_BASE_DIR,
+            "current_profile_dir": config.MODULE2_PROFILE_BASE_DIR,
             "profile_rotations": 0,
             "browser_recovery_action": None,
             "stopped_reason": "",
@@ -1277,7 +1300,7 @@ def module2_run(
         })
         log(f"🎯 Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")
 
-        if status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit"}:
+        if status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit", "render_timeout", "blank_render", "unknown"}:
             module2_run.last_result["status"] = "interrupted_checkpoint_saved" if status == "timeout_limit" else status
             module2_run.last_result["skipped_reason"] = None
             return None, None

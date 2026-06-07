@@ -39,6 +39,21 @@ class DeploymentConfigTests(unittest.TestCase):
             finally:
                 importlib.reload(config)
 
+    def test_bool_env_accepts_explicit_false_values(self):
+        overrides = {
+            "BROWSER_USE_RUNTIME_PROFILE_STATE": "0",
+            "BROWSER_PAGE_STATE_DEBUG": "off",
+            "CLOAK_DISABLE_HTTP2": "false",
+        }
+        with mock.patch.dict(os.environ, overrides, clear=False):
+            reloaded = importlib.reload(config)
+            try:
+                self.assertFalse(reloaded.BROWSER_USE_RUNTIME_PROFILE_STATE)
+                self.assertFalse(reloaded.BROWSER_PAGE_STATE_DEBUG)
+                self.assertFalse(reloaded.CLOAK_DISABLE_HTTP2)
+            finally:
+                importlib.reload(config)
+
     def test_sqlserver_connection_string_uses_db_env_shape(self):
         patches = [
             mock.patch.object(config, "DB_DRIVER", "ODBC Driver 18 for SQL Server"),

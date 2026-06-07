@@ -60,6 +60,87 @@ def is_429_page(driver) -> bool:
     return False
 
 
+KPSDK_RECHECK_BLOCK_STATES = {
+    PageState.BLOCKED_KPSDK,
+    PageState.BLOCKED_HTTP_429,
+    PageState.BLOCKED_ACCESS_DENIED,
+}
+
+KPSDK_RECHECK_USABLE_STATES = {
+    PageState.LISTINGS,
+    PageState.NO_RESULTS,
+    PageState.DETAIL_READY,
+    PageState.DETAIL_REMOVED,
+    PageState.DETAIL_SOLD,
+    PageState.DETAIL_NOT_FOUND,
+}
+
+
+def _unpack_wait_result(wait_result):
+    if isinstance(wait_result, tuple):
+        state_result = wait_result[0] if wait_result else None
+        payload = wait_result[1] if len(wait_result) > 1 else None
+        return state_result, payload
+    return wait_result, None
+
+
+def _call_wait_func(wait_func, driver, timeout, min_cards):
+    if min_cards is None:
+        return wait_func(driver, timeout=timeout)
+    try:
+        return wait_func(driver, timeout=timeout, min_cards=min_cards)
+    except TypeError:
+        return wait_func(driver, timeout=timeout)
+
+
+def same_session_kpsdk_recheck(
+    driver,
+    url,
+    wait_func,
+    safe_get_func,
+    log_func=print,
+    module_name: str = "Module",
+    timeout: int | float = 25,
+    min_cards: int | None = 1,
+    initial_result=None,
+    initial_payload=None,
+):
+    """Let a KPSDK shell settle in the same browser profile before rotating."""
+    state_result = initial_result
+    payload = initial_payload
+    if state_result is None:
+        state_result, payload = _unpack_wait_result(_call_wait_func(wait_func, driver, timeout, min_cards))
+    if getattr(state_result, "state", None) != PageState.BLOCKED_KPSDK:
+        return state_result, payload
+
+    rechecks = max(0, int(getattr(config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2)))
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+
+    for attempt in range(1, rechecks + 1):
+        if settle_seconds:
+            time.sleep(settle_seconds)
+        safe_get_func(driver, url)
+        state_result, payload = _unpack_wait_result(_call_wait_func(wait_func, driver, timeout, min_cards))
+        if log_func:
+            log_func(
+                "{module} KPSDK same-session recheck attempt={attempt} state={state} cards_found={cards} "
+                "html_length={html_len} body_text_length={body_len}".format(
+                    module=module_name,
+                    attempt=attempt,
+                    state=getattr(state_result, "state", None),
+                    cards=getattr(state_result, "cards_count", 0),
+                    html_len=getattr(state_result, "html_length", 0),
+                    body_len=getattr(state_result, "body_text_length", 0),
+                )
+            )
+        if getattr(state_result, "state", None) in KPSDK_RECHECK_USABLE_STATES:
+            return state_result, payload
+        if getattr(state_result, "state", None) not in KPSDK_RECHECK_BLOCK_STATES:
+            return state_result, payload
+
+    return state_result, payload
+
+
 def has_normal_realestate_content(driver, body_text: str = "") -> bool:
     try:
         result = driver.execute_script(

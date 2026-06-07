@@ -65,8 +65,14 @@ def run_initial_baseline_for_subscription(user_area_id: int, max_pages: int | No
         summary = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=baseline_max_pages, timeout=config.PIPELINE_TIMEOUT, full_scan=True, dry_run=False, on_log=on_log)
         safe_errors = [config.mask_sensitive_text(error) for error in summary.get("errors", [])]
         incomplete = _baseline_is_incomplete(summary)
+        scan_status = summary.get("scan_status")
+        trusted_scan = bool(summary.get("trusted_scan"))
         if incomplete:
             safe_errors.append("initial baseline incomplete: max_pages_reached before total_pages_detected")
+        if scan_status == "blocked_rate_limited":
+            safe_errors = safe_errors or [config.mask_sensitive_text(summary.get("blocked_reason") or summary.get("stop_reason") or "blocked_rate_limited")]
+        elif not trusted_scan:
+            safe_errors = safe_errors or [config.mask_sensitive_text(summary.get("stop_reason") or "untrusted_baseline_scan")]
         metrics = {
             "listings_collected": summary.get("rows_scraped", 0),
             "new_count": summary.get("new_count", 0),
@@ -76,7 +82,10 @@ def run_initial_baseline_for_subscription(user_area_id: int, max_pages: int | No
         }
         conn = db_layer.connect(config.DB_PATH)
         try:
-            if safe_errors:
+            if scan_status == "blocked_rate_limited":
+                db_layer.mark_subscription_baseline_failed(conn, user_area_id, str(safe_errors), **metrics)
+                status = "retry_wait"
+            elif safe_errors:
                 db_layer.mark_subscription_baseline_failed(conn, user_area_id, str(safe_errors), **metrics)
                 status = "incomplete" if incomplete else "failed"
             else:
@@ -84,7 +93,10 @@ def run_initial_baseline_for_subscription(user_area_id: int, max_pages: int | No
                 status = "completed"
         finally:
             conn.close()
-        return {"user_area_id": user_area_id, "status": status, "area_label": sub.get("AreaLabel"), "search_url": sub.get("SearchURL"), **metrics, "errors": safe_errors}
+        out = {"user_area_id": user_area_id, "status": status, "area_label": sub.get("AreaLabel"), "search_url": sub.get("SearchURL"), **metrics, "errors": safe_errors, "trusted_scan": trusted_scan, "scan_status": scan_status}
+        if status == "retry_wait":
+            out["retry_after_seconds"] = int(summary.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+        return out
     except RealEstateBlockedError as exc:
         safe_error = config.mask_sensitive_text(getattr(exc, "reason", str(exc)))
         conn = db_layer.connect(config.DB_PATH)
@@ -438,6 +450,10 @@ def run_monitoring_tick(dry_run: bool = False, send_telegram: bool = False, noti
                         light_result = {"user_area_id": user_area_id, "search_id": search_id, "status": "due", "search_url": sub.get("SearchURL")}
                     else:
                         light_result = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=config.LIGHT_CHECK_PAGES, timeout=config.PIPELINE_TIMEOUT, dry_run=False)
+                        if light_result.get("scan_status") == "blocked_rate_limited":
+                            result["errors"].append({"user_area_id": user_area_id, "stage": "light_check", "errors": light_result.get("blocked_reason") or light_result.get("stop_reason")})
+                            result["light_checks"].append(light_result | {"user_area_id": user_area_id, "search_id": search_id})
+                            continue
                         if light_result.get("scan_status") == "technical_failure":
                             result["errors"].append({"user_area_id": user_area_id, "stage": "light_check", "errors": light_result.get("errors") or light_result.get("stop_reason")})
                             result["light_checks"].append(light_result | {"user_area_id": user_area_id, "search_id": search_id})
@@ -1005,7 +1021,7 @@ class Module2RetryableInterruption(RuntimeError):
 
 def _module2_interrupted(metadata: dict[str, Any]) -> bool:
     status = str((metadata or {}).get("status") or "").lower()
-    return status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit", "429", "429_retry_same_window"}
+    return status in {"retry_wait_network_interrupted", "interrupted_checkpoint_saved", "timeout_limit", "429", "429_retry_same_window", "render_timeout", "blank_render", "unknown"}
 
 
 def _unknown_price_debug(candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1588,6 +1604,13 @@ def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = Fals
     if dry_run:
         return {"status": "dry_run", "search_id": search_id, "search_url": sub.get("SearchURL")}
     light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=getattr(config, "INITIAL_BASELINE_MAX_PAGES", None), timeout=config.PIPELINE_TIMEOUT, full_scan=True, dry_run=False)
+    if light.get("scan_status") == "blocked_rate_limited":
+        return {
+            "status": "retry_wait",
+            "reason": light.get("blocked_reason") or light.get("stop_reason") or "blocked_rate_limited",
+            "retry_after_seconds": int(light.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+            "full_sweep": light,
+        }
     if light.get("scan_status") == "technical_failure":
         raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
     if not _search_is_active_for_monitoring(search_id):
@@ -1688,6 +1711,13 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         if not sub:
             return {"status": "skipped", "reason": "subscription_not_found"}
         light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=config.LIGHT_CHECK_PAGES, timeout=config.PIPELINE_TIMEOUT, dry_run=False)
+        if light.get("scan_status") == "blocked_rate_limited":
+            return {
+                "status": "retry_wait",
+                "reason": light.get("blocked_reason") or light.get("stop_reason") or "blocked_rate_limited",
+                "retry_after_seconds": int(light.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                "light_check": light,
+            }
         if light.get("scan_status") == "technical_failure":
             raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
         new_listing_jobs = _enqueue_new_listing_processing(search_id, user_area_id, _listing_ids_from_light(light))
@@ -1736,7 +1766,8 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
             job_queue.mark_job_succeeded(int(job["JobID"]), result)
         elif str(result.get("status") or "").startswith("retry_wait"):
             retry_after_seconds = int(result.get("retry_after_seconds") or int(getattr(config, "DETAIL_REFRESH_INTERVAL_HOURS", 1)) * 3600)
-            if str(result.get("reason") or "").startswith("realestate_rate_limited_or_blocked"):
+            retry_reason = str(result.get("reason") or "")
+            if retry_reason.startswith("realestate_rate_limited_or_blocked") or retry_reason in {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied", "blocked_rate_limited"}:
                 job_queue.mark_job_retry_wait(int(job["JobID"]), result.get("reason") or result, retry_after_seconds=retry_after_seconds)
             else:
                 job_queue.mark_job_failed(int(job["JobID"]), result.get("reason") or result, retryable=True, retry_after_seconds=retry_after_seconds)

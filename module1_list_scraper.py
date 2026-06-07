@@ -23,7 +23,7 @@ from cloak_browser_helper import (
 from config import AREA_SEARCH_URL
 import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
-from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_after_429
+from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_after_429, same_session_kpsdk_recheck
 from realestate_page_state import PageState, wait_for_search_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 
@@ -129,41 +129,19 @@ def _stop_page_loading(driver) -> None:
         pass
 
 
-_KPSDK_RECHECK_BLOCK_STATES = {
-    PageState.BLOCKED_KPSDK,
-    PageState.BLOCKED_HTTP_429,
-    PageState.BLOCKED_ACCESS_DENIED,
-}
-
-
 def _same_session_kpsdk_recheck(driver, url: str, timeout: int | float, min_cards: int, state_result, cards, log):
-    if state_result.state != PageState.BLOCKED_KPSDK:
-        return state_result, cards
-
-    rechecks = max(0, int(getattr(config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2)))
-    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
-
-    for attempt in range(1, rechecks + 1):
-        if settle_seconds:
-            time.sleep(settle_seconds)
-        safe_get(driver, url)
-        state_result, cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=min_cards)
-        log(
-            "Module1 KPSDK same-session recheck attempt={attempt} state={state} cards_found={cards} "
-            "html_length={html_len} body_text_length={body_len}".format(
-                attempt=attempt,
-                state=state_result.state,
-                cards=state_result.cards_count,
-                html_len=state_result.html_length,
-                body_len=state_result.body_text_length,
-            )
-        )
-        if state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}:
-            return state_result, cards
-        if state_result.state not in _KPSDK_RECHECK_BLOCK_STATES:
-            return state_result, cards
-
-    return state_result, cards
+    return same_session_kpsdk_recheck(
+        driver=driver,
+        url=url,
+        wait_func=wait_for_search_page_state,
+        safe_get_func=safe_get,
+        log_func=log,
+        module_name="Module1",
+        timeout=timeout,
+        min_cards=min_cards,
+        initial_result=state_result,
+        initial_payload=cards,
+    )
 
 
 def _collect_network_debug(driver) -> dict:

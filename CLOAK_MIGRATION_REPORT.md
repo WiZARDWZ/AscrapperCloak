@@ -37,9 +37,10 @@ CLOAK_VIEWPORT_WIDTH=1365
 CLOAK_VIEWPORT_HEIGHT=768
 CLOAK_LOCALE=en-AU
 CLOAK_TIMEZONE=Australia/Sydney
-CLOAK_DISABLE_HTTP2=0
+CLOAK_DISABLE_HTTP2=1
 CLOAK_USE_PERSISTENT_CONTEXT=1
 CLOAK_HEADLESS=0
+MODULE2_PROFILE_BASE_DIR=
 LOW_BANDWIDTH_MODE=0
 BLOCK_HEAVY_RESOURCES=0
 BLOCK_TRACKERS=0
@@ -49,6 +50,10 @@ BLOCK_FONTS=0
 BLOCK_MAPS=0
 BLOCK_ADS=0
 BLOCK_ANALYTICS=0
+BROWSER_KPSDK_SAME_SESSION_RECHECKS=2
+BROWSER_KPSDK_SETTLE_SECONDS=10
+BROWSER_PAGE_STATE_DEBUG=1
+BROWSER_USE_RUNTIME_PROFILE_STATE=1
 ```
 
 Production should still run headed inside Xvfb:
@@ -58,6 +63,10 @@ HEADLESS=0 xvfb-run -a -s "-screen 0 1365x768x24" .venv/bin/python telegram_bot.
 ```
 
 No homepage warm-up is used by default.
+
+Module1, Module2, and Module3 share a KPSDK same-session recheck helper. A first `blocked_kpsdk` shell does not rotate the profile immediately; the scraper waits, reloads the same URL with the same driver/profile, reclassifies, and only falls back to existing checkpoint/recovery behavior if the page remains blocked.
+
+Scan trust is explicit across monitoring: `listings` and stable DOM-confirmed `no_results` are trusted, while `blocked_*`, `blank_render`, `render_timeout`, and `unknown` are untrusted. Untrusted scans do not complete baselines, do not represent zero listings, and must not drive missing/removed lifecycle transitions.
 
 ## Files Changed
 
@@ -79,6 +88,9 @@ No homepage warm-up is used by default.
 - `tests/test_cloak_migration_static.py`: static regression test for old browser imports and Module1 schema keys.
 - `realestate_page_state.py`: centralized page-state classifier.
 - `tests/test_realestate_page_state.py`: fake-driver tests for network 429 with cards, KPSDK block, no-results, render timeout, and detail-ready pages.
+- `tests/test_module2_block_detection.py`: Module2 KPSDK same-session recheck, no-results, persistent block, and render-timeout regressions.
+- `tests/test_module3_block_detection.py`: Module3 KPSDK detail-ready/lifecycle/recovery and render-timeout regressions.
+- `tests/test_area_light_checker_trust.py`: light-check trusted versus blocked/technical scan metadata.
 
 ## Local Verification
 

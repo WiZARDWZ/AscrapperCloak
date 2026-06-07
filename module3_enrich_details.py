@@ -16,7 +16,7 @@ from cloak_browser_helper import By, EC, WebDriverWait, TimeoutException, WebDri
 
 from config import AREA_SEARCH_URL
 import config
-from browser_recovery import is_429_page, recover_browser_after_429
+from browser_recovery import is_429_page, recover_browser_after_429, same_session_kpsdk_recheck
 from realestate_page_state import PageState, wait_for_detail_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 
@@ -73,6 +73,13 @@ def get_with_retries(driver, url, tries=2):
             time.sleep(0.6)
 
     return driver, False, last_err
+
+
+def _same_driver_get(driver, url: str):
+    _driver, ok, err = get_with_retries(driver, url, tries=2)
+    if not ok and err:
+        raise err
+    return ok
 
 
 # -------------------------
@@ -998,7 +1005,7 @@ def module3_run(
             time.sleep(0.35)
             detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
             log(
-                "Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
+                "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
                 "html_length={html_len} body_text_length={body_len}".format(
                     state=detail_state.state,
                     network=detail_state.network_reason,
@@ -1008,6 +1015,17 @@ def module3_run(
                     body_len=detail_state.body_text_length,
                 )
             )
+            detail_state, _ = same_session_kpsdk_recheck(
+                driver=driver,
+                url=url,
+                wait_func=wait_for_detail_page_state,
+                safe_get_func=_same_driver_get,
+                log_func=log,
+                module_name="Module3",
+                timeout=wait_timeout,
+                min_cards=None,
+                initial_result=detail_state,
+            )
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(r, detail_state)
                 done.add(lid)
@@ -1015,14 +1033,14 @@ def module3_run(
                 ck["last_index"] = idx
                 save_checkpoint(ck_path, ck)
                 continue
-            if detail_state.state == PageState.RENDER_TIMEOUT:
+            if detail_state.state in {PageState.RENDER_TIMEOUT, PageState.BLANK_RENDER, PageState.UNKNOWN}:
                 try:
                     driver.refresh()
                     detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
                 except Exception:
                     pass
-                if detail_state.state == PageState.RENDER_TIMEOUT:
-                    r["detail_error"] = "detail_render_timeout"
+                if detail_state.state in {PageState.RENDER_TIMEOUT, PageState.BLANK_RENDER, PageState.UNKNOWN}:
+                    r["detail_error"] = "detail_render_timeout" if detail_state.state == PageState.RENDER_TIMEOUT else f"detail_{detail_state.state}"
                     done.add(lid)
                     ck["done_listing_ids"] = list(done)
                     ck["last_index"] = idx
@@ -1091,9 +1109,9 @@ def module3_run(
                         wait_for_detail_ready(driver, timeout=wait_timeout)
                         data = extract_detail_data(driver)
                     except Exception as e:
-                        data = {"detail_error": f"empty_extract_after_retry: {e}"}
+                        data = {"detail_error": f"detail_parse_empty_after_retry: {e}"}
                 else:
-                    data = {"detail_error": "empty_extract"}
+                    data = {"detail_error": "detail_parse_empty"}
 
             # merge into row
             r["detail_scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1195,7 +1213,7 @@ def enrich_detail_rows(
                 continue
             detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
             log(
-                "Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
+                "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
                 "html_length={html_len} body_text_length={body_len}".format(
                     state=detail_state.state,
                     network=detail_state.network_reason,
@@ -1205,19 +1223,31 @@ def enrich_detail_rows(
                     body_len=detail_state.body_text_length,
                 )
             )
+            detail_state, _ = same_session_kpsdk_recheck(
+                driver=driver,
+                url=url,
+                wait_func=wait_for_detail_page_state,
+                safe_get_func=_same_driver_get,
+                log_func=log,
+                module_name="Module3",
+                timeout=wait_timeout,
+                min_cards=None,
+                initial_result=detail_state,
+            )
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(merged, detail_state)
                 enriched.append(merged)
                 time.sleep(max(0.0, sleep_between))
                 continue
-            if detail_state.state == PageState.RENDER_TIMEOUT:
+            if detail_state.state in {PageState.RENDER_TIMEOUT, PageState.BLANK_RENDER, PageState.UNKNOWN}:
                 try:
                     driver.refresh()
                     detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
                 except Exception:
                     pass
-                if detail_state.state == PageState.RENDER_TIMEOUT:
-                    _mark_detail_failure(merged, "detail_render_timeout")
+                if detail_state.state in {PageState.RENDER_TIMEOUT, PageState.BLANK_RENDER, PageState.UNKNOWN}:
+                    reason = "detail_render_timeout" if detail_state.state == PageState.RENDER_TIMEOUT else f"detail_{detail_state.state}"
+                    _mark_detail_failure(merged, reason)
                     enriched.append(merged)
                     continue
             listing_429_retries = 0
@@ -1262,7 +1292,7 @@ def enrich_detail_rows(
                         wait_ready = False
                     data = extract_detail_data(driver)
                 except Exception as e:
-                    data = {"detail_error": f"empty_extract_after_retry: {e}"}
+                    data = {"detail_error": f"detail_parse_empty_after_retry: {e}"}
             quality = _detail_quality(data or {}, wait_ready=wait_ready)
             _merge_extracted_detail(merged, data or {}, quality, only_if_missing=False)
             if original_external_id is not None:
