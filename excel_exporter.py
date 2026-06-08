@@ -236,6 +236,14 @@ def _apply_normal_format(ws) -> None:
                 ws.cell(row=row_idx, column=idx).alignment = Alignment(wrap_text=True, vertical="top")
 
 
+def get_zero_row_diagnostics(telegram_user_id: int | None, user_area_id: int | None, search_id: int | None) -> dict:
+    conn = _connect()
+    try:
+        return db_layer.get_excel_export_zero_row_diagnostics(conn, telegram_user_id, user_area_id, search_id)
+    finally:
+        conn.close()
+
+
 def build_active_listings_excel(search_id: int, area_label: str, output_dir: str | None = None, mode: str = "normal") -> ExcelExportResult:
     mode = normalize_export_mode(mode)
     out_dir = output_dir or config.OUTPUT_DIR
@@ -283,4 +291,5 @@ __all__ = [
     "export_area_excel",
     "get_authorized_export_area",
     "get_user_export_areas",
+    "get_zero_row_diagnostics",
 ]

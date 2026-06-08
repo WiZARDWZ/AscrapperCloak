@@ -719,14 +719,13 @@ async def handle_export_area_selection(update: Update, context: ContextTypes.DEF
             result.file_path,
         )
         if int(result.active_listing_count or 0) == 0:
+            diagnostics = await asyncio.to_thread(excel_exporter.get_zero_row_diagnostics, telegram_user_id, user_area_id, search_id)
             logger.warning(
-                "Excel export generated zero rows telegram_user_id=%s user_area_id=%s resolved_search_id=%s snapshot_count=%s inference_count=%s export_rows=%s",
+                "Excel export generated zero rows telegram_user_id=%s user_area_id=%s resolved_search_id=%s diagnostics=%s",
                 telegram_user_id,
                 user_area_id,
                 search_id,
-                "unknown",
-                "unknown",
-                0,
+                config.mask_sensitive_text(diagnostics),
             )
             await update.effective_chat.send_message("Excel export generated no rows for this area. Please try again after monitoring refreshes.", reply_markup=main_menu_keyboard())
             return

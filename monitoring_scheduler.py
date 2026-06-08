@@ -15,6 +15,12 @@ from area_light_checker import light_check_area
 from listing_detail_refresher import is_retryable_detail_batch_failure, refresh_active_listings
 from json_safe import json_safe
 from realestate_errors import RealEstateBlockedError
+try:
+    from browser_recovery import is_retryable_navigation_error
+except Exception:
+    def is_retryable_navigation_error(exc):
+        text = str(exc or "").lower()
+        return "net::" in text or "page.goto" in text or "timeout" in text
 
 
 def _utcnow() -> datetime:
@@ -712,6 +718,19 @@ def _due_decision(search_id: int, job_type: str, last_at, current_time_used: dat
     }
 
 
+def _terminal_failed_area_blocks_auto_baseline(search_id: int) -> bool:
+    try:
+        conn = db_layer.connect(config.DB_PATH)
+        try:
+            state = db_layer.get_area_monitoring_state(conn, int(search_id))
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    status = str((state or {}).get("setup_status") or "").lower()
+    return status in {"failed", "failed_ingest"}
+
+
 def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
     import job_queue
 
@@ -742,6 +761,9 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
         try:
             if not _subscription_group_is_ready(group):
                 result["not_ready_search_ids_considered"].append(search_id)
+                if _terminal_failed_area_blocks_auto_baseline(search_id):
+                    result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "reason": "terminal_failed_area_requires_manual_retry"})
+                    continue
                 job = job_queue.enqueue_job_once(
                     job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
                     search_id=search_id,
@@ -1780,5 +1802,7 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         failure = job_queue.mark_job_retry_wait(int(job["JobID"]), reason, retry_after_seconds=retry_after_seconds)
         return {"status": "retry_wait", "claimed_job": job, "error": reason, "failure": failure}
     except Exception as exc:
-        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=True)
-        return {"status": "failed", "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure}
+        retryable = is_retryable_navigation_error(exc) or isinstance(exc, Module2RetryableInterruption)
+        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=retryable)
+        status = "retry_wait" if retryable else "failed"
+        return {"status": status, "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure}

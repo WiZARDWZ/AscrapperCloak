@@ -18,7 +18,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import is_429_page, recover_browser_after_429, same_session_kpsdk_recheck
+from browser_recovery import is_429_page, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -101,8 +101,14 @@ def get_with_retries(driver, url, tries=2):
     last_err = None
     for _ in range(tries):
         try:
-            driver.get(url)
-            return driver, True, None
+            ok, exc = safe_driver_get(driver, url)
+            if ok:
+                return driver, True, None
+            last_err = exc
+            if is_internet_disconnected(exc):
+                return driver, False, exc
+            time.sleep(0.6)
+            continue
         except TimeoutException as e:
             last_err = e
             try:
@@ -742,6 +748,7 @@ def infer_prices_window_based_with_checkpoint(
                             build_driver_func=build_driver,
                             rotations_used=int(ck.get("profile_rotations", 0)),
                             max_rotations=config.MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN,
+                            reason="module2_navigation_or_page_state",
                             log_func=log_func,
                         )
                         ck["profile_rotations"] = new_rotations
@@ -1268,6 +1275,7 @@ def module2_run(
                 build_driver_func=build_driver,
                 rotations_used=rotations,
                 max_rotations=config.MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN,
+                reason="module2_blocked_page_state",
                 log_func=log,
             )
             if recovery_status != "recovered":
