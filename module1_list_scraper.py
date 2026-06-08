@@ -23,7 +23,7 @@ from cloak_browser_helper import (
 from config import AREA_SEARCH_URL
 import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
-from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_after_429, same_session_kpsdk_recheck
+from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 
@@ -106,16 +106,9 @@ def is_headless_enabled() -> bool:
 
 
 def safe_get(driver, url: str):
-    """جلوگیری از کرش در renderer/page load timeout"""
-    try:
-        driver.get(url)
-        return True
-    except TimeoutException:
-        try:
-            driver.execute_script("window.stop();")
-        except Exception:
-            pass
-        return False
+    """Navigate while preserving DOM-first classification after renderer/page failures."""
+    ok, _exc = safe_driver_get(driver, url)
+    return ok
 
 
 def _stop_page_loading(driver) -> None:
@@ -742,6 +735,7 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                     build_driver_func=setup_driver,
                     rotations_used=rotations_used,
                     max_rotations=min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN),
+                    reason=state_result.state,
                     log_func=log,
                 )
                 if recovery_status != "recovered":
@@ -916,6 +910,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     build_driver_func=setup_driver,
                     rotations_used=rotations_used,
                     max_rotations=min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN),
+                    reason=state_result.state,
                     log_func=log,
                 )
                 if recovery_status != "recovered":
