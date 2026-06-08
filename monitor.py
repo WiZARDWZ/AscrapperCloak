@@ -647,8 +647,26 @@ def baseline_setup_area(
             rows_after_module2 = json.load(f)
         full_rows = _merge_rows_by_listing_id(rows_after_module3, rows_after_module2)
 
-    run_id = ingest_full_rows(config.DB_PATH, normalized_url, full_rows, full_scan=True, emit_events=False)
-    price_counts = _record_price_states_for_rows(config.DB_PATH, area_id, full_rows, attempted_module2=module2_attempted)
+    try:
+        run_id = ingest_full_rows(config.DB_PATH, normalized_url, full_rows, full_scan=True, emit_events=False)
+        price_counts = _record_price_states_for_rows(config.DB_PATH, area_id, full_rows, attempted_module2=module2_attempted)
+    except Exception as exc:
+        conn = connect(config.DB_PATH)
+        try:
+            upsert_area_monitoring_state(
+                conn,
+                area_id,
+                setup_status="failed_ingest",
+                module1_status="completed",
+                module3_status="completed",
+                module2_status="completed" if module2_attempted else "skipped",
+                active_listing_count=len(full_rows),
+                last_error=config.mask_sensitive_text(exc),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        raise
     conn = connect(config.DB_PATH)
     try:
         upsert_area_monitoring_state(
