@@ -16,8 +16,9 @@ from cloak_browser_helper import By, EC, WebDriverWait, TimeoutException, WebDri
 
 from config import AREA_SEARCH_URL
 import config
-from browser_recovery import is_429_page, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get
-from realestate_page_state import PageState, wait_for_detail_page_state
+from browser_recovery import is_429_page, is_retryable_navigation_error, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
+from realestate_errors import RealEstateBlockedError
+from realestate_page_state import PageState, classify_detail_page, wait_for_detail_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 
 # -------------------------
@@ -58,6 +59,14 @@ def get_with_retries(driver, url, tries=2):
     for _ in range(tries):
         try:
             ok, exc = safe_driver_get(driver, url)
+            try:
+                driver._module3_last_navigation = {
+                    "url": url,
+                    "navigation_failed": not ok,
+                    "navigation_error": exc,
+                }
+            except Exception:
+                pass
             if ok:
                 return driver, True, None
             last_err = exc
@@ -86,6 +95,195 @@ def _same_driver_get(driver, url: str):
     if not ok and err:
         raise err
     return ok
+
+
+def _module3_current_url(driver, state_result=None) -> str:
+    if state_result is not None and getattr(state_result, "current_url", None):
+        return str(state_result.current_url or "")
+    try:
+        return str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        return ""
+
+
+def _module3_is_chrome_error_url(value: str | None) -> bool:
+    return str(value or "").strip().lower().startswith("chrome-error://chromewebdata")
+
+
+def _module3_last_navigation(driver) -> dict:
+    try:
+        value = getattr(driver, "_module3_last_navigation", {}) or {}
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _module3_detail_recovery_reason(driver, detail_state, navigation_info: dict) -> str:
+    state = getattr(detail_state, "state", None) or "unknown"
+    reason = getattr(detail_state, "reason", None) or state
+    if _module3_is_chrome_error_url(_module3_current_url(driver, detail_state)):
+        reason = f"chrome_error:{reason}"
+    if navigation_info.get("navigation_error") is not None:
+        reason = f"navigation_failed:{reason}:{navigation_info.get('navigation_error')}"
+    return config.mask_sensitive_text(reason)
+
+
+def _module3_is_same_page_kpsdk_candidate(driver, requested_url: str, detail_state) -> bool:
+    current_url = _module3_current_url(driver, detail_state)
+    if _module3_is_chrome_error_url(current_url):
+        return False
+    current_l = str(current_url or "").lower()
+    requested_l = str(requested_url or "").lower()
+    if "realestate.com.au" not in current_l:
+        return False
+    if requested_l and "realestate.com.au" in requested_l:
+        current = urlparse(current_l)
+        requested = urlparse(requested_l)
+        if (current.netloc, current.path) != (requested.netloc, requested.path):
+            return False
+    state = getattr(detail_state, "state", None)
+    network_reason = str(getattr(detail_state, "network_reason", "") or "").lower()
+    reason = str(getattr(detail_state, "reason", "") or "").lower()
+    is_transient_block = state in {PageState.BLOCKED_KPSDK, PageState.BLOCKED_HTTP_429}
+    is_network_429 = "blocked_http_429" in network_reason or "blocked_http_429" in reason
+    is_kpsdk = "kpsdk" in network_reason or "kpsdk" in reason
+    if not (is_transient_block or is_network_429 or is_kpsdk):
+        return False
+    html_len = int(getattr(detail_state, "html_length", 0) or 0)
+    body_len = int(getattr(detail_state, "body_text_length", 0) or 0)
+    return html_len < 5000 or body_len < 250 or is_transient_block
+
+
+def _module3_same_page_kpsdk_settle(driver, requested_url: str, detail_state, *, log):
+    if not _module3_is_same_page_kpsdk_candidate(driver, requested_url, detail_state):
+        return detail_state
+    log(
+        "Module3 transient KPSDK detected; same-page settle start "
+        f"state={getattr(detail_state, 'state', None)} current_url={_module3_current_url(driver, detail_state)} "
+        f"html_length={getattr(detail_state, 'html_length', 0) or 0} "
+        f"body_text_length={getattr(detail_state, 'body_text_length', 0) or 0}"
+    )
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+    grace_seconds = max(settle_seconds, float(getattr(config, "BROWSER_BLOCK_GRACE_SECONDS", 30)))
+    poll_seconds = max(0.05, float(getattr(config, "BROWSER_BLOCK_POLL_SECONDS", 1.0)))
+    deadline = time.time() + grace_seconds
+    next_sleep = settle_seconds if settle_seconds > 0 else poll_seconds
+    previous_html_len = int(getattr(detail_state, "html_length", 0) or 0)
+    last = detail_state
+    while time.time() <= deadline:
+        time.sleep(min(next_sleep, max(0.0, deadline - time.time())))
+        current = classify_detail_page(driver, timeout=True)
+        log(
+            "Module3 same-page settle result state={state} html_length={html_len} body_text_length={body_len} "
+            "network_reason={network} current_url={url}".format(
+                state=current.state,
+                html_len=getattr(current, "html_length", 0) or 0,
+                body_len=getattr(current, "body_text_length", 0) or 0,
+                network=getattr(current, "network_reason", None),
+                url=getattr(current, "current_url", "") or _module3_current_url(driver),
+            )
+        )
+        last = current
+        if current.state in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
+            log("Module3 DOM-first detail ready after transient KPSDK; ignoring historical 429")
+            return current
+        if _module3_is_chrome_error_url(_module3_current_url(driver, current)):
+            return current
+        html_len = int(getattr(current, "html_length", 0) or 0)
+        title = str(getattr(current, "title", "") or "").lower()
+        still_loading_rea = "real estate" in title or "realestate.com.au" in title or html_len > previous_html_len
+        if not still_loading_rea:
+            break
+        previous_html_len = max(previous_html_len, html_len)
+        next_sleep = poll_seconds
+    return last
+
+
+def _module3_detail_state_is_recoverable(driver, detail_state, navigation_info: dict) -> bool:
+    if _module3_is_chrome_error_url(_module3_current_url(driver, detail_state)):
+        return True
+    state = getattr(detail_state, "state", None)
+    if state in UNTRUSTED_RECOVERY_STATES:
+        return True
+    return bool(navigation_info.get("navigation_failed") and state not in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD})
+
+
+def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotations_used: int, wait_timeout: int, log):
+    """Load one detail URL with DOM-first classification and bounded profile recovery."""
+    retry_after = int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+    max_rotations = min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE3_MAX_PROFILE_ROTATIONS_PER_RUN)
+    max_attempts = max(1, int(getattr(config, "MODULE3_RETRY_SAME_LISTING_AFTER_429", 1)) + max_rotations + 1)
+    last_state = None
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        driver, ok, err = get_with_retries(driver, url, tries=1)
+        navigation_info = _module3_last_navigation(driver)
+        last_error = err or navigation_info.get("navigation_error")
+        if ok:
+            try:
+                WebDriverWait(driver, min(5, wait_timeout)).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
+                )
+            except Exception:
+                pass
+            time.sleep(0.35)
+            detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
+        else:
+            detail_state = classify_detail_page(driver, timeout=True)
+        last_state = detail_state
+        log(
+            "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
+            "html_length={html_len} body_text_length={body_len} attempt={attempt}".format(
+                state=detail_state.state,
+                network=detail_state.network_reason,
+                reason=detail_state.reason,
+                url=detail_state.current_url,
+                html_len=detail_state.html_length,
+                body_len=detail_state.body_text_length,
+                attempt=attempt,
+            )
+        )
+        detail_state = _module3_same_page_kpsdk_settle(driver, url, detail_state, log=log)
+        detail_state, _ = same_session_kpsdk_recheck(
+            driver=driver,
+            url=url,
+            wait_func=wait_for_detail_page_state,
+            safe_get_func=_same_driver_get,
+            log_func=log,
+            module_name="Module3",
+            timeout=wait_timeout,
+            min_cards=None,
+            initial_result=detail_state,
+        )
+        last_state = detail_state
+        if detail_state.state in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
+            return driver, profile_dir_current, rotations_used, detail_state, True, None
+        if not (config.BROWSER_RECOVERY_ON_429 and _module3_detail_state_is_recoverable(driver, detail_state, navigation_info)):
+            return driver, profile_dir_current, rotations_used, detail_state, ok, last_error
+        reason = _module3_detail_recovery_reason(driver, detail_state, navigation_info)
+        log(f"Module3 untrusted detail state={detail_state.state} current_url={_module3_current_url(driver, detail_state)}. Recovering profile/session reason={reason}.")
+        driver, rotations_used, profile_dir_current, recovery_status = recover_browser_after_429(
+            driver=driver,
+            current_profile_dir=profile_dir_current,
+            build_driver_func=build_driver,
+            rotations_used=rotations_used,
+            max_rotations=max_rotations,
+            reason=reason,
+            log_func=log,
+        )
+        if recovery_status != "recovered":
+            return driver, profile_dir_current, rotations_used, detail_state, False, RealEstateBlockedError(reason, retry_after_seconds=retry_after)
+    reason = _module3_detail_recovery_reason(driver, last_state, _module3_last_navigation(driver)) if last_state is not None else config.mask_sensitive_text(last_error or "module3_detail_retry_limit")
+    return driver, profile_dir_current, rotations_used, last_state, False, RealEstateBlockedError(reason, retry_after_seconds=retry_after)
+
+
+def _module3_retryable_result(reason: Any) -> dict:
+    retry_after = int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+    return {
+        "status": "retry_wait_browser_recovery",
+        "reason": config.mask_sensitive_text(reason or "module3_retryable_browser_failure"),
+        "retry_after_seconds": retry_after,
+    }
 
 
 # -------------------------
@@ -905,6 +1103,7 @@ def module3_run(
     on_progress=None,
     on_log=None,
 ):
+    module3_run.last_result = {"status": "running"}
     os.makedirs(out_dir, exist_ok=True)
 
     def log(msg: str) -> None:
@@ -983,55 +1182,28 @@ def module3_run(
             log(f"\n🔎 Detail {idx+1}/{len(rows)} | listing_id={lid}")
 
             listing_429_retries = 0
-            driver, ok, err = get_with_retries(driver, url, tries=2)
+            driver, profile_dir_current, rotations_used, detail_state, ok, err = _module3_load_detail_page(
+                driver,
+                url,
+                profile_dir_current,
+                rotations_used,
+                wait_timeout,
+                log,
+            )
             if not ok:
                 consecutive_get_failures += 1
-
-                if err and is_internet_disconnected(err):
-                    log("Network interrupted. Checkpoint saved; rerun to resume.")
-                    ck["last_index"] = idx
-                    save_checkpoint(ck_path, ck)
+                ck["last_index"] = idx
+                save_checkpoint(ck_path, ck)
+                if isinstance(err, RealEstateBlockedError) or is_retryable_navigation_error(err):
+                    module3_run.last_result = _module3_retryable_result(err)
+                    log("Retryable Module3 browser/navigation interruption. Checkpoint saved; job should retry_wait.")
                     return None, None
-
                 log("   -> GET failed/timeout (renderer).")
                 if consecutive_get_failures >= 2:
                     log("   -> Restarting driver ...")
                     driver = restart_driver(driver)
                     consecutive_get_failures = 0
-
-                ck["last_index"] = idx
-                save_checkpoint(ck_path, ck)
                 continue
-            try:
-                WebDriverWait(driver, min(5, wait_timeout)).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
-                )
-            except Exception:
-                pass
-            time.sleep(0.35)
-            detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
-            log(
-                "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
-                "html_length={html_len} body_text_length={body_len}".format(
-                    state=detail_state.state,
-                    network=detail_state.network_reason,
-                    reason=detail_state.reason,
-                    url=detail_state.current_url,
-                    html_len=detail_state.html_length,
-                    body_len=detail_state.body_text_length,
-                )
-            )
-            detail_state, _ = same_session_kpsdk_recheck(
-                driver=driver,
-                url=url,
-                wait_func=wait_for_detail_page_state,
-                safe_get_func=_same_driver_get,
-                log_func=log,
-                module_name="Module3",
-                timeout=wait_timeout,
-                min_cards=None,
-                initial_result=detail_state,
-            )
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(r, detail_state)
                 done.add(lid)
@@ -1140,6 +1312,7 @@ def module3_run(
 
         # خروجی FULL
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
+        module3_run.last_result = {"status": "completed", "rows": len(rows), "output_json": out_json}
         log("\nModule3 done. FULL files saved:")
         log(f" - {out_csv}")
         log(f" - {out_json}")
@@ -1213,34 +1386,20 @@ def enrich_detail_rows(
                 _mark_detail_failure(merged, "missing_url")
                 enriched.append(merged)
                 continue
-            driver, ok, _ = get_with_retries(driver, url, tries=2)
+            driver, profile_dir_current, rotations_used, detail_state, ok, err = _module3_load_detail_page(
+                driver,
+                url,
+                profile_dir_current,
+                rotations_used,
+                wait_timeout,
+                log,
+            )
             if not ok:
+                if isinstance(err, RealEstateBlockedError):
+                    raise err
                 _mark_detail_failure(merged, "get_failed")
                 enriched.append(merged)
                 continue
-            detail_state = wait_for_detail_page_state(driver, timeout=wait_timeout)
-            log(
-                "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
-                "html_length={html_len} body_text_length={body_len}".format(
-                    state=detail_state.state,
-                    network=detail_state.network_reason,
-                    reason=detail_state.reason,
-                    url=detail_state.current_url,
-                    html_len=detail_state.html_length,
-                    body_len=detail_state.body_text_length,
-                )
-            )
-            detail_state, _ = same_session_kpsdk_recheck(
-                driver=driver,
-                url=url,
-                wait_func=wait_for_detail_page_state,
-                safe_get_func=_same_driver_get,
-                log_func=log,
-                module_name="Module3",
-                timeout=wait_timeout,
-                min_cards=None,
-                initial_result=detail_state,
-            )
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(merged, detail_state)
                 enriched.append(merged)

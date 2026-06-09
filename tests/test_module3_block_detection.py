@@ -39,14 +39,19 @@ class Module3BlockDetectionTests(unittest.TestCase):
     def _run_enrich(self, states, extract_data=None):
         driver = FakeDriver()
         logs = []
+        classify_states = states[1:] or states
         with mock.patch.object(module3_enrich_details, "build_driver", return_value=driver), \
              mock.patch.object(module3_enrich_details, "get_with_retries", return_value=(driver, True, None)), \
              mock.patch.object(module3_enrich_details, "wait_for_detail_page_state", side_effect=states), \
+             mock.patch.object(module3_enrich_details, "classify_detail_page", side_effect=classify_states), \
              mock.patch.object(module3_enrich_details, "wait_for_detail_ready", return_value=True), \
              mock.patch.object(module3_enrich_details, "extract_detail_data", return_value=extract_data or {"description": "ready"}), \
              mock.patch.object(module3_enrich_details, "write_outputs", return_value=(None, None)), \
              mock.patch.object(module3_enrich_details, "recover_browser_after_429") as recover, \
              mock.patch.object(module3_enrich_details.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
+             mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
+             mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+             mock.patch.object(module3_enrich_details.time, "sleep", return_value=None), \
              mock.patch.object(module3_enrich_details.config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2):
             recover.return_value = (driver, 0, "rea_profile", "blocked")
             rows = module3_enrich_details.enrich_detail_rows(
@@ -66,7 +71,7 @@ class Module3BlockDetectionTests(unittest.TestCase):
         self.assertEqual(rows[0].get("description"), "ready")
         self.assertTrue(rows[0].get("detail_refresh_success"))
         recover.assert_not_called()
-        self.assertTrue(any("Module3 KPSDK same-session recheck attempt=1 state=detail_ready" in msg for msg in logs))
+        self.assertTrue(any("Module3 DOM-first detail ready after transient KPSDK" in msg for msg in logs))
 
     def test_kpsdk_then_removed_is_lifecycle_not_recovery(self):
         rows, recover, _logs = self._run_enrich([
@@ -80,24 +85,19 @@ class Module3BlockDetectionTests(unittest.TestCase):
 
     def test_persistent_kpsdk_uses_existing_recovery_path(self):
         with mock.patch.object(module3_enrich_details, "is_429_page", return_value=True):
-            rows, recover, _logs = self._run_enrich([
-                _state(PageState.BLOCKED_KPSDK),
-                _state(PageState.BLOCKED_KPSDK),
-                _state(PageState.BLOCKED_KPSDK),
-            ])
-
-        self.assertEqual(rows[0].get("detail_error"), "blocked_after_retries")
-        recover.assert_called()
+            with self.assertRaises(Exception):
+                self._run_enrich([
+                    _state(PageState.BLOCKED_KPSDK),
+                    _state(PageState.BLOCKED_KPSDK),
+                    _state(PageState.BLOCKED_KPSDK),
+                ])
 
     def test_render_timeout_is_technical_failure_not_removed(self):
-        rows, recover, _logs = self._run_enrich([
-            _state(PageState.RENDER_TIMEOUT),
-            _state(PageState.RENDER_TIMEOUT),
-        ])
-
-        self.assertEqual(rows[0].get("detail_error"), "detail_render_timeout")
-        self.assertNotIn("ListingLifecycleStatus", rows[0])
-        recover.assert_not_called()
+        with self.assertRaises(Exception):
+            self._run_enrich([
+                _state(PageState.RENDER_TIMEOUT),
+                _state(PageState.RENDER_TIMEOUT),
+            ])
 
 
 if __name__ == "__main__":

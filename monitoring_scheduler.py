@@ -979,6 +979,22 @@ def _search_is_active_for_monitoring(search_id: int | None) -> bool:
         conn.close()
 
 
+def _search_ready_for_operational_monitoring(search_id: int | None) -> bool:
+    if search_id is None:
+        return True
+    conn = db_layer.connect(config.DB_PATH)
+    if conn is None:
+        return True
+    try:
+        subs = db_layer.get_active_user_area_subscriptions_for_search(conn, int(search_id))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return bool(subs and _subscription_group_is_ready(subs))
+
+
 def _inactive_job_result(search_id: int | None) -> dict[str, Any]:
     return {
         "status": "cancelled",
@@ -1749,6 +1765,14 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
     user_area_id = int(job.get("UserAreaID") or 0) if job.get("UserAreaID") is not None else None
     if search_id is not None and not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
+    setup_job_types = {
+        job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+        job_queue.JOB_TYPE_SETUP_FULL_BASELINE,
+        job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE,
+        job_queue.JOB_TYPE_SETUP_PRICE_BASELINE,
+    }
+    if search_id is not None and job_type not in setup_job_types and not _search_ready_for_operational_monitoring(search_id):
+        return {"status": "skipped", "reason": "search_not_ready_for_operational_monitoring", "search_id": search_id, "job_type": job_type}
     if job_type == job_queue.JOB_TYPE_BASELINE_SETUP_AREA:
         payload = _job_payload(job)
         area_url = payload.get("search_url")

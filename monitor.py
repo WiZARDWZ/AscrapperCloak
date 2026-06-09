@@ -10,6 +10,7 @@ import db_layer
 import module1_list_scraper
 import module2_infer_prices
 import module3_enrich_details
+from realestate_errors import RealEstateBlockedError
 from db_layer import (
     activate_area_subscriptions,
     connect,
@@ -39,6 +40,14 @@ WATCH_EVENT_TYPES = [
     "inspection_or_auction_change",
     "removed_or_missing",
 ]
+
+
+def _module3_retryable_last_result() -> Dict[str, Any] | None:
+    result = getattr(module3_enrich_details.module3_run, "last_result", {}) or {}
+    status = str(result.get("status") or "").lower()
+    if status.startswith("retry_wait"):
+        return result
+    return None
 
 
 def _area_slug(search_url: str) -> str:
@@ -421,6 +430,12 @@ def full_run_area(
     if getattr(cancel_token, "is_set", lambda: False)():
         return {"status": "cancelled", "area_id": None, "run_id": None, "excel_path": None, "events_count": 0}
     if not json3:
+        retryable_module3 = _module3_retryable_last_result()
+        if retryable_module3:
+            raise RealEstateBlockedError(
+                retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
+                retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+            )
         raise RuntimeError("Module3 failed to produce JSON output")
     if on_progress:
         on_progress("module3_done", None)
@@ -573,6 +588,24 @@ def baseline_setup_area(
     if getattr(cancel_token, "is_set", lambda: False)():
         return {"status": "cancelled", "area_id": area_id}
     if not json3:
+        retryable_module3 = _module3_retryable_last_result()
+        if retryable_module3:
+            conn = connect(config.DB_PATH)
+            try:
+                upsert_area_monitoring_state(
+                    conn,
+                    area_id,
+                    setup_status="retry_wait",
+                    module3_status="retry_wait",
+                    last_error=retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            raise RealEstateBlockedError(
+                retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
+                retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+            )
         conn = connect(config.DB_PATH)
         try:
             upsert_area_monitoring_state(conn, area_id, setup_status="failed", module3_status="failed", last_error="Module3 failed to produce JSON output")
