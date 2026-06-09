@@ -856,6 +856,32 @@ def get_next_due_jobs(limit: int = 10) -> list[dict[str, Any]]:
         conn.close()
 
 
+def get_jobs_by_dedupe_key(dedupe_key: str, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    """Return jobs for an exact dedupe key, optionally limited by status."""
+    ensure_job_tables()
+    if not dedupe_key:
+        return []
+    if _TEST_STORE is not None:
+        rows = [dict(r) for r in _TEST_STORE if r.get("DedupeKey") == dedupe_key]
+        if statuses is not None:
+            allowed = {str(status) for status in statuses}
+            rows = [row for row in rows if str(row.get("Status")) in allowed]
+        rows.sort(key=lambda r: (r.get("CreatedAt") or _now(), int(r.get("JobID") or 0)))
+        return rows
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if statuses is None:
+            cur.execute("SELECT * FROM dbo.Job WHERE DedupeKey=? ORDER BY CreatedAt, JobID", dedupe_key)
+        else:
+            safe_statuses = [str(status) for status in statuses]
+            placeholders = ",".join("?" for _ in safe_statuses)
+            cur.execute(f"SELECT * FROM dbo.Job WHERE DedupeKey=? AND Status IN ({placeholders}) ORDER BY CreatedAt, JobID", dedupe_key, *safe_statuses)
+        return _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+
 def get_active_jobs(dedupe_key: str | None = None) -> list[dict[str, Any]]:
     ensure_job_tables()
     if _TEST_STORE is not None:
