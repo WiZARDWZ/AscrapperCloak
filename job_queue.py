@@ -357,6 +357,13 @@ def ensure_job_tables(conn=None) -> None:
             _normalize_existing_defaulted_job_column(conn, column_name, sql_type, default_expression)
         _ensure_job_status_default(conn)
         _ensure_job_status_values_and_constraint(conn)
+        db_layer._execute_ddl_safely(conn, """
+        IF OBJECT_ID('dbo.Job') IS NOT NULL
+        AND COL_LENGTH('dbo.Job', 'RunAfter') IS NOT NULL
+        UPDATE dbo.Job
+        SET RunAfter=SYSDATETIME(), LockedAt=NULL, LockedBy=NULL, UpdatedAt=SYSDATETIME()
+        WHERE Status='retry_wait' AND RunAfter IS NULL
+        """, description="repair dbo.Job retry_wait rows with missing RunAfter", required=False)
         dedupe_index_columns = ("DedupeKey", "Status")
         db_layer._execute_ddl_safely(conn, f"""
         IF OBJECT_ID('dbo.Job') IS NOT NULL
@@ -499,8 +506,8 @@ def claim_next_job(worker_id: str | None = None) -> dict[str, Any] | None:
     now = _now()
     if _TEST_STORE is not None:
         for row in _TEST_STORE:
-            if row["Status"] == "retry_wait" and row["RunAfter"] <= now:
-                row.update({"Status": "queued", "UpdatedAt": now})
+            if row["Status"] == "retry_wait" and row.get("RunAfter") is not None and row["RunAfter"] <= now:
+                row.update({"Status": "queued", "LockedBy": None, "LockedAt": None, "UpdatedAt": now})
         due = [r for r in _TEST_STORE if r["Status"] == "queued" and r["RunAfter"] <= now]
         if not due:
             return None
@@ -513,7 +520,7 @@ def claim_next_job(worker_id: str | None = None) -> dict[str, Any] | None:
         cur = conn.cursor()
         cur.execute("""
         UPDATE dbo.Job
-            SET Status='queued', UpdatedAt=SYSDATETIME()
+            SET Status='queued', LockedBy=NULL, LockedAt=NULL, UpdatedAt=SYSDATETIME()
             WHERE Status='retry_wait' AND RunAfter <= SYSDATETIME()
         """)
         cur.execute("""
@@ -571,7 +578,7 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
         row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
         row["AttemptCount"] = int(row.get("AttemptCount") or 0) + 1
         if retryable and row["AttemptCount"] < int(row.get("MaxAttempts") or 3):
-            row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
+            row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         else:
             row.update({"Status": "failed", "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         return dict(row)
@@ -583,9 +590,11 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
             SET AttemptCount=AttemptCount+1,
                 Status=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN 'retry_wait' ELSE 'failed' END,
                 RunAfter=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN DATEADD(second, ?, SYSDATETIME()) ELSE RunAfter END,
+                LockedAt=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN NULL ELSE LockedAt END,
+                LockedBy=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN NULL ELSE LockedBy END,
                 FinishedAt=SYSDATETIME(), LastError=?, UpdatedAt=SYSDATETIME()
             WHERE JobID=?
-        """, 1 if retryable else 0, 1 if retryable else 0, retry_after_seconds, error_text, int(job_id))
+        """, 1 if retryable else 0, 1 if retryable else 0, retry_after_seconds, 1 if retryable else 0, 1 if retryable else 0, error_text, int(job_id))
         conn.commit()
         return {"job_id": int(job_id), "status": "retry_wait_or_failed", "retryable": bool(retryable)}
     finally:
@@ -604,7 +613,7 @@ def mark_job_retry_wait(job_id: int, error: Any, retry_after_seconds: int | None
     retry_after_seconds = int(retry_after_seconds if retry_after_seconds is not None else 300)
     if _TEST_STORE is not None:
         row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
-        row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
+        row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         return dict(row)
     conn = _connect()
     try:
@@ -613,6 +622,8 @@ def mark_job_retry_wait(job_id: int, error: Any, retry_after_seconds: int | None
             UPDATE dbo.Job
             SET Status='retry_wait',
                 RunAfter=DATEADD(second, ?, SYSDATETIME()),
+                LockedAt=NULL,
+                LockedBy=NULL,
                 FinishedAt=SYSDATETIME(),
                 LastError=?,
                 UpdatedAt=SYSDATETIME()
@@ -840,6 +851,32 @@ def get_next_due_jobs(limit: int = 10) -> list[dict[str, Any]]:
             WHERE j.Status='queued' AND j.RunAfter <= SYSDATETIME()
             ORDER BY j.Priority ASC, j.RunAfter ASC, j.CreatedAt ASC, j.JobID ASC
         """)
+        return _rows_to_dicts(cur)
+    finally:
+        conn.close()
+
+
+def get_jobs_by_dedupe_key(dedupe_key: str, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    """Return jobs for an exact dedupe key, optionally limited by status."""
+    ensure_job_tables()
+    if not dedupe_key:
+        return []
+    if _TEST_STORE is not None:
+        rows = [dict(r) for r in _TEST_STORE if r.get("DedupeKey") == dedupe_key]
+        if statuses is not None:
+            allowed = {str(status) for status in statuses}
+            rows = [row for row in rows if str(row.get("Status")) in allowed]
+        rows.sort(key=lambda r: (r.get("CreatedAt") or _now(), int(r.get("JobID") or 0)))
+        return rows
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if statuses is None:
+            cur.execute("SELECT * FROM dbo.Job WHERE DedupeKey=? ORDER BY CreatedAt, JobID", dedupe_key)
+        else:
+            safe_statuses = [str(status) for status in statuses]
+            placeholders = ",".join("?" for _ in safe_statuses)
+            cur.execute(f"SELECT * FROM dbo.Job WHERE DedupeKey=? AND Status IN ({placeholders}) ORDER BY CreatedAt, JobID", dedupe_key, *safe_statuses)
         return _rows_to_dicts(cur)
     finally:
         conn.close()
