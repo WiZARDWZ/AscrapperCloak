@@ -150,7 +150,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
                 )
 
         self.assertEqual(safe_get.call_count, 1)
-        recover.assert_called_once()
+        recover.assert_not_called()
         self.assertTrue(
             any("Module1 transient KPSDK detected; same-page settle start" in item for item in logs)
         )
@@ -219,7 +219,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
                 )
 
         self.assertEqual(safe_get.call_count, 1)
-        recover.assert_called_once()
+        recover.assert_not_called()
         self.assertTrue(
             any("Module1 same-page settle result state=blocked_kpsdk" in item for item in logs)
         )
@@ -239,8 +239,17 @@ class Module1BlockDetectionTests(unittest.TestCase):
         recovered = FakeRecoveredDriver()
         requested_url = module1_list_scraper.make_list_url("https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1", 1)
 
+        attempts = {"count": 0}
+        def fake_safe_driver_get(driver, url):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                driver.current_url = "chrome-error://chromewebdata/"
+                return False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+            driver.current_url = requested_url
+            return True, None
+
         with mock.patch.object(module1_list_scraper, "setup_driver", return_value=FakeChromeErrorDriver()), \
-             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=[(False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")), (True, None)]) as safe_driver_get, \
+             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=fake_safe_driver_get) as safe_driver_get, \
              mock.patch.object(module1_list_scraper, "classify_search_page", return_value=chrome_unknown) as classify, \
              mock.patch.object(module1_list_scraper, "wait_for_search_page_state", return_value=(listings, [fake_card])) as wait_state, \
              mock.patch.object(module1_list_scraper, "recover_browser_after_429", return_value=(recovered, 1, "rea_profile_recovered", "recovered")) as recover, \
@@ -259,7 +268,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(meta["page_state"], PageState.LISTINGS)
         classify.assert_called_once()
-        recover.assert_called_once()
+        recover.assert_not_called()
         self.assertEqual(safe_driver_get.call_args_list[0].args[1], requested_url)
         self.assertEqual(safe_driver_get.call_args_list[1].args[1], requested_url)
         wait_state.assert_called_once()
@@ -301,8 +310,17 @@ class Module1BlockDetectionTests(unittest.TestCase):
         recovered = FakeRecoveredDriver()
         requested_url = module1_list_scraper.make_list_url("https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1", 1)
 
+        attempts = {"count": 0}
+        def fake_safe_driver_get(driver, url):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                driver.current_url = "chrome-error://chromewebdata/"
+                return False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+            driver.current_url = requested_url
+            return True, None
+
         with mock.patch.object(module1_list_scraper, "setup_driver", return_value=FakeChromeErrorDriver()), \
-             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=[(False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")), (True, None)]) as safe_driver_get, \
+             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=fake_safe_driver_get) as safe_driver_get, \
              mock.patch.object(module1_list_scraper, "classify_search_page", return_value=chrome_unknown) as classify, \
              mock.patch.object(module1_list_scraper, "wait_for_search_page_state", return_value=(listings, [fake_card])) as wait_state, \
              mock.patch.object(module1_list_scraper, "recover_browser_after_429", return_value=(recovered, 1, "rea_profile_recovered", "recovered")) as recover, \
@@ -321,7 +339,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(meta["page_state"], PageState.LISTINGS)
         classify.assert_called_once()
-        recover.assert_called_once()
+        recover.assert_not_called()
         self.assertEqual(safe_driver_get.call_args_list[0].args[1], requested_url)
         self.assertEqual(safe_driver_get.call_args_list[1].args[1], requested_url)
         wait_state.assert_called_once()
@@ -363,8 +381,17 @@ class Module1BlockDetectionTests(unittest.TestCase):
         recovered = FakeRecoveredDriver()
         requested_url = module1_list_scraper.make_list_url("https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1", 1)
 
+        attempts = {"count": 0}
+        def fake_safe_driver_get(driver, url):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                driver.current_url = "chrome-error://chromewebdata/"
+                return False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+            driver.current_url = requested_url
+            return True, None
+
         with mock.patch.object(module1_list_scraper, "setup_driver", return_value=FakeChromeErrorDriver()), \
-             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=[(False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")), (True, None)]) as safe_driver_get, \
+             mock.patch.object(module1_list_scraper, "safe_driver_get", side_effect=fake_safe_driver_get) as safe_driver_get, \
              mock.patch.object(module1_list_scraper, "classify_search_page", return_value=chrome_unknown) as classify, \
              mock.patch.object(module1_list_scraper, "wait_for_search_page_state", return_value=(listings, [fake_card])) as wait_state, \
              mock.patch.object(module1_list_scraper, "recover_browser_after_429", return_value=(recovered, 1, "rea_profile_recovered", "recovered")) as recover, \
@@ -383,7 +410,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(meta["page_state"], PageState.LISTINGS)
         classify.assert_called_once()
-        recover.assert_called_once()
+        recover.assert_not_called()
         self.assertEqual(safe_driver_get.call_args_list[0].args[1], requested_url)
         self.assertEqual(safe_driver_get.call_args_list[1].args[1], requested_url)
         wait_state.assert_called_once()

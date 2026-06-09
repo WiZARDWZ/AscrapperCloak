@@ -12,6 +12,7 @@ from cloak_browser_helper import By
 
 
 class PageState:
+    CHROME_ERROR = "chrome_error"
     LISTINGS = "listings"
     NO_RESULTS = "no_results"
     DETAIL_READY = "detail_ready"
@@ -112,6 +113,10 @@ def _safe_attr(obj: Any, name: str, default: str = "") -> str:
         return str(getattr(obj, name, default) or "")
     except Exception:
         return default
+
+
+def is_chrome_error_url(value: str | None) -> bool:
+    return str(value or "").strip().lower().startswith("chrome-error://chromewebdata/")
 
 
 def _safe_script(driver, script: str, default: Any = "") -> Any:
@@ -335,6 +340,9 @@ def _block_state(reason: str | None) -> str:
 
 
 def classify_search_page(driver, timeout=None, min_cards: int = 1, grace_seconds=None) -> PageStateResult:
+    title, current_url, body_text, html = _page_snapshot(driver)
+    if is_chrome_error_url(current_url):
+        return _result(driver, PageState.CHROME_ERROR, "chrome_error_page", cards_count=0)
     cards = count_listing_cards(driver)
     network_reason = get_network_block_reason(driver)
     if cards >= min_cards:
@@ -356,6 +364,8 @@ def classify_search_page(driver, timeout=None, min_cards: int = 1, grace_seconds
 def classify_detail_page(driver, timeout=None, grace_seconds=None) -> PageStateResult:
     network_reason = get_network_block_reason(driver)
     title, _url, body_text, html = _page_snapshot(driver)
+    if is_chrome_error_url(_url):
+        return _result(driver, PageState.CHROME_ERROR, "chrome_error_page", network_reason=network_reason)
     merged = f"{title}\n{body_text}\n{_html_text(html)}".lower()
     if has_detail_ready_markers(driver):
         return _result(driver, PageState.DETAIL_READY, "detail_ready_marker", network_reason=network_reason)
