@@ -3,6 +3,7 @@ import unittest
 from unittest import mock
 
 import module1_list_scraper
+import tools.test_module1_cloak_two_pages as smoke_tool
 from realestate_page_state import PageState, PageStateResult
 
 
@@ -111,6 +112,51 @@ class Module1PaginationNavigationTests(unittest.TestCase):
         self.assertFalse(any(phase == "list_page_2" for _url, phase in safe_get_calls))
         self.assertTrue(any("click-next landed" in item for item in logs))
 
+    def test_click_next_success_when_dispatch_false_but_landed_expected_page(self):
+        driver = FakeDriver()
+        logs = []
+
+        def fake_safe_get(drv, url, *, phase, apply_delay=False, log_func=print):
+            drv.current_url = url
+            drv._module1_last_navigation = {"url": url, "navigation_failed": False, "navigation_error": None}
+            return True
+
+        def fake_click(drv, next_page, log):
+            drv.current_url = f"https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-{next_page}?activeSort=list-date"
+            return {"clicked": False, "reason": "unknown"}
+
+        with mock.patch.object(module1_list_scraper.config, "MODULE1_PAGINATION_NAV_MODE", "click_next"), \
+             mock.patch.object(module1_list_scraper, "setup_driver", return_value=driver), \
+             mock.patch.object(module1_list_scraper, "safe_get", side_effect=fake_safe_get), \
+             mock.patch.object(module1_list_scraper, "wait_for_search_page_state", side_effect=[(state_for(1), ["card1"]), (state_for(2), ["card2"])]), \
+             mock.patch.object(module1_list_scraper, "wait_for_cards", side_effect=[["card1"], ["card2"]]), \
+             mock.patch.object(module1_list_scraper, "WebDriverWait", FakeWait), \
+             mock.patch.object(module1_list_scraper, "_stop_page_loading", return_value=None), \
+             mock.patch.object(module1_list_scraper, "extract_card", side_effect=[{"listing_id": "1", "page": 1}, {"listing_id": "2", "page": 2}]), \
+             mock.patch.object(module1_list_scraper, "get_total_pages", return_value=2), \
+             mock.patch.object(module1_list_scraper, "detect_next", side_effect=[True, False]), \
+             mock.patch.object(module1_list_scraper, "_click_next_anchor", side_effect=fake_click), \
+             mock.patch.object(module1_list_scraper.time, "sleep", return_value=None), \
+             mock.patch("builtins.print"):
+            rows = module1_list_scraper.scrape_search(
+                "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date",
+                max_pages=2,
+                timeout=1,
+                on_log=logs.append,
+            )
+
+        self.assertEqual([row["page"] for row in rows], [1, 2])
+        self.assertEqual(module1_list_scraper.scrape_search.last_result["fallback_paths"], [])
+        self.assertEqual(
+            module1_list_scraper.scrape_search.last_result["page_stats"],
+            [
+                {"page": 1, "rows": 1, "cards": 1, "url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date", "nav": "direct_url"},
+                {"page": 2, "rows": 1, "cards": 1, "url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-2?activeSort=list-date", "nav": "click_next"},
+            ],
+        )
+        self.assertTrue(any("dispatch_result" in item for item in logs))
+        self.assertTrue(any("landed_page=2 expected_page=2 chrome_error=False success=True" in item for item in logs))
+
     def test_fresh_context_fallback_preserves_page1_rows(self):
         first_driver = FakeDriver()
         second_driver = FakeDriver(url="https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-2?activeSort=list-date")
@@ -185,6 +231,45 @@ class Module1PaginationNavigationTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(classify_calls, [])
         self.assertIn("click_next_chrome_error_to_fresh_context_per_page:page_2", module1_list_scraper.scrape_search.last_result["fallback_paths"])
+
+
+class Module1SmokeToolPageStatsTests(unittest.TestCase):
+    def test_smoke_summary_uses_last_result_page_stats_not_row_page_zero(self):
+        rows = [{} for _ in range(28)]
+        logs = []
+        module1_list_scraper.scrape_search.last_result = {
+            "status": "completed",
+            "rows": 28,
+            "stop_reason": "completed",
+            "page_stats": [
+                {"page": 1, "rows": 25, "cards": 25, "url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1", "nav": "direct_url"},
+                {"page": 2, "rows": 3, "cards": 3, "url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-2", "nav": "click_next"},
+            ],
+            "fallback_paths": [],
+        }
+
+        summary = smoke_tool.build_summary("https://example.test/list-1", rows, logs)
+
+        self.assertEqual(summary["page_count_source"], "last_result.page_stats")
+        self.assertEqual(summary["page_counts"], {1: 25, 2: 3})
+        ok, message = smoke_tool.validate_summary(summary, expected_total=28)
+        self.assertTrue(ok, message)
+
+    def test_smoke_summary_falls_back_to_extract_logs_when_page_stats_missing(self):
+        module1_list_scraper.scrape_search.last_result = {"status": "completed", "rows": 28, "stop_reason": "completed"}
+        logs = [
+            "Page 1: https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1",
+            "Extracted 25 rows from this page (total=25)",
+            "Page 2: https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-2",
+            "Extracted 3 rows from this page (total=28)",
+        ]
+
+        summary = smoke_tool.build_summary("https://example.test/list-1", [{} for _ in range(28)], logs)
+
+        self.assertEqual(summary["page_count_source"], "logs")
+        self.assertEqual(summary["page_counts"], {1: 25, 2: 3})
+        ok, message = smoke_tool.validate_summary(summary, expected_total=28)
+        self.assertTrue(ok, message)
 
 
 if __name__ == "__main__":

@@ -874,6 +874,12 @@ def _parse_list_page(url: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _is_realestate_list_page_url(url: str | None) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.netloc or "").lower()
+    return host.endswith("realestate.com.au") and _parse_list_page(parsed.path or "") is not None
+
+
 def get_total_pages(driver) -> int | None:
     """
     تلاش می‌کند تعداد کل صفحات نتایج را از pagination استخراج کند.
@@ -1192,7 +1198,9 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
         hard_cap = 500  # جلوگیری از لوپ بی‌نهایت در شرایط عجیب
         nav_mode = _module1_pagination_nav_mode()
         pagination_landed_by_click = False
+        pending_page_nav: str | None = None
         fallback_paths: list[str] = []
+        page_stats: list[dict] = []
         log(f"Module1 pagination nav mode={nav_mode}")
 
         while page <= hard_cap:
@@ -1205,20 +1213,25 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
             url = make_list_url(base_url, page)
             log(f"\nPage {page}: {url}")
             if page == 1 or nav_mode == "direct_url":
+                page_nav = "direct_url"
                 navigation_ok = safe_get(driver, url, phase=f"list_page_{page}", apply_delay=page > 1, log_func=log)
                 navigation_info = _last_navigation(driver)
                 session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
                 pagination_landed_by_click = False
+                pending_page_nav = None
             elif nav_mode == "fresh_context_per_page" or not pagination_landed_by_click:
+                page_nav = "fresh_context_per_page"
                 driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, url, page, log=log)
                 session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
                 fallback_paths.append(f"fresh_context_per_page:page_{page}")
                 pagination_landed_by_click = False
+                pending_page_nav = None
             else:
+                page_nav = pending_page_nav or "click_next"
                 current = _current_url(driver)
                 log(f"Module1 click-next landed current_url={current}")
                 navigation_ok = not _is_chrome_error_url(current)
-                navigation_info = {"url": url, "navigation_failed": not navigation_ok, "navigation_error": None, "navigation_mode": "click_next"}
+                navigation_info = {"url": url, "navigation_failed": not navigation_ok, "navigation_error": None, "navigation_mode": page_nav}
                 try:
                     driver._module1_last_navigation = navigation_info
                 except Exception:
@@ -1229,7 +1242,9 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, url, page, log=log)
                     session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
                     fallback_paths.append(f"click_next_chrome_error_to_fresh_context_per_page:page_{page}")
+                    page_nav = "fresh_context_per_page"
                     pagination_landed_by_click = True
+                    pending_page_nav = None
             page_429_retries = 0
             while True:
                 if _navigation_needs_fast_classification(driver, navigation_info):
@@ -1374,6 +1389,8 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 page_count += 1
                 time.sleep(0.03)
 
+            current_page_url = _current_url(driver) or url
+            page_stats.append({"page": page, "rows": page_count, "cards": len(cards), "url": current_page_url, "nav": page_nav})
             log(f"Extracted {page_count} rows from this page (total={len(all_rows)})")
             net_summary = _collect_network_debug(driver)
             log("Page network summary:")
@@ -1412,23 +1429,33 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 log(f"Module1 pagination nav mode=click_next page={page} next_page={next_page}")
                 _human_scroll_idle_before_next(driver, log)
                 click_result = _click_next_anchor(driver, next_page, log)
+                log(f"Module1 click-next dispatch_result={click_result}")
                 time.sleep(max(0.5, float(getattr(config, "MODULE1_INTER_PAGE_DELAY_SECONDS", 0)) / 4.0))
                 current_after_click = _current_url(driver)
                 log(f"Module1 click-next landed current_url={current_after_click}")
                 actual_next = _parse_list_page(current_after_click)
-                if click_result.get("clicked") and actual_next == next_page and not _is_chrome_error_url(current_after_click):
+                chrome_error = _is_chrome_error_url(current_after_click)
+                click_success = actual_next == next_page and not chrome_error and _is_realestate_list_page_url(current_after_click)
+                log(
+                    "Module1 click-next landed_page={landed} expected_page={expected} chrome_error={chrome_error} success={success}".format(
+                        landed=actual_next, expected=next_page, chrome_error=chrome_error, success=click_success
+                    )
+                )
+                if click_success:
                     pagination_landed_by_click = True
+                    pending_page_nav = "click_next"
                 else:
-                    reason = click_result.get("reason") or f"landed_page={actual_next} chrome_error={_is_chrome_error_url(current_after_click)}"
+                    reason = click_result.get("reason") or f"landed_page={actual_next} chrome_error={chrome_error}"
                     log(f"Module1 click-next fallback fresh_context_per_page page={next_page} reason={reason}")
                     driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, make_list_url(base_url, next_page), next_page, log=log)
                     session_health.record_navigation(make_list_url(base_url, next_page), navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
-                    fallback_name = "click_next_chrome_error_to_fresh_context_per_page" if _is_chrome_error_url(current_after_click) else "click_next_to_fresh_context_per_page"
+                    fallback_name = "click_next_chrome_error_to_fresh_context_per_page" if chrome_error else "click_next_to_fresh_context_per_page"
                     fallback_paths.append(f"{fallback_name}:page_{next_page}")
                     pagination_landed_by_click = True
+                    pending_page_nav = "fresh_context_per_page"
             page = next_page
 
-        scrape_search.last_result = {"status": "completed", "rows": len(all_rows), "stop_reason": "completed", "page_state": PageState.LISTINGS if all_rows else None, "pagination_nav_mode": nav_mode, "fallback_paths": fallback_paths}
+        scrape_search.last_result = {"status": "completed", "rows": len(all_rows), "stop_reason": "completed", "page_state": PageState.LISTINGS if all_rows else None, "pagination_nav_mode": nav_mode, "fallback_paths": fallback_paths, "page_stats": page_stats}
         return all_rows
 
     finally:
