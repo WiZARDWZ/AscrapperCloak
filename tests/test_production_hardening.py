@@ -246,3 +246,30 @@ def test_unknown_price_inference_sets_future_next_retry_at():
     assert 'PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS' in source
     assert 'status in {"unknown_pending_retry", "technical_failed"}' in source
     assert 'next_retry_at=next_retry_at' in source
+
+
+def test_browser_recovery_logs_requested_and_completed(monkeypatch):
+    import browser_recovery
+
+    logs = []
+    monkeypatch.setattr(
+        browser_recovery,
+        "recover_browser_after_429",
+        lambda **kwargs: ("driver2", kwargs["rotations_used"] + 1, "/tmp/new_profile", "recovered"),
+    )
+    driver, rotations, profile, status = browser_recovery.recover_browser_for_untrusted_state(
+        driver="driver1",
+        current_profile_dir="/tmp/old_profile",
+        build_driver_func=lambda profile_dir_override=None: "driver2",
+        rotations_used=0,
+        max_rotations=2,
+        reason="chrome_error:unknown",
+        job_id=123,
+        search_id=42,
+        log_func=logs.append,
+    )
+    assert status == "recovered"
+    assert rotations == 1
+    assert profile == "/tmp/new_profile"
+    assert any("[recovery] requested" in item and "old_profile=/tmp/old_profile" in item and "job_id=123" in item and "search_id=42" in item for item in logs)
+    assert any("[recovery] completed" in item and "new_profile=/tmp/new_profile" in item and "reason=chrome_error:unknown" in item for item in logs)
