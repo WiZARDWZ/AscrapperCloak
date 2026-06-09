@@ -24,7 +24,7 @@ from config import AREA_SEARCH_URL
 import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
-from realestate_page_state import PageState, classify_search_page, wait_for_search_page_state
+from realestate_page_state import PageState, classify_search_page, get_listing_cards, wait_for_search_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 from realestate_errors import RealEstateBlockedError
 
@@ -161,6 +161,107 @@ def _module1_recovery_reason(driver, state_result, navigation_info: dict) -> str
     if navigation_info.get("navigation_error") is not None:
         reason = f"navigation_failed:{reason}:{navigation_info.get('navigation_error')}"
     return config.mask_sensitive_text(reason)
+
+
+def _module1_is_same_page_kpsdk_candidate(driver, requested_url: str, state_result) -> bool:
+    """Return True when a realestate search page should be allowed to hydrate in-place.
+
+    realestate.com.au can briefly expose a KPSDK/429 shell while the same tab is
+    still on the requested URL and the DOM is actively hydrating. Re-navigating
+    that URL immediately can turn the temporary shell into Chrome's
+    ``chrome-error://chromewebdata/`` page, so Module1 first settles the current
+    DOM without another ``driver.get``.
+    """
+    current_url = _current_url(driver, state_result)
+    if _is_chrome_error_url(current_url):
+        return False
+    current_l = str(current_url or "").lower()
+    requested_l = str(requested_url or "").lower()
+    if "realestate.com.au" not in current_l:
+        return False
+    if requested_l and "realestate.com.au" in requested_l:
+        current_parsed = urlparse(current_l)
+        requested_parsed = urlparse(requested_l)
+        if (current_parsed.netloc, current_parsed.path) != (requested_parsed.netloc, requested_parsed.path):
+            return False
+    network_reason = str(getattr(state_result, "network_reason", "") or "").lower()
+    reason = str(getattr(state_result, "reason", "") or "").lower()
+    state = getattr(state_result, "state", None)
+    is_transient_block = state in {PageState.BLOCKED_KPSDK, PageState.BLOCKED_HTTP_429}
+    is_network_429 = "blocked_http_429" in network_reason or "blocked_http_429" in reason
+    is_kpsdk = "kpsdk" in network_reason or "kpsdk" in reason
+    if not (is_transient_block or is_network_429 or is_kpsdk):
+        return False
+    html_len = int(getattr(state_result, "html_length", 0) or 0)
+    body_len = int(getattr(state_result, "body_text_length", 0) or 0)
+    return html_len < 5000 or body_len < 250 or state in {PageState.BLOCKED_KPSDK, PageState.BLOCKED_HTTP_429}
+
+
+def _module1_same_page_kpsdk_settle(driver, requested_url: str, state_result, cards, *, min_cards: int, log):
+    """Settle transient KPSDK/429 shells on the same page before re-navigation.
+
+    This preserves the browser tab when the URL is still the requested REA page,
+    allowing listings/cards to win over historical network 429s.
+    """
+    if not _module1_is_same_page_kpsdk_candidate(driver, requested_url, state_result):
+        return state_result, cards
+
+    log(
+        "Module1 transient KPSDK detected; same-page settle start "
+        f"state={getattr(state_result, 'state', None)} current_url={_current_url(driver, state_result)} "
+        f"html_length={getattr(state_result, 'html_length', 0) or 0} "
+        f"body_text_length={getattr(state_result, 'body_text_length', 0) or 0}"
+    )
+
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+    grace_seconds = max(settle_seconds, float(getattr(config, "BROWSER_BLOCK_GRACE_SECONDS", 30)))
+    poll_seconds = max(0.05, float(getattr(config, "BROWSER_BLOCK_POLL_SECONDS", 1.0)))
+    deadline = time.time() + grace_seconds
+    next_sleep = settle_seconds if settle_seconds > 0 else poll_seconds
+    previous_html_len = int(getattr(state_result, "html_length", 0) or 0)
+    last_result = state_result
+    last_cards = cards or []
+
+    while time.time() <= deadline:
+        time.sleep(min(next_sleep, max(0.0, deadline - time.time())))
+        current = classify_search_page(driver, timeout=True, min_cards=min_cards)
+        current_cards = get_listing_cards(driver, min_cards=min_cards)
+        if current_cards and current.state != PageState.LISTINGS:
+            current = classify_search_page(driver, min_cards=min_cards)
+        log(
+            "Module1 same-page settle result state={state} cards_found={cards} html_length={html_len} "
+            "body_text_length={body_len} network_reason={network} current_url={url}".format(
+                state=current.state,
+                cards=getattr(current, "cards_count", len(current_cards)),
+                html_len=getattr(current, "html_length", 0) or 0,
+                body_len=getattr(current, "body_text_length", 0) or 0,
+                network=getattr(current, "network_reason", None),
+                url=getattr(current, "current_url", "") or _current_url(driver),
+            )
+        )
+        last_result = current
+        last_cards = current_cards
+        if current.state == PageState.LISTINGS or len(current_cards) >= min_cards:
+            log("Module1 DOM-first listings after transient KPSDK; ignoring historical 429")
+            if current.state != PageState.LISTINGS:
+                current.state = PageState.LISTINGS
+                current.reason = current.reason or "listing_cards_present"
+                current.cards_count = max(getattr(current, "cards_count", 0) or 0, len(current_cards))
+            return current, current_cards
+        if current.state == PageState.NO_RESULTS:
+            return current, []
+        if _is_chrome_error_url(_current_url(driver, current)):
+            return current, []
+
+        html_len = int(getattr(current, "html_length", 0) or 0)
+        title = str(getattr(current, "title", "") or "").lower()
+        still_loading_rea = "real estate" in title or "realestate.com.au" in title or html_len > previous_html_len
+        if not still_loading_rea:
+            break
+        previous_html_len = max(previous_html_len, html_len)
+        next_sleep = poll_seconds
+
+    return last_result, last_cards
 
 
 def _recover_module1_untrusted_page(
@@ -788,15 +889,24 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                     body_len=state_result.body_text_length,
                 )
             )
-            state_result, cards = _same_session_kpsdk_recheck(
-                driver=driver,
-                url=page_url,
-                timeout=effective_timeout,
+            state_result, cards = _module1_same_page_kpsdk_settle(
+                driver,
+                page_url,
+                state_result,
+                cards,
                 min_cards=1,
-                state_result=state_result,
-                cards=cards,
                 log=log,
             )
+            if state_result.state == PageState.BLOCKED_KPSDK and not _is_chrome_error_url(_current_url(driver, state_result)):
+                state_result, cards = _same_session_kpsdk_recheck(
+                    driver=driver,
+                    url=page_url,
+                    timeout=effective_timeout,
+                    min_cards=1,
+                    state_result=state_result,
+                    cards=cards,
+                    log=log,
+                )
             if state_result.state == PageState.LISTINGS:
                 break
             if _module1_state_is_recoverable(driver, state_result, navigation_info) and config.BROWSER_RECOVERY_ON_429:
@@ -965,15 +1075,24 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                         body_len=state_result.body_text_length,
                     )
                 )
-                state_result, cards = _same_session_kpsdk_recheck(
-                    driver=driver,
-                    url=url,
-                    timeout=timeout,
+                state_result, cards = _module1_same_page_kpsdk_settle(
+                    driver,
+                    url,
+                    state_result,
+                    cards,
                     min_cards=1,
-                    state_result=state_result,
-                    cards=cards,
                     log=log,
                 )
+                if state_result.state == PageState.BLOCKED_KPSDK and not _is_chrome_error_url(_current_url(driver, state_result)):
+                    state_result, cards = _same_session_kpsdk_recheck(
+                        driver=driver,
+                        url=url,
+                        timeout=timeout,
+                        min_cards=1,
+                        state_result=state_result,
+                        cards=cards,
+                        log=log,
+                    )
                 if state_result.state == PageState.LISTINGS:
                     break
                 if _module1_state_is_recoverable(driver, state_result, navigation_info) and config.BROWSER_RECOVERY_ON_429:
