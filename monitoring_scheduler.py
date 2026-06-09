@@ -15,6 +15,12 @@ from area_light_checker import light_check_area
 from listing_detail_refresher import is_retryable_detail_batch_failure, refresh_active_listings
 from json_safe import json_safe
 from realestate_errors import RealEstateBlockedError
+try:
+    from browser_recovery import is_retryable_navigation_error
+except Exception:
+    def is_retryable_navigation_error(exc):
+        text = str(exc or "").lower()
+        return "net::" in text or "page.goto" in text or "timeout" in text
 
 
 def _utcnow() -> datetime:
@@ -658,6 +664,51 @@ def _active_price_job_exists(search_id: int) -> bool:
     return False
 
 
+def _job_exists_for_dedupe_key(dedupe_key: str, include_terminal: bool = True) -> dict[str, Any] | None:
+    import job_queue
+
+    statuses = None if include_terminal else job_queue.JOB_STATUS_ACTIVE
+    rows = job_queue.get_jobs_by_dedupe_key(dedupe_key, statuses=statuses)
+    return rows[0] if rows else None
+
+
+def _scheduled_price_dedupe_key(search_id: int, scheduled_at) -> str:
+    import job_queue
+
+    scheduled_text = scheduled_at.isoformat() if hasattr(scheduled_at, "isoformat") else str(scheduled_at)
+    return f"{job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA}:search_id={int(search_id)}:scheduled_at={scheduled_text}"
+
+
+def _price_retry_window_dedupe_key(search_id: int, listing_external_ids: list[str], retry_window_at=None) -> str:
+    import job_queue
+
+    safe_ids = sorted(str(value).strip() for value in listing_external_ids if str(value).strip())
+    retry_window_at = retry_window_at or _utcnow()
+    interval = max(1, int(getattr(config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)))
+    epoch = int(retry_window_at.timestamp()) if hasattr(retry_window_at, "timestamp") else int(_utcnow().timestamp())
+    window_epoch = epoch - (epoch % interval)
+    window_text = datetime.fromtimestamp(window_epoch).isoformat()
+    return f"{job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS}:search_id={int(search_id)}:retry_window={window_text}:listing_ids={','.join(safe_ids)}"
+
+
+def _log_scheduler_due_decision(decision: dict[str, Any]) -> None:
+    print(
+        "scheduler due decision: search_id={search_id} job_type={job_type} last_at={last_at} "
+        "latest_scheduled_at={latest_scheduled_at} current_time_used={current_time_used} "
+        "is_due={is_due} reason={reason} existing_active_job_found={active} existing_recent_job_found={recent}".format(
+            search_id=decision.get("search_id"),
+            job_type=decision.get("job_type"),
+            last_at=decision.get("last_at"),
+            latest_scheduled_at=decision.get("latest_scheduled_at"),
+            current_time_used=decision.get("current_time_used"),
+            is_due=decision.get("is_due"),
+            reason=decision.get("reason"),
+            active=decision.get("existing_active_job_found"),
+            recent=decision.get("existing_recent_job_found"),
+        )
+    )
+
+
 def _listing_ids_from_light(light_result: dict[str, Any]) -> list[str]:
     ids: list[str] = []
     for row in light_result.get("new_listings") or []:
@@ -712,6 +763,19 @@ def _due_decision(search_id: int, job_type: str, last_at, current_time_used: dat
     }
 
 
+def _terminal_failed_area_blocks_auto_baseline(search_id: int) -> bool:
+    try:
+        conn = db_layer.connect(config.DB_PATH)
+        try:
+            state = db_layer.get_area_monitoring_state(conn, int(search_id))
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    status = str((state or {}).get("setup_status") or "").lower()
+    return status in {"failed", "failed_ingest"}
+
+
 def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
     import job_queue
 
@@ -742,6 +806,9 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
         try:
             if not _subscription_group_is_ready(group):
                 result["not_ready_search_ids_considered"].append(search_id)
+                if _terminal_failed_area_blocks_auto_baseline(search_id):
+                    result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "reason": "terminal_failed_area_requires_manual_retry"})
+                    continue
                 job = job_queue.enqueue_job_once(
                     job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
                     search_id=search_id,
@@ -804,16 +871,21 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                 finally:
                     retry_conn.close()
                 if due_unknown_ids:
-                    retry_job = job_queue.enqueue_job_once(
-                        job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
-                        search_id=search_id,
-                        user_area_id=int(rep["UserAreaID"]),
-                        priority=job_queue.PRIORITY_PRICE_RETRY_UNKNOWNS,
-                        run_after=current_time_used,
-                        payload={"listing_external_ids": due_unknown_ids},
-                        dedupe_key=f"{job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS}:search_id={search_id}:listing_ids={','.join(sorted(due_unknown_ids))}",
-                        max_attempts=3,
-                    )
+                    retry_dedupe = _price_retry_window_dedupe_key(search_id, due_unknown_ids, retry_window_at=current_time_used)
+                    existing_retry = _job_exists_for_dedupe_key(retry_dedupe, include_terminal=True)
+                    if existing_retry:
+                        retry_job = {**existing_retry, "created": False, "duplicate": True, "reason": "existing_price_retry_for_window"}
+                    else:
+                        retry_job = job_queue.enqueue_job_once(
+                            job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
+                            search_id=search_id,
+                            user_area_id=int(rep["UserAreaID"]),
+                            priority=job_queue.PRIORITY_PRICE_RETRY_UNKNOWNS,
+                            run_after=current_time_used,
+                            payload={"listing_external_ids": due_unknown_ids, "retry_window_at": current_time_used.isoformat()},
+                            dedupe_key=retry_dedupe,
+                            max_attempts=3,
+                        )
                     (result["created"] if retry_job.get("created") else result["skipped_duplicates"]).append(retry_job)
                 price_check = _scheduled_due_decision(
                     search_id,
@@ -822,25 +894,37 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                     current_time_used,
                     getattr(config, "PRICE_REFRESH_TIMES", "00:00,12:00"),
                 )
+                scheduled_at = price_check.get("latest_scheduled_at")
+                price_dedupe = _scheduled_price_dedupe_key(search_id, scheduled_at) if scheduled_at else None
+                existing_scheduled_job = _job_exists_for_dedupe_key(price_dedupe, include_terminal=True) if price_dedupe else None
+                active_price_exists = _active_price_job_exists(search_id)
+                price_check["dedupe_key"] = price_dedupe
+                price_check["existing_recent_job_found"] = bool(existing_scheduled_job)
+                price_check["existing_active_job_found"] = bool(active_price_exists)
                 result["due_checks"].append(price_check)
+                _log_scheduler_due_decision(price_check)
                 if price_check["is_due"]:
-                    if _active_price_job_exists(search_id):
+                    if existing_scheduled_job:
+                        job = {**existing_scheduled_job, "created": False, "duplicate": True, "reason": "existing_scheduled_price_job", "dedupe_key": price_dedupe}
+                    elif active_price_exists:
                         job = {
                             "created": False,
                             "duplicate": True,
                             "reason": "active_price_refresh_exists",
                             "search_id": search_id,
                             "job_type": job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
+                            "dedupe_key": price_dedupe,
                         }
                     else:
-                        run_id = f"price-refresh-{search_id}-{price_check['latest_scheduled_at'].isoformat()}"
+                        run_id = f"price-refresh-{search_id}-{scheduled_at.isoformat()}"
                         job = job_queue.enqueue_job_once(
                             job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
                             search_id=search_id,
                             user_area_id=int(rep["UserAreaID"]),
                             priority=getattr(job_queue, "PRIORITY_PRICE_REFRESH", job_queue.PRIORITY_DETAIL_REFRESH),
                             run_after=current_time_used,
-                            payload={"run_id": run_id, "run_started_at": current_time_used.isoformat(), "full_refresh": True},
+                            payload={"run_id": run_id, "run_started_at": current_time_used.isoformat(), "scheduled_at": scheduled_at.isoformat(), "full_refresh": True},
+                            dedupe_key=price_dedupe,
                         )
                     (result["created"] if job.get("created") else result["skipped_duplicates"]).append(job)
                 else:
@@ -893,6 +977,22 @@ def _search_is_active_for_monitoring(search_id: int | None) -> bool:
         return db_layer.is_area_active_for_monitoring(conn, search_id=int(search_id))
     finally:
         conn.close()
+
+
+def _search_ready_for_operational_monitoring(search_id: int | None) -> bool:
+    if search_id is None:
+        return True
+    conn = db_layer.connect(config.DB_PATH)
+    if conn is None:
+        return True
+    try:
+        subs = db_layer.get_active_user_area_subscriptions_for_search(conn, int(search_id))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return bool(subs and _subscription_group_is_ready(subs))
 
 
 def _inactive_job_result(search_id: int | None) -> dict[str, Any]:
@@ -1039,23 +1139,27 @@ def _price_retry_dedupe_key(search_id: int, listing_external_ids: list[str]) -> 
 
 
 def _enqueue_price_retry_unknowns(search_id: int, listing_external_ids: list[str], run_after=None, dedupe_suffix: str = "") -> dict[str, Any] | None:
+    import job_queue
+
     safe_ids = sorted(str(value).strip() for value in listing_external_ids if str(value).strip())
     if not safe_ids:
         return None
-    import job_queue
-
-    base_key = _price_retry_dedupe_key(search_id, safe_ids)
-    dedupe_key = f"{base_key}:{dedupe_suffix}" if dedupe_suffix else base_key
+    retry_at = run_after or (_utcnow() + timedelta(seconds=int(getattr(config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600))))
+    dedupe_key = _price_retry_window_dedupe_key(search_id, safe_ids, retry_window_at=retry_at)
+    if dedupe_suffix:
+        dedupe_key = f"{dedupe_key}:{dedupe_suffix}"
+    existing = _job_exists_for_dedupe_key(dedupe_key, include_terminal=True)
+    if existing:
+        return {**existing, "created": False, "duplicate": True, "reason": "existing_price_retry_for_window"}
     return job_queue.enqueue_job_once(
         job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
         search_id=int(search_id),
         priority=job_queue.PRIORITY_PRICE_RETRY_UNKNOWNS,
-        run_after=run_after or (_utcnow() + timedelta(seconds=5)),
-        payload={"listing_external_ids": safe_ids},
+        run_after=retry_at,
+        payload={"listing_external_ids": safe_ids, "retry_window_at": retry_at.isoformat() if hasattr(retry_at, "isoformat") else str(retry_at)},
         dedupe_key=dedupe_key,
         max_attempts=3,
     )
-
 
 def _price_sweep_history(conn, search_id: int) -> dict[str, Any]:
     summary = db_layer.get_price_inference_history_summary(conn, search_id, sample_size=10)
@@ -1154,6 +1258,12 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
         "errors": [],
     }
     if dry_run or not candidates:
+        if mark_search_complete and not dry_run:
+            conn = db_layer.connect(config.DB_PATH)
+            try:
+                db_layer.mark_search_price_refreshed(conn, search_id)
+            finally:
+                conn.close()
         return json_safe(result)
 
     remaining_by_external = {str(row.get("listing_id") or row.get("external_id") or "").strip(): row for row in candidates if str(row.get("listing_id") or row.get("external_id") or "").strip()}
@@ -1275,7 +1385,7 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
                 retry_job = _enqueue_price_retry_unknowns(search_id, result["unknown_external_ids"])
                 result["price_retry_job"] = retry_job
                 result["price_retry_job_enqueued"] = bool(retry_job)
-        if mark_search_complete and result["processed_count"] > 0:
+        if mark_search_complete:
             db_layer.mark_search_price_refreshed(conn, search_id)
         conn.commit()
     finally:
@@ -1541,7 +1651,6 @@ def run_price_retry_unknowns_for_search(search_id: int, payload: dict[str, Any] 
             search_id,
             price.get("unknown_external_ids") or [],
             run_after=retry_after,
-            dedupe_suffix=f"retry_after={retry_after.isoformat()}",
         )
     return {"status": price.get("status", "completed"), "search_id": search_id, "price_retry": price, "next_retry_job": next_job}
 
@@ -1555,13 +1664,14 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
     payload = dict(payload or {})
     run_id = payload.get("run_id") or f"price-refresh-{search_id}-{uuid.uuid4().hex}"
     run_started_at = _parse_run_started_at(payload.get("run_started_at"))
+    scheduled_at = _parse_run_started_at(payload.get("scheduled_at"))
     price = run_price_baseline_for_search(
         search_id,
         limit=int(getattr(config, "PRICE_REFRESH_BATCH_SIZE", 10)),
         dry_run=dry_run,
         setup=False,
         run_started_at=run_started_at,
-        mark_search_complete=False,
+        mark_search_complete=True,
     )
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
@@ -1586,12 +1696,12 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
                 search_id=search_id,
                 priority=job_queue.PRIORITY_PRICE_REFRESH,
                 run_after=_utcnow() + timedelta(seconds=5),
-                payload={"run_id": run_id, "run_started_at": run_started_at.isoformat(), "full_refresh": True},
+                payload={"run_id": run_id, "run_started_at": run_started_at.isoformat(), "scheduled_at": scheduled_at.isoformat() if scheduled_at else None, "full_refresh": True},
                 dedupe_key=f"{job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING}:search_id={search_id}",
                 max_attempts=3,
             )
     status = "completed" if remaining == 0 else "running"
-    return {"status": status, "run_id": run_id, "run_started_at": run_started_at, "remaining_count": remaining, "price_refresh": price, "enqueued_next_batch": enqueued}
+    return {"status": status, "run_id": run_id, "run_started_at": run_started_at, "scheduled_at": scheduled_at, "remaining_count": remaining, "price_refresh": price, "enqueued_next_batch": enqueued}
 
 
 def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = False) -> dict[str, Any]:
@@ -1655,6 +1765,14 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
     user_area_id = int(job.get("UserAreaID") or 0) if job.get("UserAreaID") is not None else None
     if search_id is not None and not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
+    setup_job_types = {
+        job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+        job_queue.JOB_TYPE_SETUP_FULL_BASELINE,
+        job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE,
+        job_queue.JOB_TYPE_SETUP_PRICE_BASELINE,
+    }
+    if search_id is not None and job_type not in setup_job_types and not _search_ready_for_operational_monitoring(search_id):
+        return {"status": "skipped", "reason": "search_not_ready_for_operational_monitoring", "search_id": search_id, "job_type": job_type}
     if job_type == job_queue.JOB_TYPE_BASELINE_SETUP_AREA:
         payload = _job_payload(job)
         area_url = payload.get("search_url")
@@ -1780,5 +1898,7 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         failure = job_queue.mark_job_retry_wait(int(job["JobID"]), reason, retry_after_seconds=retry_after_seconds)
         return {"status": "retry_wait", "claimed_job": job, "error": reason, "failure": failure}
     except Exception as exc:
-        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=True)
-        return {"status": "failed", "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure}
+        retryable = is_retryable_navigation_error(exc) or isinstance(exc, Module2RetryableInterruption)
+        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=retryable)
+        status = "retry_wait" if retryable else "failed"
+        return {"status": status, "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure}

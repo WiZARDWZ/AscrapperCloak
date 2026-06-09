@@ -17,6 +17,9 @@ sys.modules.setdefault(
         is_429_page=lambda *a, **k: False,
         raise_if_realestate_blocked=lambda *a, **k: None,
         recover_browser_after_429=lambda *a, **k: None,
+        recover_browser_for_untrusted_state=lambda *a, **k: (None, 0, "rea_profile", "rotation_limit"),
+        safe_driver_get=lambda driver, url, log_func=print: (True, None),
+        is_retryable_navigation_error=lambda exc: "net::" in str(exc).lower() or "page.goto" in str(exc).lower(),
         same_session_kpsdk_recheck=lambda **kwargs: (kwargs.get("initial_result"), kwargs.get("initial_payload")),
     ),
 )

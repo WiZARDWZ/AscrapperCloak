@@ -23,9 +23,10 @@ from cloak_browser_helper import (
 from config import AREA_SEARCH_URL
 import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
-from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_after_429, same_session_kpsdk_recheck
-from realestate_page_state import PageState, wait_for_search_page_state
+from browser_recovery import is_429_page, raise_if_realestate_blocked, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
+from realestate_page_state import PageState, classify_search_page, get_listing_cards, wait_for_search_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
+from realestate_errors import RealEstateBlockedError
 
 
 # --- Fix: جلوگیری از WinError 6 در پایان برنامه (UC روی ویندوز) ---
@@ -106,16 +107,188 @@ def is_headless_enabled() -> bool:
 
 
 def safe_get(driver, url: str):
-    """جلوگیری از کرش در renderer/page load timeout"""
+    """Navigate while retaining retryable failures for DOM-first recovery decisions."""
+    ok, exc = safe_driver_get(driver, url)
     try:
-        driver.get(url)
+        driver._module1_last_navigation = {
+            "url": url,
+            "navigation_failed": not ok,
+            "navigation_error": exc,
+        }
+    except Exception:
+        pass
+    return ok
+
+
+def _last_navigation(driver) -> dict:
+    try:
+        value = getattr(driver, "_module1_last_navigation", {}) or {}
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def _current_url(driver, state_result=None) -> str:
+    if state_result is not None and getattr(state_result, "current_url", None):
+        return str(state_result.current_url or "")
+    try:
+        return str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        return ""
+
+
+def _is_chrome_error_url(value: str | None) -> bool:
+    return str(value or "").strip().lower().startswith("chrome-error://chromewebdata")
+
+
+def _navigation_needs_fast_classification(driver, navigation_info: dict) -> bool:
+    return _is_chrome_error_url(_current_url(driver))
+
+
+def _module1_state_is_recoverable(driver, state_result, navigation_info: dict) -> bool:
+    if _is_chrome_error_url(_current_url(driver, state_result)):
         return True
-    except TimeoutException:
-        try:
-            driver.execute_script("window.stop();")
-        except Exception:
-            pass
+    if getattr(state_result, "state", None) in UNTRUSTED_RECOVERY_STATES:
+        return True
+    return bool(navigation_info.get("navigation_failed") and getattr(state_result, "state", None) not in {PageState.LISTINGS, PageState.NO_RESULTS})
+
+
+def _module1_recovery_reason(driver, state_result, navigation_info: dict) -> str:
+    state = getattr(state_result, "state", None) or "unknown"
+    reason = getattr(state_result, "reason", None) or state
+    if _is_chrome_error_url(_current_url(driver, state_result)):
+        reason = f"chrome_error:{reason}"
+    if navigation_info.get("navigation_error") is not None:
+        reason = f"navigation_failed:{reason}:{navigation_info.get('navigation_error')}"
+    return config.mask_sensitive_text(reason)
+
+
+def _module1_is_same_page_kpsdk_candidate(driver, requested_url: str, state_result) -> bool:
+    """Return True when a realestate search page should be allowed to hydrate in-place.
+
+    realestate.com.au can briefly expose a KPSDK/429 shell while the same tab is
+    still on the requested URL and the DOM is actively hydrating. Re-navigating
+    that URL immediately can turn the temporary shell into Chrome's
+    ``chrome-error://chromewebdata/`` page, so Module1 first settles the current
+    DOM without another ``driver.get``.
+    """
+    current_url = _current_url(driver, state_result)
+    if _is_chrome_error_url(current_url):
         return False
+    current_l = str(current_url or "").lower()
+    requested_l = str(requested_url or "").lower()
+    if "realestate.com.au" not in current_l:
+        return False
+    if requested_l and "realestate.com.au" in requested_l:
+        current_parsed = urlparse(current_l)
+        requested_parsed = urlparse(requested_l)
+        if (current_parsed.netloc, current_parsed.path) != (requested_parsed.netloc, requested_parsed.path):
+            return False
+    network_reason = str(getattr(state_result, "network_reason", "") or "").lower()
+    reason = str(getattr(state_result, "reason", "") or "").lower()
+    state = getattr(state_result, "state", None)
+    is_transient_block = state in {PageState.BLOCKED_KPSDK, PageState.BLOCKED_HTTP_429}
+    is_network_429 = "blocked_http_429" in network_reason or "blocked_http_429" in reason
+    is_kpsdk = "kpsdk" in network_reason or "kpsdk" in reason
+    if not (is_transient_block or is_network_429 or is_kpsdk):
+        return False
+    html_len = int(getattr(state_result, "html_length", 0) or 0)
+    body_len = int(getattr(state_result, "body_text_length", 0) or 0)
+    return html_len < 5000 or body_len < 250 or state in {PageState.BLOCKED_KPSDK, PageState.BLOCKED_HTTP_429}
+
+
+def _module1_same_page_kpsdk_settle(driver, requested_url: str, state_result, cards, *, min_cards: int, log):
+    """Settle transient KPSDK/429 shells on the same page before re-navigation.
+
+    This preserves the browser tab when the URL is still the requested REA page,
+    allowing listings/cards to win over historical network 429s.
+    """
+    if not _module1_is_same_page_kpsdk_candidate(driver, requested_url, state_result):
+        return state_result, cards
+
+    log(
+        "Module1 transient KPSDK detected; same-page settle start "
+        f"state={getattr(state_result, 'state', None)} current_url={_current_url(driver, state_result)} "
+        f"html_length={getattr(state_result, 'html_length', 0) or 0} "
+        f"body_text_length={getattr(state_result, 'body_text_length', 0) or 0}"
+    )
+
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+    grace_seconds = max(settle_seconds, float(getattr(config, "BROWSER_BLOCK_GRACE_SECONDS", 30)))
+    poll_seconds = max(0.05, float(getattr(config, "BROWSER_BLOCK_POLL_SECONDS", 1.0)))
+    deadline = time.time() + grace_seconds
+    next_sleep = settle_seconds if settle_seconds > 0 else poll_seconds
+    previous_html_len = int(getattr(state_result, "html_length", 0) or 0)
+    last_result = state_result
+    last_cards = cards or []
+
+    while time.time() <= deadline:
+        time.sleep(min(next_sleep, max(0.0, deadline - time.time())))
+        current = classify_search_page(driver, timeout=True, min_cards=min_cards)
+        current_cards = get_listing_cards(driver, min_cards=min_cards)
+        if current_cards and current.state != PageState.LISTINGS:
+            current = classify_search_page(driver, min_cards=min_cards)
+        log(
+            "Module1 same-page settle result state={state} cards_found={cards} html_length={html_len} "
+            "body_text_length={body_len} network_reason={network} current_url={url}".format(
+                state=current.state,
+                cards=getattr(current, "cards_count", len(current_cards)),
+                html_len=getattr(current, "html_length", 0) or 0,
+                body_len=getattr(current, "body_text_length", 0) or 0,
+                network=getattr(current, "network_reason", None),
+                url=getattr(current, "current_url", "") or _current_url(driver),
+            )
+        )
+        last_result = current
+        last_cards = current_cards
+        if current.state == PageState.LISTINGS or len(current_cards) >= min_cards:
+            log("Module1 DOM-first listings after transient KPSDK; ignoring historical 429")
+            if current.state != PageState.LISTINGS:
+                current.state = PageState.LISTINGS
+                current.reason = current.reason or "listing_cards_present"
+                current.cards_count = max(getattr(current, "cards_count", 0) or 0, len(current_cards))
+            return current, current_cards
+        if current.state == PageState.NO_RESULTS:
+            return current, []
+        if _is_chrome_error_url(_current_url(driver, current)):
+            return current, []
+
+        html_len = int(getattr(current, "html_length", 0) or 0)
+        title = str(getattr(current, "title", "") or "").lower()
+        still_loading_rea = "real estate" in title or "realestate.com.au" in title or html_len > previous_html_len
+        if not still_loading_rea:
+            break
+        previous_html_len = max(previous_html_len, html_len)
+        next_sleep = poll_seconds
+
+    return last_result, last_cards
+
+
+def _recover_module1_untrusted_page(
+    *,
+    driver,
+    profile_dir_current: str,
+    rotations_used: int,
+    max_rotations: int,
+    state_result,
+    navigation_info: dict,
+    url: str,
+    log,
+):
+    reason = _module1_recovery_reason(driver, state_result, navigation_info)
+    log(f"Module1 untrusted page state={getattr(state_result, 'state', None)} current_url={_current_url(driver, state_result)}. Recovering profile/session reason={reason}.")
+    driver, rotations_used, profile_dir_current, recovery_status = recover_browser_after_429(
+        driver=driver,
+        current_profile_dir=profile_dir_current,
+        build_driver_func=setup_driver,
+        rotations_used=rotations_used,
+        max_rotations=max_rotations,
+        reason=reason,
+        log_func=log,
+    )
+    if recovery_status == "recovered":
+        safe_get(driver, url)
+    return driver, rotations_used, profile_dir_current, recovery_status
 
 
 def _stop_page_loading(driver) -> None:
@@ -694,10 +867,15 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
     try:
         driver = setup_driver(profile_dir_override=profile_dir_current)
         page_url = make_list_url(search_url, page)
-        safe_get(driver, page_url)
+        navigation_ok = safe_get(driver, page_url)
+        navigation_info = _last_navigation(driver)
         page_429_retries = 0
         while True:
-            state_result, cards = wait_for_search_page_state(driver, timeout=effective_timeout, min_cards=1)
+            if _navigation_needs_fast_classification(driver, navigation_info):
+                state_result = classify_search_page(driver, timeout=True, min_cards=1)
+                cards = []
+            else:
+                state_result, cards = wait_for_search_page_state(driver, timeout=effective_timeout, min_cards=1)
             log(
                 "Module1 page_state={state} cards_found={cards} network_reason={network} block_reason={reason} "
                 "no_results_detected={no_results} current_url={url} html_length={html_len} body_text_length={body_len}".format(
@@ -711,17 +889,44 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                     body_len=state_result.body_text_length,
                 )
             )
-            state_result, cards = _same_session_kpsdk_recheck(
-                driver=driver,
-                url=page_url,
-                timeout=effective_timeout,
+            state_result, cards = _module1_same_page_kpsdk_settle(
+                driver,
+                page_url,
+                state_result,
+                cards,
                 min_cards=1,
-                state_result=state_result,
-                cards=cards,
                 log=log,
             )
+            if state_result.state == PageState.BLOCKED_KPSDK and not _is_chrome_error_url(_current_url(driver, state_result)):
+                state_result, cards = _same_session_kpsdk_recheck(
+                    driver=driver,
+                    url=page_url,
+                    timeout=effective_timeout,
+                    min_cards=1,
+                    state_result=state_result,
+                    cards=cards,
+                    log=log,
+                )
             if state_result.state == PageState.LISTINGS:
                 break
+            if _module1_state_is_recoverable(driver, state_result, navigation_info) and config.BROWSER_RECOVERY_ON_429:
+                driver, rotations_used, profile_dir_current, recovery_status = _recover_module1_untrusted_page(
+                    driver=driver,
+                    profile_dir_current=profile_dir_current,
+                    rotations_used=rotations_used,
+                    max_rotations=min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN),
+                    state_result=state_result,
+                    navigation_info=navigation_info,
+                    url=page_url,
+                    log=log,
+                )
+                if recovery_status != "recovered":
+                    raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+                page_429_retries += 1
+                if page_429_retries > config.MODULE1_RETRY_SAME_PAGE_AFTER_429:
+                    raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+                navigation_info = _last_navigation(driver)
+                continue
             if state_result.state == PageState.NO_RESULTS:
                 return [], {
                     "page": page,
@@ -734,25 +939,6 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                     "stop_reason": "no_results",
                     "page_state": state_result.state,
                 }
-            if state_result.is_blocked and config.BROWSER_RECOVERY_ON_429:
-                log(f"Blocked Module1 page={page} state={state_result.state}. Recovering profile/session (retry={page_429_retries + 1}).")
-                driver, rotations_used, profile_dir_current, recovery_status = recover_browser_after_429(
-                    driver=driver,
-                    current_profile_dir=profile_dir_current,
-                    build_driver_func=setup_driver,
-                    rotations_used=rotations_used,
-                    max_rotations=min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN),
-                    log_func=log,
-                )
-                if recovery_status != "recovered":
-                    raise_if_realestate_blocked(driver)
-                    return [], {"page": page, "has_next_page": False, "url": page_url, "rows_count": 0, "stop_reason": state_result.state, "page_state": state_result.state}
-                page_429_retries += 1
-                if page_429_retries > config.MODULE1_RETRY_SAME_PAGE_AFTER_429:
-                    raise_if_realestate_blocked(driver)
-                    return [], {"page": page, "has_next_page": False, "url": page_url, "rows_count": 0, "stop_reason": state_result.state, "page_state": state_result.state}
-                safe_get(driver, page_url)
-                continue
             return [], {
                 "page": page,
                 "has_next_page": False,
@@ -867,10 +1053,15 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
             url = make_list_url(base_url, page)
             log(f"\nPage {page}: {url}")
-            safe_get(driver, url)
+            navigation_ok = safe_get(driver, url)
+            navigation_info = _last_navigation(driver)
             page_429_retries = 0
             while True:
-                state_result, cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=1)
+                if _navigation_needs_fast_classification(driver, navigation_info):
+                    state_result = classify_search_page(driver, timeout=True, min_cards=1)
+                    cards = []
+                else:
+                    state_result, cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=1)
                 log(
                     "Module1 page_state={state} cards_found={cards} network_reason={network} block_reason={reason} "
                     "no_results_detected={no_results} current_url={url} html_length={html_len} body_text_length={body_len}".format(
@@ -884,22 +1075,33 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                         body_len=state_result.body_text_length,
                     )
                 )
-                state_result, cards = _same_session_kpsdk_recheck(
-                    driver=driver,
-                    url=url,
-                    timeout=timeout,
+                state_result, cards = _module1_same_page_kpsdk_settle(
+                    driver,
+                    url,
+                    state_result,
+                    cards,
                     min_cards=1,
-                    state_result=state_result,
-                    cards=cards,
                     log=log,
                 )
+                if state_result.state == PageState.BLOCKED_KPSDK and not _is_chrome_error_url(_current_url(driver, state_result)):
+                    state_result, cards = _same_session_kpsdk_recheck(
+                        driver=driver,
+                        url=url,
+                        timeout=timeout,
+                        min_cards=1,
+                        state_result=state_result,
+                        cards=cards,
+                        log=log,
+                    )
                 if state_result.state == PageState.LISTINGS:
                     break
-                if state_result.state == PageState.NO_RESULTS:
+                if _module1_state_is_recoverable(driver, state_result, navigation_info) and config.BROWSER_RECOVERY_ON_429:
+                    pass
+                elif state_result.state == PageState.NO_RESULTS:
                     log("No results page detected. Stop.")
                     scrape_search.last_result = {"status": "no_results", "rows": len(all_rows), "stop_reason": "no_results", "page_state": state_result.state}
                     return all_rows
-                if not (state_result.is_blocked and config.BROWSER_RECOVERY_ON_429):
+                else:
                     log(f"Page render not usable state={state_result.state} reason={state_result.reason}. Stop.")
                     scrape_search.last_result = {
                         "status": "render_timeout",
@@ -909,29 +1111,30 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     }
                     return all_rows
                 save_results(all_rows, out_dir=config.OUTPUT_DIR)
-                log(f"HTTP 429 on Module1 page={page}. Recovering profile/session (retry={page_429_retries+1}).")
-                driver, rotations_used, profile_dir_current, recovery_status = recover_browser_after_429(
+                driver, rotations_used, profile_dir_current, recovery_status = _recover_module1_untrusted_page(
                     driver=driver,
-                    current_profile_dir=profile_dir_current,
-                    build_driver_func=setup_driver,
+                    profile_dir_current=profile_dir_current,
                     rotations_used=rotations_used,
                     max_rotations=min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN),
-                    log_func=log,
+                    state_result=state_result,
+                    navigation_info=navigation_info,
+                    url=url,
+                    log=log,
                 )
                 if recovery_status != "recovered":
                     if not all_rows:
-                        raise_if_realestate_blocked(driver)
+                        raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
                     log("Module1 recovery rotation limit reached. Returning partial rows gracefully.")
                     scrape_search.last_result = {"status": "partial_blocked", "rows": len(all_rows), "stop_reason": state_result.state, "page_state": state_result.state}
                     return all_rows
                 page_429_retries += 1
                 if page_429_retries > config.MODULE1_RETRY_SAME_PAGE_AFTER_429:
                     if not all_rows:
-                        raise_if_realestate_blocked(driver)
-                    log("Module1 page retry limit after 429 reached. Returning partial rows gracefully.")
+                        raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+                    log("Module1 page retry limit after recovery reached. Returning partial rows gracefully.")
                     scrape_search.last_result = {"status": "partial_blocked", "rows": len(all_rows), "stop_reason": state_result.state, "page_state": state_result.state}
                     return all_rows
-                safe_get(driver, url)
+                navigation_info = _last_navigation(driver)
 
             # اگر ریدایرکت شد به صفحه دیگری (مثلاً list-2 رفتی ولی برگشت list-1)
             actual_page = _parse_list_page(driver.current_url or "")

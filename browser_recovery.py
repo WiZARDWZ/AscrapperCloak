@@ -141,6 +141,95 @@ def same_session_kpsdk_recheck(
     return state_result, payload
 
 
+RETRYABLE_NAVIGATION_ERROR_MARKERS = (
+    "net::err_http_response_code_failure",
+    "net::err_http2_protocol_error",
+    "net::err_connection_reset",
+    "net::err_network_changed",
+    "net::err_timed_out",
+    "navigation timeout",
+    "timeout",
+    "page.goto",
+    "navigation",
+    "interrupted",
+)
+
+UNTRUSTED_RECOVERY_STATES = {
+    PageState.BLOCKED_KPSDK,
+    PageState.BLOCKED_HTTP_429,
+    PageState.BLOCKED_ACCESS_DENIED,
+    PageState.BLANK_RENDER,
+    PageState.RENDER_TIMEOUT,
+    PageState.UNKNOWN,
+}
+
+TRUSTED_RECOVERY_STATES = {
+    PageState.LISTINGS,
+    PageState.DETAIL_READY,
+    PageState.NO_RESULTS,
+    PageState.DETAIL_REMOVED,
+    PageState.DETAIL_SOLD,
+    PageState.DETAIL_NOT_FOUND,
+}
+
+
+def is_retryable_navigation_error(exc: Exception | str | None) -> bool:
+    text = str(exc or "").lower()
+    return any(marker in text for marker in RETRYABLE_NAVIGATION_ERROR_MARKERS)
+
+
+def stop_page_loading(driver) -> None:
+    try:
+        driver.execute_script("window.stop();")
+    except Exception:
+        pass
+
+
+def safe_driver_get(driver, url: str, log_func=print) -> tuple[bool, Exception | None]:
+    """Navigate without letting retryable Page.goto failures skip DOM classification."""
+    try:
+        driver.get(url)
+        return True, None
+    except Exception as exc:
+        stop_page_loading(driver)
+        if log_func:
+            log_func(f"[recovery] Page.goto retryable render/navigation failure url={url} error={config.mask_sensitive_text(exc)}")
+        if is_retryable_navigation_error(exc):
+            return False, exc
+        return False, exc
+
+
+def recover_browser_for_untrusted_state(
+    *,
+    driver,
+    current_profile_dir: str,
+    build_driver_func,
+    rotations_used: int,
+    max_rotations: int,
+    reason: str,
+    job_id: int | None = None,
+    search_id: int | None = None,
+    log_func=print,
+):
+    old_profile = os.path.abspath(_sanitize_profile_dir_for_platform(current_profile_dir or config.BROWSER_PROFILE_BASE_DIR))
+    if log_func:
+        log_func(f"[recovery] requested | old_profile={old_profile} | reason={reason} | job_id={job_id} | search_id={search_id}")
+    new_driver, new_rotations, new_profile, status = recover_browser_after_429(
+        driver=driver,
+        current_profile_dir=old_profile,
+        build_driver_func=build_driver_func,
+        rotations_used=rotations_used,
+        max_rotations=max_rotations,
+        log_func=log_func,
+    )
+    if log_func:
+        log_func(
+            f"[recovery] completed | action={status} | old_profile={old_profile} | "
+            f"new_profile={new_profile} | reason={reason} | job_id={job_id} | search_id={search_id}"
+        )
+    return new_driver, new_rotations, new_profile, status
+
+
 def has_normal_realestate_content(driver, body_text: str = "") -> bool:
     try:
         result = driver.execute_script(
