@@ -1035,6 +1035,15 @@ def infer_prices_window_based_with_checkpoint(
         save_checkpoint(ck_path, ck)
         return inferred, driver, "retry_wait_browser_recovery"
 
+    if session_failure_windows and checked_this_run > 0 and session_failure_windows >= checked_this_run and not inferred:
+        ck["stopped_reason"] = "retry_wait_browser_recovery"
+        ck["updated_at"] = datetime.now().isoformat()
+        ck["inferred_map"] = inferred
+        ck["remaining_ids"] = sorted(remaining)
+        ck["session_failure_windows"] = session_failure_windows
+        save_checkpoint(ck_path, ck)
+        return inferred, driver, "retry_wait_browser_recovery"
+
     if test_limit_mode and remaining and effective_max_windows > 0 and checked_this_run >= effective_max_windows and window_cursor < len(sweep_windows):
         ck["stopped_reason"] = "max_windows_test_limit"
         ck["updated_at"] = datetime.now().isoformat()
