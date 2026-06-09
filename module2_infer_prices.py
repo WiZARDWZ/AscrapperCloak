@@ -3,7 +3,6 @@ import json
 import os
 import re
 import time
-import random
 import gc
 import hashlib
 import uuid
@@ -18,7 +17,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -97,11 +96,18 @@ def is_internet_disconnected(err: Exception) -> bool:
     ])
 
 
-def get_with_retries(driver, url, tries=2):
+def get_with_retries(driver, url, tries=2, *, phase: str = "page", apply_delay: bool = False, log_func=print):
     last_err = None
-    for _ in range(tries):
+    for attempt in range(tries):
         try:
-            ok, exc = safe_driver_get(driver, url)
+            ok, exc = safe_realestate_get_with_reset(
+                driver,
+                url,
+                module_name="Module2",
+                phase=phase,
+                log_func=log_func,
+                apply_delay=apply_delay and attempt == 0,
+            )
             if ok:
                 return driver, True, None
             last_err = exc
@@ -126,7 +132,7 @@ def get_with_retries(driver, url, tries=2):
 
 
 def _same_driver_get(driver, url: str):
-    _driver, ok, err = get_with_retries(driver, url, tries=2)
+    _driver, ok, err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
     if not ok and err:
         raise err
     return ok
@@ -742,7 +748,16 @@ def infer_prices_window_based_with_checkpoint(
                     {"window": window_idx, "page": page, "remaining": len(remaining), "range_low": low, "range_high": high},
                 )
 
-            driver, ok, err = get_with_retries(driver, url, tries=2)
+            nav_phase = "window" if page == 1 else "page"
+            nav_apply_delay = (page > 1) or (page == 1 and checked_this_run > 1)
+            driver, ok, err = get_with_retries(
+                driver,
+                url,
+                tries=2,
+                phase=nav_phase,
+                apply_delay=nav_apply_delay,
+                log_func=log_func,
+            )
             session_health.record_navigation(url, ok, err, str(getattr(driver, "current_url", "") or ""))
             if not ok:
                 consecutive_get_failures += 1
@@ -863,7 +878,7 @@ def infer_prices_window_based_with_checkpoint(
                 if should_same_url_retry and recovery_policy.should_retry_same_profile(session_health):
                     session_health.record_same_url_retry(state_result.reason or state_result.state)
                     log_session_health(session_health, url_type="price_window", page_state=state_result.state, action=action, log_func=log_func)
-                    driver, ok_retry, err_retry = get_with_retries(driver, url, tries=1)
+                    driver, ok_retry, err_retry = get_with_retries(driver, url, tries=1, phase="chrome_error_retry", apply_delay=False, log_func=log_func)
                     session_health.record_navigation(url, ok_retry, err_retry, str(getattr(driver, "current_url", "") or ""))
                     if ok_retry:
                         try:
@@ -986,7 +1001,6 @@ def infer_prices_window_based_with_checkpoint(
             if page < max_pages_per_window and not has_next_results_page(driver, page):
                 log_func("No next page detected. Stop paging this window.")
                 break
-            time.sleep(random.uniform(config.MODULE2_SLEEP_BETWEEN_PAGES_MIN, config.MODULE2_SLEEP_BETWEEN_PAGES_MAX))
 
         log_func(f"Remaining after window: {len(remaining)}")
         if window_timed_out:
@@ -1011,7 +1025,15 @@ def infer_prices_window_based_with_checkpoint(
         ck["consecutive_timeout_windows"] = consecutive_timeout_windows
         ck["session_failure_windows"] = session_failure_windows
         save_checkpoint(ck_path, ck)
-        time.sleep(random.uniform(config.MODULE2_SLEEP_BETWEEN_WINDOWS_MIN, config.MODULE2_SLEEP_BETWEEN_WINDOWS_MAX))
+
+    if session_failure_windows and checked_this_run > 0 and session_failure_windows >= checked_this_run and not inferred:
+        ck["stopped_reason"] = "retry_wait_browser_recovery"
+        ck["updated_at"] = datetime.now().isoformat()
+        ck["inferred_map"] = inferred
+        ck["remaining_ids"] = sorted(remaining)
+        ck["session_failure_windows"] = session_failure_windows
+        save_checkpoint(ck_path, ck)
+        return inferred, driver, "retry_wait_browser_recovery"
 
     if session_failure_windows and checked_this_run > 0 and session_failure_windows >= checked_this_run and not inferred:
         ck["stopped_reason"] = "retry_wait_browser_recovery"

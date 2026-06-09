@@ -1,4 +1,5 @@
 import json
+import random
 import os
 import shutil
 import time
@@ -300,6 +301,117 @@ def stop_page_loading(driver) -> None:
         driver.execute_script("window.stop();")
     except Exception:
         pass
+
+
+def _delay_settings(module_name: str, phase: str) -> tuple[float, float]:
+    module = str(module_name or "").strip().upper()
+    phase_l = str(phase or "").strip().lower()
+    if module == "MODULE2" and "window" in phase_l:
+        return (
+            float(getattr(config, "MODULE2_INTER_WINDOW_DELAY_SECONDS", 10)),
+            float(getattr(config, "MODULE2_INTER_WINDOW_DELAY_JITTER_SECONDS", 5)),
+        )
+    if module == "MODULE2":
+        return (
+            float(getattr(config, "MODULE2_INTER_PAGE_DELAY_SECONDS", 8)),
+            float(getattr(config, "MODULE2_INTER_PAGE_DELAY_JITTER_SECONDS", 4)),
+        )
+    if module == "MODULE3":
+        return (
+            float(getattr(config, "MODULE3_INTER_DETAIL_DELAY_SECONDS", 8)),
+            float(getattr(config, "MODULE3_INTER_DETAIL_DELAY_JITTER_SECONDS", 4)),
+        )
+    return (
+        float(getattr(config, "MODULE1_INTER_PAGE_DELAY_SECONDS", 8)),
+        float(getattr(config, "MODULE1_INTER_PAGE_DELAY_JITTER_SECONDS", 4)),
+    )
+
+
+def _chrome_error_retry_delay(module_name: str) -> float:
+    module = str(module_name or "").strip().upper()
+    if module == "MODULE2":
+        return float(getattr(config, "MODULE2_CHROME_ERROR_RETRY_DELAY_SECONDS", 3))
+    if module == "MODULE3":
+        return float(getattr(config, "MODULE3_CHROME_ERROR_RETRY_DELAY_SECONDS", 3))
+    return float(getattr(config, "MODULE1_CHROME_ERROR_RETRY_DELAY_SECONDS", 3))
+
+
+def _chrome_error_reset_enabled(module_name: str) -> bool:
+    module = str(module_name or "").strip().upper()
+    if module == "MODULE2":
+        return bool(getattr(config, "MODULE2_CHROME_ERROR_NAV_RESET", True))
+    if module == "MODULE3":
+        return bool(getattr(config, "MODULE3_CHROME_ERROR_NAV_RESET", True))
+    return bool(getattr(config, "MODULE1_CHROME_ERROR_NAV_RESET", True))
+
+
+def human_inter_navigation_delay(module_name: str, phase: str, log_func=print) -> float:
+    base, jitter = _delay_settings(module_name, phase)
+    delay = max(0.0, base) + random.uniform(0.0, max(0.0, jitter))
+    if log_func:
+        log_func(f"{module_name} inter-navigation delay phase={phase}: {delay:.1f}s")
+    if delay > 0:
+        time.sleep(delay)
+    return delay
+
+
+def reset_chrome_error_tab(driver, log_func=print) -> bool:
+    current_url = ""
+    try:
+        current_url = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        current_url = ""
+    if not is_chrome_error_url(current_url):
+        return False
+    if log_func:
+        log_func("chrome-error tab reset: current_url=chrome-error://chromewebdata/")
+    stop_page_loading(driver)
+    try:
+        driver.execute_cdp_cmd("Page.stopLoading", {})
+    except Exception:
+        pass
+    try:
+        driver.get("about:blank")
+    except Exception:
+        try:
+            driver.execute_script("window.location.href = 'about:blank';")
+        except Exception:
+            pass
+    time.sleep(0.5)
+    return True
+
+
+def safe_realestate_get_with_reset(
+    driver,
+    url: str,
+    module_name: str,
+    phase: str,
+    log_func=print,
+    *,
+    apply_delay: bool = True,
+) -> tuple[bool, Exception | None]:
+    if _chrome_error_reset_enabled(module_name):
+        reset_chrome_error_tab(driver, log_func=log_func)
+    if apply_delay:
+        human_inter_navigation_delay(module_name, phase, log_func=log_func)
+    ok, err = safe_driver_get(driver, url, log_func=log_func)
+    current_url = ""
+    try:
+        current_url = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        current_url = ""
+    if ok or not (_chrome_error_reset_enabled(module_name) and is_chrome_error_url(current_url)):
+        return ok, err
+    if log_func:
+        log_func(f"{module_name} chrome-error navigation reset before retry phase={phase} requested_url={config.mask_sensitive_text(url)}")
+    reset_chrome_error_tab(driver, log_func=log_func)
+    retry_delay = max(0.0, _chrome_error_retry_delay(module_name))
+    if retry_delay:
+        if log_func:
+            log_func(f"{module_name} chrome-error retry delay phase={phase}: {retry_delay:.1f}s")
+        time.sleep(retry_delay)
+    retry_ok, retry_err = safe_driver_get(driver, url, log_func=log_func)
+    return retry_ok, retry_err or err
 
 
 def safe_driver_get(driver, url: str, log_func=print) -> tuple[bool, Exception | None]:

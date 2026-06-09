@@ -23,7 +23,7 @@ from cloak_browser_helper import (
 from config import AREA_SEARCH_URL
 import config
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, raise_if_realestate_blocked, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, raise_if_realestate_blocked, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get, UNTRUSTED_RECOVERY_STATES
 from realestate_page_state import PageState, classify_search_page, get_listing_cards, wait_for_search_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 from realestate_errors import RealEstateBlockedError
@@ -106,9 +106,16 @@ def is_headless_enabled() -> bool:
     return os.getenv("HEADLESS", "0") == "1"
 
 
-def safe_get(driver, url: str):
+def safe_get(driver, url: str, *, phase: str = "list", apply_delay: bool = False, log_func=print):
     """Navigate while retaining retryable failures for DOM-first recovery decisions."""
-    ok, exc = safe_driver_get(driver, url)
+    ok, exc = safe_realestate_get_with_reset(
+        driver,
+        url,
+        module_name="Module1",
+        phase=phase,
+        log_func=log_func,
+        apply_delay=apply_delay,
+    )
     try:
         driver._module1_last_navigation = {
             "url": url,
@@ -287,7 +294,7 @@ def _recover_module1_untrusted_page(
         log_func=log,
     )
     if recovery_status == "recovered":
-        safe_get(driver, url)
+        safe_get(driver, url, phase="post_rotation_retry", apply_delay=False, log_func=log)
     return driver, rotations_used, profile_dir_current, recovery_status
 
 
@@ -869,7 +876,7 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
     try:
         driver = setup_driver(profile_dir_override=profile_dir_current)
         page_url = make_list_url(search_url, page)
-        navigation_ok = safe_get(driver, page_url)
+        navigation_ok = safe_get(driver, page_url, phase=f"list_page_{page}", apply_delay=False, log_func=log)
         navigation_info = _last_navigation(driver)
         session_health.record_navigation(page_url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
         page_429_retries = 0
@@ -921,7 +928,7 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                 if should_same_url_retry and recovery_policy.should_retry_same_profile(session_health):
                     session_health.record_same_url_retry(reason)
                     log_session_health(session_health, url_type="list", page_state=state_result.state, action="retry_same_profile", log_func=log)
-                    navigation_ok = safe_get(driver, page_url)
+                    navigation_ok = safe_get(driver, page_url, phase=f"retry_page_{page}", apply_delay=False, log_func=log)
                     navigation_info = _last_navigation(driver)
                     session_health.record_navigation(page_url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
                     continue
@@ -1075,7 +1082,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
             url = make_list_url(base_url, page)
             log(f"\nPage {page}: {url}")
-            navigation_ok = safe_get(driver, url)
+            navigation_ok = safe_get(driver, url, phase=f"list_page_{page}", apply_delay=page > 1, log_func=log)
             navigation_info = _last_navigation(driver)
             session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
             page_429_retries = 0
@@ -1127,7 +1134,7 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     if should_same_url_retry and recovery_policy.should_retry_same_profile(session_health):
                         session_health.record_same_url_retry(reason)
                         log_session_health(session_health, url_type="list", page_state=state_result.state, action="retry_same_profile", log_func=log)
-                        navigation_ok = safe_get(driver, url)
+                        navigation_ok = safe_get(driver, url, phase=f"retry_page_{page}", apply_delay=False, log_func=log)
                         navigation_info = _last_navigation(driver)
                         session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
                         continue
@@ -1255,7 +1262,6 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 break
 
             page += 1
-            time.sleep(0.45)
 
         scrape_search.last_result = {"status": "completed", "rows": len(all_rows), "stop_reason": "completed", "page_state": PageState.LISTINGS if all_rows else None}
         return all_rows

@@ -16,7 +16,7 @@ from cloak_browser_helper import By, EC, WebDriverWait, TimeoutException, WebDri
 
 from config import AREA_SEARCH_URL
 import config
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, is_retryable_navigation_error, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, is_retryable_navigation_error, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get, UNTRUSTED_RECOVERY_STATES
 from realestate_errors import RealEstateBlockedError
 from realestate_page_state import PageState, classify_detail_page, wait_for_detail_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
@@ -54,11 +54,18 @@ def is_internet_disconnected(err: Exception) -> bool:
     ])
 
 
-def get_with_retries(driver, url, tries=2):
+def get_with_retries(driver, url, tries=2, *, phase: str = "detail", apply_delay: bool = False, log_func=print):
     last_err = None
-    for _ in range(tries):
+    for attempt in range(tries):
         try:
-            ok, exc = safe_driver_get(driver, url)
+            ok, exc = safe_realestate_get_with_reset(
+                driver,
+                url,
+                module_name="Module3",
+                phase=phase,
+                log_func=log_func,
+                apply_delay=apply_delay and attempt == 0,
+            )
             try:
                 driver._module3_last_navigation = {
                     "url": url,
@@ -91,7 +98,7 @@ def get_with_retries(driver, url, tries=2):
 
 
 def _same_driver_get(driver, url: str):
-    _driver, ok, err = get_with_retries(driver, url, tries=2)
+    _driver, ok, err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
     if not ok and err:
         raise err
     return ok
@@ -208,7 +215,7 @@ def _module3_detail_state_is_recoverable(driver, detail_state, navigation_info: 
     return bool(navigation_info.get("navigation_failed") and state not in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD})
 
 
-def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotations_used: int, wait_timeout: int, log):
+def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotations_used: int, wait_timeout: int, log, *, apply_delay: bool = False):
     """Load one detail URL with DOM-first classification and bounded profile recovery."""
     retry_after = int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
     max_rotations = min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE3_MAX_PROFILE_ROTATIONS_PER_RUN)
@@ -218,7 +225,7 @@ def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotati
     last_state = None
     last_error = None
     for attempt in range(1, max_attempts + 1):
-        driver, ok, err = get_with_retries(driver, url, tries=1)
+        driver, ok, err = get_with_retries(driver, url, tries=1, phase="detail", apply_delay=apply_delay and attempt == 1, log_func=log)
         navigation_info = _module3_last_navigation(driver)
         health.record_navigation(url, ok, err or navigation_info.get("navigation_error"), _module3_current_url(driver))
         last_error = err or navigation_info.get("navigation_error")
@@ -1115,7 +1122,7 @@ def module3_run(
     out_dir: str = "output",
     only_if_missing: bool = True,
     wait_timeout: int = 25,
-    sleep_between: float = 0.35,
+    sleep_between: float | None = None,
     empty_retry: int = 1,
     cancel_token=None,
     on_progress=None,
@@ -1166,6 +1173,7 @@ def module3_run(
 
     try:
         driver = build_driver(profile_dir_override=profile_dir_current)
+        attempted_detail_navigations = 0
 
         for idx in range(start_from, len(rows)):
             if getattr(cancel_token, "is_set", lambda: False)():
@@ -1209,18 +1217,21 @@ def module3_run(
                 rotations_used,
                 wait_timeout,
                 log,
+                apply_delay=attempted_detail_navigations > 0,
             )
+            attempted_detail_navigations += 1
             if not ok:
                 consecutive_get_failures += 1
-                ck["last_index"] = idx
-                save_checkpoint(ck_path, ck)
                 if isinstance(err, RealEstateBlockedError) or is_retryable_navigation_error(err):
                     session_failure_count += 1
                     module3_run.last_result = _module3_retryable_result(err)
                     module3_run.last_result["success_count"] = success_count
                     module3_run.last_result["session_failure_count"] = session_failure_count
-                    log("Retryable Module3 browser/navigation interruption. Checkpoint saved; job should retry_wait.")
+                    save_checkpoint(ck_path, ck)
+                    log("Retryable Module3 browser/navigation interruption. Checkpoint saved without advancing this listing; job should retry_wait.")
                     return None, None
+                ck["last_index"] = idx
+                save_checkpoint(ck_path, ck)
                 log("   -> GET failed/timeout (renderer).")
                 if consecutive_get_failures >= 2:
                     log("   -> Restarting driver ...")
@@ -1272,7 +1283,7 @@ def module3_run(
                         return None, None
                     r["detail_error"] = "blocked_after_retries"
                     break
-                driver, ok, err = get_with_retries(driver, url, tries=2)
+                driver, ok, err = get_with_retries(driver, url, tries=2, phase="blocked_retry", apply_delay=False, log_func=log)
                 if not ok:
                     break
             if r.get("detail_error") == "blocked_after_retries":
@@ -1343,7 +1354,6 @@ def module3_run(
             ck["last_index"] = idx
             save_checkpoint(ck_path, ck)
 
-            time.sleep(sleep_between)
 
         # خروجی FULL
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
@@ -1390,7 +1400,7 @@ if __name__ == "__main__":
         out_dir="output",
         only_if_missing=True,
         wait_timeout=25,
-        sleep_between=0.35,
+        sleep_between=None,
         empty_retry=1,
     )
 
