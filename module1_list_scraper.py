@@ -6,6 +6,7 @@ import re
 import time
 import gc
 import codecs
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -307,6 +308,123 @@ def _stop_page_loading(driver) -> None:
         driver.execute_cdp_cmd("Page.stopLoading", {})
     except Exception:
         pass
+
+
+def _module1_pagination_nav_mode() -> str:
+    mode = str(getattr(config, "MODULE1_PAGINATION_NAV_MODE", "") or "").strip().lower()
+    if mode in {"click_next", "direct_url", "fresh_context_per_page"}:
+        return mode
+    return "click_next" if getattr(config, "BROWSER_ENGINE", "") == "cloak" else "direct_url"
+
+
+def _make_fresh_module1_profile_dir(page: int) -> str:
+    root = os.path.join(str(getattr(config, "OUTPUT_DIR", "output") or "output"), "module1_fresh_profiles")
+    os.makedirs(root, exist_ok=True)
+    return tempfile.mkdtemp(prefix=f"page_{page}_", dir=root)
+
+
+def _human_scroll_idle_before_next(driver, log) -> None:
+    try:
+        driver.execute_script(
+            """
+            (() => {
+              const maxY = Math.max(0, Math.floor(document.body.scrollHeight * 0.72));
+              window.scrollTo({top: maxY, behavior: 'smooth'});
+              setTimeout(() => window.scrollBy({top: -120, behavior: 'smooth'}), 250);
+            })();
+            """
+        )
+    except Exception as exc:
+        log(f"Module1 click-next human scroll warning={config.mask_sensitive_text(exc)}")
+    time.sleep(0.6)
+
+
+def _click_next_anchor(driver, next_page: int, log) -> dict:
+    """Click the real pagination Next anchor without Selenium-style JS arguments."""
+    script = f"""
+    (() => {{
+      const nextPage = {int(next_page)};
+      const selectors = [
+        'a[rel="next"]',
+        'a[aria-label*="Go to next page" i]',
+        `a[href*="/list-${{nextPage}}"]`
+      ];
+      const seen = new Set();
+      const candidates = [];
+      for (const selector of selectors) {{
+        for (const anchor of Array.from(document.querySelectorAll(selector))) {{
+          if (seen.has(anchor)) continue;
+          seen.add(anchor);
+          candidates.push(anchor);
+        }}
+      }}
+      const isVisible = (el) => {{
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      }};
+      const isDisabled = (el) => {{
+        const cls = String(el.getAttribute('class') || '').toLowerCase();
+        return el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled') || cls.includes('disabled');
+      }};
+      const paginationLike = (el, href, rel, aria, text) => {{
+        const haystack = `${{rel}} ${{aria}} ${{text}}`.toLowerCase();
+        const bad = `${{href}} ${{aria}} ${{text}}`.toLowerCase();
+        if (bad.includes('nextroll') || bad.includes('privacy') || bad.includes('advertising')) return false;
+        return rel === 'next' || /\b(next|go to next page|next page|pagination)\b/i.test(haystack);
+      }};
+      for (const anchor of candidates) {{
+        const href = String(anchor.href || anchor.getAttribute('href') || '');
+        const rel = String(anchor.getAttribute('rel') || '').toLowerCase();
+        const aria = String(anchor.getAttribute('aria-label') || '');
+        const text = String(anchor.innerText || anchor.textContent || '').trim();
+        const hrefTargetsNextPage = href.includes(`/list-${{nextPage}}`);
+        const relNext = rel.split(/\\s+/).includes('next');
+        if (!isVisible(anchor) || isDisabled(anchor)) continue;
+        if (!(hrefTargetsNextPage || relNext)) continue;
+        if (!paginationLike(anchor, href, relNext ? 'next' : rel, aria, text)) continue;
+        anchor.scrollIntoView({{block: 'center', inline: 'center'}});
+        for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {{
+          anchor.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}}));
+        }}
+        if (document.location.href === href && hrefTargetsNextPage) {{
+          return {{clicked: true, href, rel, aria, text, currentUrl: document.location.href}};
+        }}
+        try {{ anchor.click(); }} catch (err) {{}}
+        return {{clicked: true, href, rel, aria, text, currentUrl: document.location.href}};
+      }}
+      return {{clicked: false, reason: 'next_anchor_not_found', nextPage}};
+    }})();
+    """
+    result = driver.execute_script(script)
+    if not isinstance(result, dict):
+        result = {"clicked": bool(result)}
+    href = result.get("href") or ""
+    if href:
+        log(f"Module1 click-next href={href}")
+    else:
+        log(f"Module1 click-next failed reason={result.get('reason', 'unknown')}")
+    return result
+
+
+def _module1_fresh_context_get(driver, page_url: str, page: int, *, log):
+    old_driver = driver
+    try:
+        if old_driver:
+            old_driver.quit()
+    except Exception:
+        pass
+    try:
+        if old_driver:
+            cleanup_chrome_driver(old_driver)
+    except Exception:
+        pass
+    profile_dir = _make_fresh_module1_profile_dir(page)
+    log(f"Module1 fresh_context_per_page fallback page={page} profile_dir={profile_dir}")
+    new_driver = setup_driver(profile_dir_override=profile_dir)
+    navigation_ok = safe_get(new_driver, page_url, phase=f"fresh_context_page_{page}", apply_delay=False, log_func=log)
+    navigation_info = _last_navigation(new_driver)
+    return new_driver, profile_dir, navigation_ok, navigation_info
 
 
 def _same_session_kpsdk_recheck(driver, url: str, timeout: int | float, min_cards: int, state_result, cards, log):
@@ -1072,6 +1190,10 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
         page = 1
         total_pages = None
         hard_cap = 500  # جلوگیری از لوپ بی‌نهایت در شرایط عجیب
+        nav_mode = _module1_pagination_nav_mode()
+        pagination_landed_by_click = False
+        fallback_paths: list[str] = []
+        log(f"Module1 pagination nav mode={nav_mode}")
 
         while page <= hard_cap:
             if getattr(cancel_token, "is_set", lambda: False)():
@@ -1082,9 +1204,32 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
             url = make_list_url(base_url, page)
             log(f"\nPage {page}: {url}")
-            navigation_ok = safe_get(driver, url, phase=f"list_page_{page}", apply_delay=page > 1, log_func=log)
-            navigation_info = _last_navigation(driver)
-            session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
+            if page == 1 or nav_mode == "direct_url":
+                navigation_ok = safe_get(driver, url, phase=f"list_page_{page}", apply_delay=page > 1, log_func=log)
+                navigation_info = _last_navigation(driver)
+                session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
+                pagination_landed_by_click = False
+            elif nav_mode == "fresh_context_per_page" or not pagination_landed_by_click:
+                driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, url, page, log=log)
+                session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
+                fallback_paths.append(f"fresh_context_per_page:page_{page}")
+                pagination_landed_by_click = False
+            else:
+                current = _current_url(driver)
+                log(f"Module1 click-next landed current_url={current}")
+                navigation_ok = not _is_chrome_error_url(current)
+                navigation_info = {"url": url, "navigation_failed": not navigation_ok, "navigation_error": None, "navigation_mode": "click_next"}
+                try:
+                    driver._module1_last_navigation = navigation_info
+                except Exception:
+                    pass
+                session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), current)
+                if _is_chrome_error_url(current):
+                    log(f"Module1 click-next landed on chrome-error; fallback fresh_context_per_page page={page}")
+                    driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, url, page, log=log)
+                    session_health.record_navigation(url, navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
+                    fallback_paths.append(f"click_next_chrome_error_to_fresh_context_per_page:page_{page}")
+                    pagination_landed_by_click = True
             page_429_retries = 0
             while True:
                 if _navigation_needs_fast_classification(driver, navigation_info):
@@ -1261,9 +1406,29 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
             if not has_next and not total_pages:
                 break
 
-            page += 1
+            next_page = page + 1
+            pagination_landed_by_click = False
+            if nav_mode == "click_next":
+                log(f"Module1 pagination nav mode=click_next page={page} next_page={next_page}")
+                _human_scroll_idle_before_next(driver, log)
+                click_result = _click_next_anchor(driver, next_page, log)
+                time.sleep(max(0.5, float(getattr(config, "MODULE1_INTER_PAGE_DELAY_SECONDS", 0)) / 4.0))
+                current_after_click = _current_url(driver)
+                log(f"Module1 click-next landed current_url={current_after_click}")
+                actual_next = _parse_list_page(current_after_click)
+                if click_result.get("clicked") and actual_next == next_page and not _is_chrome_error_url(current_after_click):
+                    pagination_landed_by_click = True
+                else:
+                    reason = click_result.get("reason") or f"landed_page={actual_next} chrome_error={_is_chrome_error_url(current_after_click)}"
+                    log(f"Module1 click-next fallback fresh_context_per_page page={next_page} reason={reason}")
+                    driver, profile_dir_current, navigation_ok, navigation_info = _module1_fresh_context_get(driver, make_list_url(base_url, next_page), next_page, log=log)
+                    session_health.record_navigation(make_list_url(base_url, next_page), navigation_ok, navigation_info.get("navigation_error"), _current_url(driver))
+                    fallback_name = "click_next_chrome_error_to_fresh_context_per_page" if _is_chrome_error_url(current_after_click) else "click_next_to_fresh_context_per_page"
+                    fallback_paths.append(f"{fallback_name}:page_{next_page}")
+                    pagination_landed_by_click = True
+            page = next_page
 
-        scrape_search.last_result = {"status": "completed", "rows": len(all_rows), "stop_reason": "completed", "page_state": PageState.LISTINGS if all_rows else None}
+        scrape_search.last_result = {"status": "completed", "rows": len(all_rows), "stop_reason": "completed", "page_state": PageState.LISTINGS if all_rows else None, "pagination_nav_mode": nav_mode, "fallback_paths": fallback_paths}
         return all_rows
 
     finally:

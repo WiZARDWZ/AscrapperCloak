@@ -17,6 +17,11 @@ def main() -> int:
     parser.add_argument("--out", default=os.getenv("TEST_OUTPUT", "output/module1_cloak_two_pages_summary.json"))
     args = parser.parse_args()
 
+    if "MODULE1_PAGINATION_NAV_MODE" not in os.environ:
+        os.environ["MODULE1_PAGINATION_NAV_MODE"] = "click_next"
+        module1_list_scraper.config.MODULE1_PAGINATION_NAV_MODE = "click_next"
+    nav_mode = getattr(module1_list_scraper.config, "MODULE1_PAGINATION_NAV_MODE", "")
+    print(f"Selected Module1 pagination nav mode: {nav_mode}")
     logs: list[str] = []
     rows = module1_list_scraper.scrape_search(args.url, max_pages=2, timeout=args.timeout, on_log=logs.append)
     page_counts: dict[int, int] = {}
@@ -31,6 +36,8 @@ def main() -> int:
         "total_rows": len(rows),
         "page_counts": page_counts,
         "last_result": getattr(module1_list_scraper.scrape_search, "last_result", {}),
+        "pagination_nav_mode": nav_mode,
+        "fallback_paths": getattr(module1_list_scraper.scrape_search, "last_result", {}).get("fallback_paths", []),
         "inter_page_delay_logged": any("inter-navigation delay" in item for item in logs),
         "chrome_error_logged": any("chrome-error" in item for item in logs),
         "recent_logs": logs[-60:],
@@ -39,7 +46,13 @@ def main() -> int:
     Path(args.out).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     expected_total = int(os.getenv("EXPECTED_TOTAL_ROWS", "28"))
-    return 0 if len(rows) == expected_total else 1
+    page2_rows = page_counts.get(2, 0)
+    terminal_chrome_error = str(summary.get("last_result", {}).get("stop_reason", "")).lower() == "chrome_error"
+    failed = len(rows) < expected_total or page2_rows < 3 or terminal_chrome_error
+    if failed:
+        print(f"FAILED: expected total_rows>={expected_total}, page2_rows>=3, no terminal chrome-error; got total_rows={len(rows)} page2_rows={page2_rows} terminal_chrome_error={terminal_chrome_error}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
