@@ -43,6 +43,38 @@ SCHEMA_REQUIREMENTS = {
     "dbo.UserSuburbMonitor": {"UserID", "SearchID", "IsActive"},
 }
 
+
+
+def json_dumps_safe(value, **kwargs) -> str:
+    """Serialize DB event/snapshot payloads without failing on Decimal values."""
+    kwargs.setdefault("ensure_ascii", False)
+    kwargs.setdefault("default", str)
+    return json.dumps(value, **kwargs)
+
+
+def ensure_area_numeric_capacity(conn) -> None:
+    """Idempotently widen property/listing area columns for rural/farming land sizes."""
+    if not hasattr(conn, "commit"):
+        return
+    for table_name, column_name in (
+        ("Property", "LandAreaSqm"),
+        ("Property", "BuildingAreaSqm"),
+        ("ListingSnapshot", "LandSizeSqm"),
+        ("ListingSnapshot", "BuildingSizeSqm"),
+        ("ListingSnapshot", "FloorAreaSqm"),
+    ):
+        _execute_ddl_safely(conn, f"""
+            IF OBJECT_ID('dbo.{table_name}') IS NOT NULL
+            AND COL_LENGTH('dbo.{table_name}', '{column_name}') IS NOT NULL
+            AND EXISTS (
+                SELECT 1
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='{table_name}' AND COLUMN_NAME='{column_name}'
+                  AND (DATA_TYPE NOT IN ('decimal','numeric') OR NUMERIC_PRECISION < 18 OR NUMERIC_SCALE < 2)
+            )
+            ALTER TABLE dbo.{table_name} ALTER COLUMN {column_name} DECIMAL(18,2) NULL
+            """, description=f"widen dbo.{table_name}.{column_name} to DECIMAL(18,2)", required=False)
+
 def connect(_db_path: Optional[str] = None):
     return pyodbc.connect(
         config.build_sqlserver_connection_string(include_password=True),
@@ -721,6 +753,7 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
     summary={"rows_input":len(rows),"rows_processed":0,"rows_skipped":0,"properties_upserted":0,"listings_upserted":0,"snapshots_inserted":0,"events_created":0,"skipped_reasons":{}}
     try:
         ensure_listing_event_metadata_columns(conn)
+        ensure_area_numeric_capacity(conn)
         ensure_listing_snapshot_size_columns(conn)
         ensure_listing_lifecycle_columns(conn)
         cur = conn.cursor(); validate_required_schema(conn); sid = _upsert_search(conn, search_url)
@@ -746,7 +779,7 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
             if listing_lifecycle_status_from_row(rr) == "sold":
                 apply_listing_lifecycle_signal(conn, sid, lid, "sold", rr.get("StatusReason") or "sold_evidence", rr.get("StatusEvidence"), run_id=run_id, create_event=emit_events)
             snap_payload={"price_display":n["price_display"],"price_low":str(n["price_low"] or ""),"price_high":str(n["price_high"] or ""),"price_method":n["price_method"],"primary_agent_id":primary_agent_id,"inspection_short":n["inspection_short_label"],"inspection_long":n["inspection_long_label"],"auction_label":n["auction_label"],"description_hash":desc_hash,"url":n["url"],"land_size_display":n["land_size_display"],"land_size_sqm":str(n["land_size_sqm"] or ""),"building_size_display":n["building_size_display"],"building_size_sqm":str(n["building_size_sqm"] or ""),"floor_area_display":n["floor_area_display"],"floor_area_sqm":str(n["floor_area_sqm"] or "")}
-            snap_hash=_sha(json.dumps(snap_payload,sort_keys=True,ensure_ascii=False))
+            snap_hash=_sha(json_dumps_safe(snap_payload, sort_keys=True))
             prev=_one(cur,"SELECT TOP 1 SnapshotID,PriceLow,PriceHigh,PriceDisplay,PrimaryAgentID,InspectionShort,InspectionLong,AuctionTimeLabel,DescriptionHash FROM dbo.ListingSnapshot WHERE ListingID=? AND SearchID=? ORDER BY SnapshotID DESC", lid,sid)
             snapshot_params = (
                 lid,
@@ -791,11 +824,11 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
             if prev and prev[8] != desc_hash: events.append(("description_change",{"description_hash":prev[8]},{"description_hash":desc_hash}))
             if emit_events:
                 for et,ov,nv in events:
-                    eh=_sha(json.dumps({"sid":sid,"lid":lid,"et":et,"ov":ov,"nv":nv},sort_keys=True,ensure_ascii=False))
+                    eh=_sha(json_dumps_safe({"sid": sid, "lid": lid, "et": et, "ov": ov, "nv": nv}, sort_keys=True))
                     should_notify = et in {"new_listing", "price_changed", "inspection_changed", "auction_changed"}
                     reason = "agent_metadata_enrichment" if et == "agent_change" else None
                     payload = {**event_context, "event_type": et, "old_value": ov, "new_value": nv, "should_notify": should_notify, "reason": reason}
-                    cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) INSERT INTO dbo.ListingEvent(RunID,SearchID,ListingID,EventType,EventHash,OldValueJson,NewValueJson,ShouldNotify,Reason,EventPayloadJson) VALUES (?,?,?,?,?,?,?,?,?,?)", eh,run_id,sid,lid,et,eh,json.dumps(ov,ensure_ascii=False) if ov else None,json.dumps(nv,ensure_ascii=False) if nv else None,should_notify,reason,json.dumps(payload,ensure_ascii=False))
+                    cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) INSERT INTO dbo.ListingEvent(RunID,SearchID,ListingID,EventType,EventHash,OldValueJson,NewValueJson,ShouldNotify,Reason,EventPayloadJson) VALUES (?,?,?,?,?,?,?,?,?,?)", eh,run_id,sid,lid,et,eh,json_dumps_safe(ov) if ov else None,json_dumps_safe(nv) if nv else None,should_notify,reason,json_dumps_safe(payload))
                     summary["events_created"] += 1
         if full_scan:
             cur.execute("SELECT l.listingID,l.ExternalID FROM dbo.Listing l JOIN dbo.ListingSearchState s ON s.ListingID=l.listingID WHERE s.SearchID=? AND s.Status='active'", sid)
@@ -822,6 +855,7 @@ def ingest_light_check_rows(
     conn = db_path_or_conn if hasattr(db_path_or_conn, "cursor") else connect()
     own = not hasattr(db_path_or_conn, "cursor")
     ensure_listing_event_metadata_columns(conn)
+    ensure_area_numeric_capacity(conn)
     ensure_listing_snapshot_size_columns(conn)
     summary = {
         "rows_input": len(rows),
@@ -904,7 +938,7 @@ def ingest_light_check_rows(
                     "floor_area_display": n["floor_area_display"],
                     "floor_area_sqm": str(n["floor_area_sqm"] or ""),
                 }
-                snap_hash = _sha(json.dumps(snap_payload, sort_keys=True, ensure_ascii=False))
+                snap_hash = _sha(json_dumps_safe(snap_payload, sort_keys=True))
                 snapshot_params = (
                     lid, sid, run_id, snap_hash, n["price_value"], n["price_display"], n["price_low"], n["price_high"],
                     n["price_method"], primary_agent_id, primary_agent_id, "active", n["description"], desc_hash, agency_id,
@@ -929,11 +963,11 @@ def ingest_light_check_rows(
                     )
 
                 event_context = listing_change_detector.build_event_payload({"external_id": ext, "address": n["address"], "listing_url": n["url"], "property_type": n["property_type"], "bedrooms": n["bedrooms"], "bathrooms": n["bathrooms"], "car_spaces": n["parking"], "price_display": n["price_display"], "price_low": n["price_low"], "price_high": n["price_high"], "price_method": n["price_method"], "agency_name": n["agency_name"], "agents": n["agents"], "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"]})
-                ev_hash = _sha(json.dumps({"sid": sid, "lid": lid, "et": "new_listing", "ext": str(ext)}, sort_keys=True, ensure_ascii=False))
+                ev_hash = _sha(json_dumps_safe({"sid": sid, "lid": lid, "et": "new_listing", "ext": str(ext)}, sort_keys=True))
                 cur.execute(
                     "IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) "
                     "INSERT INTO dbo.ListingEvent(RunID,SearchID,ListingID,EventType,EventHash,OldValueJson,NewValueJson,ShouldNotify,Severity,EventPayloadJson) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    ev_hash, run_id, sid, lid, "new_listing", ev_hash, None, json.dumps(event_context, ensure_ascii=False, default=str), True, "normal", json.dumps({**event_context, "event_type": "new_listing", "field": "listing", "new_value": event_context, "should_notify": True, "severity": "normal"}, ensure_ascii=False, default=str),
+                    ev_hash, run_id, sid, lid, "new_listing", ev_hash, None, json_dumps_safe(event_context), True, "normal", json_dumps_safe({**event_context, "event_type": "new_listing", "field": "listing", "new_value": event_context, "should_notify": True, "severity": "normal"}),
                 )
                 if cur.rowcount and cur.rowcount > 0:
                     summary["events_created"] += 1
@@ -1151,7 +1185,7 @@ def _compute_event_hash(listing_id: int, event_type: str, event_payload: dict) -
         "old_value": event_payload.get("old_value"),
         "new_value": event_payload.get("new_value"),
     }
-    return _sha(json.dumps(base, sort_keys=True, ensure_ascii=False, default=str))
+    return _sha(json_dumps_safe(base, sort_keys=True))
 
 
 
@@ -1174,7 +1208,7 @@ def create_listing_event_if_new(conn, listing_id: int, event_type: str, event_pa
     new_value = payload.get("new_value")
     event_context = dict(payload.get("event_payload") or {})
     event_context.update({key: value for key, value in payload.items() if key != "event_payload"})
-    cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) INSERT INTO dbo.ListingEvent(RunID,SearchID,ListingID,EventType,EventHash,OldValueJson,NewValueJson,ShouldNotify,Severity,Reason,EventPayloadJson) VALUES (?,?,?,?,?,?,?,?,?,?,?)", eh, run_id, search_id, listing_id, event_type, eh, json.dumps(old_value, ensure_ascii=False, default=str) if old_value is not None else None, json.dumps(new_value, ensure_ascii=False, default=str) if new_value is not None else None, payload.get("should_notify"), payload.get("severity"), payload.get("reason"), json.dumps(event_context, ensure_ascii=False, default=str))
+    cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) INSERT INTO dbo.ListingEvent(RunID,SearchID,ListingID,EventType,EventHash,OldValueJson,NewValueJson,ShouldNotify,Severity,Reason,EventPayloadJson) VALUES (?,?,?,?,?,?,?,?,?,?,?)", eh, run_id, search_id, listing_id, event_type, eh, json_dumps_safe(old_value) if old_value is not None else None, json_dumps_safe(new_value) if new_value is not None else None, payload.get("should_notify"), payload.get("severity"), payload.get("reason"), json_dumps_safe(event_context))
     return bool(cur.rowcount and cur.rowcount > 0)
 
 
@@ -1404,6 +1438,7 @@ def _legacy_format_export_price_range(low, high) -> str:
 
 def export_latest_to_rows(conn, area_url):
     ensure_monitoring_state_tables(conn)
+    ensure_area_numeric_capacity(conn)
     ensure_listing_snapshot_size_columns(conn)
     ensure_listing_lifecycle_columns(conn)
     sid = _upsert_search(conn, area_url); c=conn.cursor()
@@ -1760,7 +1795,7 @@ def apply_listing_lifecycle_signal(
             "should_notify": True,
             "severity": "high" if event_type == "sold" else "normal",
         }
-        eh = _sha(json.dumps({"search_id": int(search_id), "listing_id": int(listing_id), **payload}, sort_keys=True, ensure_ascii=False, default=str))
+        eh = _sha(json_dumps_safe({"search_id": int(search_id), "listing_id": int(listing_id), **payload}, sort_keys=True))
         if create_listing_event_if_new(conn, int(listing_id), event_type, payload, event_hash=eh, search_id=int(search_id), run_id=final_run_id):
             cur.execute("UPDATE dbo.ListingSearchState SET StatusNotificationSentAt=COALESCE(StatusNotificationSentAt, SYSDATETIME()) WHERE SearchID=? AND ListingID=?", int(search_id), int(listing_id))
     recheck_job = None
@@ -1993,7 +2028,7 @@ def ingest_detail_refresh_rows_conn(
             lid = int(_one(cur, "SELECT listingID FROM dbo.Listing WHERE ExternalID=?", n["external_id"])[0])
         cur.execute("UPDATE dbo.Listing SET PropertyID=?,AgencyID=?,AgentID=?,ListingURL=?,CurrentPriceDisplay=?,Price=?,Description=?,CurrentDescriptionHash=?,CurrentStatus='active',LastTimeSeen=SYSDATETIME(),UpdatedAt=SYSDATETIME() WHERE listingID=?", property_id, agency_id, primary_agent_id, n["url"], n["price_display"], n["price_value"], n["description"], desc_hash, lid)
         snap_payload = {"price_display": n["price_display"], "price_low": str(n["price_low"] or ""), "price_high": str(n["price_high"] or ""), "price_method": n["price_method"], "primary_agent_id": primary_agent_id, "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"], "description_hash": desc_hash, "url": n["url"], "land_size_display": n["land_size_display"], "land_size_sqm": str(n["land_size_sqm"] or ""), "building_size_display": n["building_size_display"], "building_size_sqm": str(n["building_size_sqm"] or ""), "floor_area_display": n["floor_area_display"], "floor_area_sqm": str(n["floor_area_sqm"] or "")}
-        snap_hash = _sha(json.dumps(snap_payload, sort_keys=True, ensure_ascii=False))
+        snap_hash = _sha(json_dumps_safe(snap_payload, sort_keys=True))
         snapshot_params = (
             lid, sid, run_id, snap_hash, n["price_value"], n["price_display"], n["price_low"], n["price_high"],
             n["price_method"], primary_agent_id, primary_agent_id, "active", n["description"], desc_hash, agency_id,
@@ -2229,6 +2264,58 @@ def ensure_monitoring_state_tables(conn) -> None:
         CREATE INDEX IX_listing_price_inference_state_due ON dbo.listing_price_inference_state(area_id, status, next_retry_at)
         """, description="create IX_listing_price_inference_state_due", required=False)
     _MONITORING_STATE_TABLES_ENSURED = True
+
+
+def get_excel_export_zero_row_diagnostics(conn, telegram_user_id: int | None, user_area_id: int | None, search_id: int | None) -> dict:
+    """Collect SQL-backed diagnostics when an authorized Excel export has no rows."""
+    diagnostics = {
+        "telegram_user_id": telegram_user_id,
+        "user_area_id": user_area_id,
+        "resolved_search_id": search_id,
+        "listing_search_state_count": None,
+        "active_listing_search_state_count": None,
+        "listing_snapshot_count": None,
+        "latest_scrape_run_status": None,
+        "latest_scrape_run_error": None,
+        "subscription_statuses": [],
+        "area_monitoring_state": None,
+    }
+    if not search_id:
+        return diagnostics
+    cur = conn.cursor()
+    try:
+        row = _one(cur, "SELECT COUNT(1) FROM dbo.ListingSearchState WHERE SearchID=?", int(search_id))
+        diagnostics["listing_search_state_count"] = int(row[0]) if row else 0
+        row = _one(cur, "SELECT COUNT(1) FROM dbo.ListingSearchState WHERE SearchID=? AND COALESCE(ListingLifecycleStatus, Status, 'active')='active'", int(search_id))
+        diagnostics["active_listing_search_state_count"] = int(row[0]) if row else 0
+        row = _one(cur, "SELECT COUNT(1) FROM dbo.ListingSnapshot WHERE SearchID=?", int(search_id))
+        diagnostics["listing_snapshot_count"] = int(row[0]) if row else 0
+        cur.execute("""
+            SELECT TOP 1 RunID, Status
+            FROM dbo.ScrapeRun
+            WHERE SearchID=?
+            ORDER BY RunID DESC
+        """, int(search_id))
+        rows = _rows_to_dicts(cur)
+        if rows:
+            diagnostics["latest_scrape_run_status"] = rows[0].get("Status")
+            diagnostics["latest_scrape_run_error"] = None
+    except Exception as exc:
+        diagnostics["count_error"] = config.mask_sensitive_text(exc)
+    try:
+        cur.execute("""
+            SELECT UserAreaID, BaselineStatus, DetailBaselineStatus, PriceBaselineStatus, SubscriptionStatus, NotifyEnabled, NotificationReadyAt
+            FROM dbo.UserAreaSubscription
+            WHERE SearchID=? AND (? IS NULL OR UserAreaID=?)
+        """, int(search_id), user_area_id, user_area_id)
+        diagnostics["subscription_statuses"] = _rows_to_dicts(cur)
+    except Exception as exc:
+        diagnostics["subscription_error"] = config.mask_sensitive_text(exc)
+    try:
+        diagnostics["area_monitoring_state"] = get_area_monitoring_state(conn, int(search_id))
+    except Exception as exc:
+        diagnostics["area_monitoring_state_error"] = config.mask_sensitive_text(exc)
+    return diagnostics
 
 
 def get_area_monitoring_state(conn, area_id: int) -> dict | None:
@@ -2678,6 +2765,7 @@ def ensure_listing_event_metadata_columns(conn) -> None:
 def ensure_listing_snapshot_size_columns(conn) -> None:
     if not hasattr(conn, "commit"):
         return
+    ensure_area_numeric_capacity(conn)
     for column_name, definition in {
         "LandSizeDisplay": "NVARCHAR(100) NULL",
         "LandSizeSqm": "DECIMAL(18,2) NULL",
@@ -3051,7 +3139,7 @@ def coalesce_listing_price_update_events(events: list[dict]) -> list[dict]:
         payload_data["combined_events"] = combined
         primary["EventType"] = "listing_update"
         primary["event_type"] = "listing_update"
-        primary["EventPayloadJson"] = json.dumps(payload_data, ensure_ascii=False, default=str)
+        primary["EventPayloadJson"] = json_dumps_safe(payload_data)
         primary["_absorbed_event_ids"] = [item["event_id"] for item in combined[1:] if item.get("event_id")]
         out.append(primary)
     return sorted(out, key=lambda row: int(row.get("EventID") or row.get("event_id") or 0))
@@ -3221,6 +3309,7 @@ def ensure_telegram_bot_tables(conn) -> None:
         return
     ensure_notification_tables(conn)
     ensure_monitoring_state_tables(conn)
+    ensure_area_numeric_capacity(conn)
     _execute_ddl_safely(conn, """
         IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='TelegramUser')
         CREATE TABLE dbo.TelegramUser (
@@ -3353,7 +3442,7 @@ def set_user_session(conn, telegram_user_id: int, state: str, payload: dict | No
     normalized_state = str(state or "idle")
     if normalized_state not in allowed:
         raise ValueError(f"Unsupported Telegram session state: {normalized_state}")
-    payload_json = json.dumps(payload or {}, ensure_ascii=False, default=str)
+    payload_json = json_dumps_safe(payload or {})
     conn.cursor().execute("""
         MERGE dbo.TelegramUserSession AS target
         USING (SELECT ? AS TelegramUserID) AS source
@@ -4357,7 +4446,7 @@ def update_listing_price_inference(conn, search_id: int, listing_id: int, low: A
             "reason": "module2_price_refresh",
             "severity": "low",
         }
-        eh = _sha(json.dumps({"search_id": int(search_id), "listing_id": int(listing_id), **payload}, sort_keys=True, ensure_ascii=False, default=str))
+        eh = _sha(json_dumps_safe({"search_id": int(search_id), "listing_id": int(listing_id), **payload}, sort_keys=True))
         create_listing_event_if_new(conn, int(listing_id), "inferred_price_range_changed", payload, event_hash=eh, search_id=int(search_id), run_id=run_id, suppress_notifications=False)
 
 
