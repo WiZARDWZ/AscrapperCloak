@@ -51,6 +51,9 @@ def _failed_item(row: dict[str, Any]) -> dict[str, Any]:
         "detail_refresh_error": error,
         "events_detected": [],
         "events_created": 0,
+        "suppressed_sold_count": 0,
+        "weak_sold_evidence_count": 0,
+        "strong_sold_evidence_count": 0,
         "should_notify_events": [],
         "warnings": [{"warning": "detail_refresh_failed", "error": error}],
     }
@@ -86,6 +89,9 @@ def refresh_active_listings(
         "refreshed_count": 0,
         "failed_count": 0,
         "events_created": 0,
+        "suppressed_sold_count": 0,
+        "weak_sold_evidence_count": 0,
+        "strong_sold_evidence_count": 0,
         "should_notify_events": [],
         "items": [],
         "errors": [],
@@ -160,6 +166,12 @@ def refresh_active_listings(
                     "should_notify_events": det.get("should_notify_events", []),
                     "warnings": det.get("warnings", []),
                 }
+                item["suppressed_sold_count"] = int(det.get("suppressed_sold_count", 0))
+                item["weak_sold_evidence_count"] = int(det.get("weak_sold_evidence_count", 0))
+                item["strong_sold_evidence_count"] = int(det.get("strong_sold_evidence_count", 0))
+                result["suppressed_sold_count"] += item["suppressed_sold_count"]
+                result["weak_sold_evidence_count"] += item["weak_sold_evidence_count"]
+                result["strong_sold_evidence_count"] += item["strong_sold_evidence_count"]
                 result["items"].append(item)
                 result["should_notify_events"].extend(det.get("should_notify_events", []))
                 for warning in det.get("warnings", []):
@@ -171,6 +183,9 @@ def refresh_active_listings(
 
     ingest = db_layer.ingest_detail_refresh_rows(config.DB_PATH, search_url, successful_rows, dry_run=False, context=context, suppress_notifications=suppress_notifications)
     result["events_created"] = ingest.get("events_created", 0)
+    result["suppressed_sold_count"] = int(ingest.get("suppressed_sold_count", 0))
+    result["weak_sold_evidence_count"] = int(ingest.get("weak_sold_evidence_count", 0))
+    result["strong_sold_evidence_count"] = int(ingest.get("strong_sold_evidence_count", 0))
     for item in ingest.get("items", []):
         result_item = {
             "external_id": item.get("external_id"),
@@ -182,6 +197,9 @@ def refresh_active_listings(
             "events_created": item.get("events_created", 0),
             "should_notify_events": item.get("should_notify_events", []),
             "warnings": item.get("warnings", []),
+            "suppressed_sold_count": int(item.get("suppressed_sold_count", 0)),
+            "weak_sold_evidence_count": int(item.get("weak_sold_evidence_count", 0)),
+            "strong_sold_evidence_count": int(item.get("strong_sold_evidence_count", 0)),
         }
         result["items"].append(result_item)
         result["should_notify_events"].extend(result_item["should_notify_events"])

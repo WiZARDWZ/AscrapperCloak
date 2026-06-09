@@ -20,6 +20,12 @@ sys.modules.setdefault(
         recover_browser_for_untrusted_state=lambda *a, **k: (None, 0, "rea_profile", "rotation_limit"),
         safe_driver_get=lambda driver, url, log_func=print: (True, None),
         is_retryable_navigation_error=lambda exc: "net::" in str(exc).lower() or "page.goto" in str(exc).lower(),
+        BrowserSessionHealth=object,
+        RecoveryPolicy=object,
+        log_session_health=lambda *a, **k: None,
+        safe_realestate_get_with_reset=lambda *a, **k: (True, None),
+        reset_chrome_error_tab=lambda *a, **k: None,
+        UNTRUSTED_RECOVERY_STATES=set(),
         same_session_kpsdk_recheck=lambda **kwargs: (kwargs.get("initial_result"), kwargs.get("initial_payload")),
     ),
 )
@@ -48,6 +54,7 @@ import db_layer
 import excel_exporter
 import job_queue
 import listing_change_detector
+import listing_detail_refresher
 import monitor
 import monitoring_scheduler
 import module1_list_scraper
@@ -499,6 +506,88 @@ class MonitoringRefactorTests(unittest.TestCase):
         self.assertEqual(out["ListingLifecycleStatus"], "sold")
         self.assertEqual(out["StatusReason"], "sold_evidence")
         self.assertIn("Sold prior to auction", out["StatusEvidence"])
+
+
+    def test_module3_active_detail_ignores_generic_sold_text(self):
+        html = """
+        <main>
+          <h1 class="property-info-address">12 Active Road, Noona NSW 2835</h1>
+          <span class="property-price property-info__price">Contact Agent</span>
+          <script>{"marketing":"recently sold nearby homes"}</script>
+          <section>For Sale by negotiation</section>
+        </main>
+        """
+        out = module3_enrich_details.extract_detail_data_from_html(html)
+        self.assertNotEqual(out.get("ListingLifecycleStatus"), "sold")
+        self.assertNotEqual(out.get("status"), "sold")
+        self.assertEqual(out.get("SoldEvidenceStrength"), "weak")
+
+    def test_detail_refresh_weak_sold_recent_active_is_suppressed(self):
+        old_state = {"external_id": "1", "listing_id": 9, "status": "active", "price_display": "Contact Agent"}
+        row = {
+            "listing_id": "1",
+            "external_id": "1",
+            "db_listing_id": 9,
+            "url": "https://www.realestate.com.au/property-house-nsw-noona-1",
+            "status": "sold",
+            "ListingLifecycleStatus": "sold",
+            "StatusReason": "weak_sold_evidence_ignored",
+            "SoldEvidenceStrength": "weak",
+            "detail_refresh_success": True,
+        }
+        with mock.patch.object(db_layer, "get_latest_listing_state", return_value=old_state), \
+             mock.patch.object(db_layer, "_search_id_if_exists", return_value=4), \
+             mock.patch.object(db_layer, "_recent_active_list_evidence", return_value={"recent_active": True}):
+            result = db_layer.detect_and_record_changes_for_row(NoopConn(), "https://example.test/search", row, create_events=False)
+        self.assertEqual(result["suppressed_sold_count"], 1)
+        self.assertEqual(result["weak_sold_evidence_count"], 1)
+        self.assertFalse(any(e["event_type"] in {"sold", "status_changed"} for e in result["events_detected"]))
+        self.assertFalse(any(e["event_type"] in {"sold", "status_changed"} for e in result["should_notify_events"]))
+        self.assertTrue(any(w.get("warning") == "suppressed_sold_due_to_recent_active_list_evidence" for w in result["warnings"]))
+
+    def test_detail_refresh_strong_sold_allows_sold_events(self):
+        old_state = {"external_id": "1", "listing_id": 9, "status": "active", "price_display": "Contact Agent"}
+        row = {
+            "listing_id": "1",
+            "external_id": "1",
+            "db_listing_id": 9,
+            "url": "https://www.realestate.com.au/property-house-nsw-noona-1",
+            "status": "sold",
+            "ListingLifecycleStatus": "sold",
+            "StatusReason": "sold_evidence",
+            "StatusEvidence": "Sold on 1 Jan 2026",
+            "SoldEvidenceStrength": "strong",
+            "detail_refresh_success": True,
+        }
+        with mock.patch.object(db_layer, "get_latest_listing_state", return_value=old_state):
+            result = db_layer.detect_and_record_changes_for_row(NoopConn(), "https://example.test/search", row, create_events=False)
+        event_types = {e["event_type"] for e in result["events_detected"]}
+        self.assertEqual(result["strong_sold_evidence_count"], 1)
+        self.assertIn("status_changed", event_types)
+        self.assertIn("sold", event_types)
+        self.assertTrue(any(e.get("should_notify") for e in result["events_detected"] if e["event_type"] == "sold"))
+
+    def test_module1_active_observation_restores_stale_sold_state(self):
+        source = inspect.getsource(db_layer.ingest_full_rows)
+        self.assertIn("CurrentStatus='active'", source)
+        self.assertIn("ListingLifecycleStatus='active'", source)
+        self.assertIn("Status='active'", source)
+        self.assertIn("SoldAt=NULL", source)
+        self.assertIn("RemovedAt=NULL", source)
+
+    def test_detail_refresh_result_includes_sold_diagnostics(self):
+        with mock.patch.object(db_layer, "connect", return_value=NoopConn()), \
+             mock.patch.object(db_layer, "get_active_listings_for_detail_refresh", return_value=[{"listing_id": "1", "url": "u"}]), \
+             mock.patch.object(listing_detail_refresher, "ENRICH_DETAIL_ROWS_FUNC", return_value=[{"listing_id": "1", "url": "u", "detail_refresh_success": True}]), \
+             mock.patch.object(db_layer, "detect_and_record_changes_for_row", return_value={
+                 "external_id": "1", "events_detected": [], "events_created": 0,
+                 "should_notify_events": [], "warnings": [],
+                 "suppressed_sold_count": 1, "weak_sold_evidence_count": 1, "strong_sold_evidence_count": 0,
+             }):
+            result = listing_detail_refresher.refresh_active_listings("https://example.test/search", dry_run=True)
+        self.assertEqual(result["suppressed_sold_count"], 1)
+        self.assertEqual(result["weak_sold_evidence_count"], 1)
+        self.assertEqual(result["strong_sold_evidence_count"], 0)
 
     def test_module1_card_size_html_extraction(self):
         html = '<article><ul><li aria-label="301m² land size"><p>301m²</p></li></ul></article>'
