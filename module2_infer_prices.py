@@ -17,7 +17,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, safe_realestate_get_with_reset, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -132,9 +132,7 @@ def get_with_retries(driver, url, tries=2, *, phase: str = "page", apply_delay: 
 
 
 def _same_driver_get(driver, url: str):
-    _driver, ok, err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
-    if not ok and err:
-        raise err
+    _driver, ok, _err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
     return ok
 
 
@@ -223,6 +221,237 @@ def build_between_url(base_list_url: str, low: int, high: int, page: int = 1) ->
 def _parse_list_page(url: str) -> int | None:
     m = re.search(r"/list-(\d+)", url or "")
     return int(m.group(1)) if m else None
+
+
+def _current_url(driver, state_result=None) -> str:
+    if state_result is not None and getattr(state_result, "current_url", None):
+        return str(state_result.current_url or "")
+    try:
+        return str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        return ""
+
+
+def _is_chrome_error_url(value: str | None) -> bool:
+    return str(value or "").strip().lower().startswith("chrome-error://chromewebdata")
+
+
+def _module2_is_same_page_kpsdk_candidate(driver, requested_url: str, state_result) -> bool:
+    if getattr(state_result, "state", None) != PageState.BLOCKED_KPSDK:
+        return False
+    current_url = _current_url(driver, state_result)
+    if _is_chrome_error_url(current_url):
+        return False
+    current_l = str(current_url or "").lower()
+    requested_l = str(requested_url or "").lower()
+    if "realestate.com.au" not in current_l or "realestate.com.au" not in requested_l:
+        return False
+    current_parsed = urlparse(current_l)
+    requested_parsed = urlparse(requested_l)
+    return (current_parsed.netloc, current_parsed.path) == (requested_parsed.netloc, requested_parsed.path)
+
+
+def _module2_same_page_kpsdk_settle(driver, requested_url: str, state_result, cards, *, min_cards: int, timeout: int | float, log_func):
+    """Let a transient Module2 KPSDK shell hydrate without re-navigating the URL."""
+    if not _module2_is_same_page_kpsdk_candidate(driver, requested_url, state_result):
+        return state_result, cards
+
+    log_func(
+        "   Module2 transient KPSDK detected; same-page settle start "
+        f"state={getattr(state_result, 'state', None)} current_url={_current_url(driver, state_result)} "
+        f"html_length={getattr(state_result, 'html_length', 0) or 0} "
+        f"body_text_length={getattr(state_result, 'body_text_length', 0) or 0}"
+    )
+    rechecks = max(1, int(getattr(config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2)))
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+    last_result = state_result
+    last_cards = cards or []
+    for attempt in range(1, rechecks + 1):
+        if settle_seconds:
+            time.sleep(settle_seconds)
+        last_result, last_cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=min_cards)
+        log_func(
+            "   Module2 KPSDK same-page settle attempt={attempt} state={state} cards_found={cards} "
+            "html_length={html_len} body_text_length={body_len}".format(
+                attempt=attempt,
+                state=getattr(last_result, "state", None),
+                cards=getattr(last_result, "cards_count", 0),
+                html_len=getattr(last_result, "html_length", 0),
+                body_len=getattr(last_result, "body_text_length", 0),
+            )
+        )
+        if getattr(last_result, "state", None) in {PageState.LISTINGS, PageState.NO_RESULTS}:
+            return last_result, last_cards
+        if getattr(last_result, "state", None) != PageState.BLOCKED_KPSDK:
+            return last_result, last_cards
+    return last_result, last_cards
+
+
+def _module2_pagination_nav_mode() -> str:
+    mode = str(getattr(config, "MODULE2_PAGINATION_NAV_MODE", "") or "").strip().lower()
+    if mode in {"click_next", "direct_url", "fresh_context_per_page"}:
+        return mode
+    return "click_next" if getattr(config, "BROWSER_ENGINE", "") == "cloak" else "direct_url"
+
+
+def _make_fresh_module2_profile_dir(window_idx: int, page: int) -> str:
+    root = os.path.join(str(getattr(config, "OUTPUT_DIR", "output") or "output"), "module2_fresh_profiles")
+    os.makedirs(root, exist_ok=True)
+    path = os.path.join(root, f"window_{window_idx}_page_{page}_{uuid.uuid4().hex[:8]}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _module2_fresh_context_get(driver, page_url: str, window_idx: int, page: int, *, log_func):
+    try:
+        if driver:
+            driver.quit()
+    except Exception:
+        pass
+    try:
+        if driver:
+            cleanup_chrome_driver(driver)
+    except Exception:
+        pass
+    profile_dir = _make_fresh_module2_profile_dir(window_idx, page)
+    log_func(f"Module2 fresh_context_per_page fallback window={window_idx} page={page} profile_dir={profile_dir}")
+    new_driver = build_driver(profile_dir_override=profile_dir)
+    new_driver, ok, err = get_with_retries(new_driver, page_url, tries=2, phase="fresh_context_page", apply_delay=False, log_func=log_func)
+    return new_driver, profile_dir, ok, err
+
+
+def _module2_next_anchor_info(driver, current_page: int) -> dict:
+    next_page = int(current_page) + 1
+    script = f"""
+    (() => {{
+      const nextPage = {next_page};
+      const selectors = [
+        'a[rel="next"]',
+        'a[aria-label*="Go to next page" i]',
+        `a[href*="/list-${{nextPage}}"]`
+      ];
+      const seen = new Set();
+      const candidates = [];
+      for (const selector of selectors) {{
+        for (const anchor of Array.from(document.querySelectorAll(selector))) {{
+          if (seen.has(anchor)) continue;
+          seen.add(anchor);
+          candidates.push(anchor);
+        }}
+      }}
+      const isVisible = (el) => {{
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+      }};
+      const isDisabled = (el) => {{
+        const cls = String(el.getAttribute('class') || '').toLowerCase();
+        return el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled') || cls.includes('disabled');
+      }};
+      const paginationLike = (href, rel, aria, text) => {{
+        const haystack = `${{rel}} ${{aria}} ${{text}}`.toLowerCase();
+        const bad = `${{href}} ${{aria}} ${{text}}`.toLowerCase();
+        if (bad.includes('nextroll') || bad.includes('privacy') || bad.includes('advertising')) return false;
+        return rel === 'next' || /\\b(next|go to next page|next page|pagination)\\b/i.test(haystack);
+      }};
+      for (const anchor of candidates) {{
+        const href = String(anchor.href || anchor.getAttribute('href') || '');
+        const rel = String(anchor.getAttribute('rel') || '').toLowerCase();
+        const aria = String(anchor.getAttribute('aria-label') || '');
+        const text = String(anchor.innerText || anchor.textContent || '').trim();
+        const hrefTargetsNextPage = href.includes(`/list-${{nextPage}}`);
+        const relNext = rel.split(/\\s+/).includes('next');
+        if (!isVisible(anchor) || isDisabled(anchor)) continue;
+        if (!(hrefTargetsNextPage || relNext)) continue;
+        if (!paginationLike(href, relNext ? 'next' : rel, aria, text)) continue;
+        return {{exists: true, href, rel, aria, text, nextPage}};
+      }}
+      return {{exists: false, reason: 'no_next_anchor', nextPage}};
+    }})();
+    """
+    try:
+        result = driver.execute_script(script)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+    selectors = ['a[rel="next"]', 'a[aria-label*="Go to next page"]', f'a[href*="/list-{next_page}"]']
+    for sel in selectors:
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                if not el.is_displayed() or _is_disabled_pagination_control(el):
+                    continue
+                href = (el.get_attribute("href") or "").strip()
+                rel = (el.get_attribute("rel") or "").strip().lower()
+                aria = (el.get_attribute("aria-label") or "").strip()
+                text = (getattr(el, "text", "") or "").strip()
+                bad = f"{href} {aria} {text}".lower()
+                if any(marker in bad for marker in ("nextroll", "privacy", "advertising")):
+                    continue
+                if f"/list-{next_page}" in href or "next" in rel.split():
+                    return {"exists": True, "href": href, "rel": rel, "aria": aria, "text": text, "nextPage": next_page}
+        except Exception:
+            continue
+    return {"exists": False, "reason": "no_next_anchor", "nextPage": next_page}
+
+
+def _module2_click_next_anchor(driver, next_page: int, log_func) -> dict:
+    script = f"""
+    (() => {{
+      const nextPage = {int(next_page)};
+      const selectors = ['a[rel="next"]', 'a[aria-label*="Go to next page" i]', `a[href*="/list-${{nextPage}}"]`];
+      const seen = new Set();
+      const candidates = [];
+      for (const selector of selectors) {{
+        for (const anchor of Array.from(document.querySelectorAll(selector))) {{
+          if (seen.has(anchor)) continue;
+          seen.add(anchor);
+          candidates.push(anchor);
+        }}
+      }}
+      const visible = (el) => {{ const s = window.getComputedStyle(el); const r = el.getBoundingClientRect(); return s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0; }};
+      const disabled = (el) => {{ const cls = String(el.getAttribute('class') || '').toLowerCase(); return el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled') || cls.includes('disabled'); }};
+      const paginationLike = (href, rel, aria, text) => {{
+        const haystack = `${{rel}} ${{aria}} ${{text}}`.toLowerCase();
+        const bad = `${{href}} ${{aria}} ${{text}}`.toLowerCase();
+        if (bad.includes('nextroll') || bad.includes('privacy') || bad.includes('advertising')) return false;
+        return rel === 'next' || /\\b(next|go to next page|next page|pagination)\\b/i.test(haystack);
+      }};
+      for (const anchor of candidates) {{
+        const href = String(anchor.href || anchor.getAttribute('href') || '');
+        const rel = String(anchor.getAttribute('rel') || '').toLowerCase();
+        const aria = String(anchor.getAttribute('aria-label') || '');
+        const text = String(anchor.innerText || anchor.textContent || '').trim();
+        const hrefTargetsNextPage = href.includes(`/list-${{nextPage}}`);
+        const relNext = rel.split(/\\s+/).includes('next');
+        if (!visible(anchor) || disabled(anchor)) continue;
+        if (!(hrefTargetsNextPage || relNext)) continue;
+        if (!paginationLike(href, relNext ? 'next' : rel, aria, text)) continue;
+        anchor.scrollIntoView({{block: 'center', inline: 'center'}});
+        for (const type of ['mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {{
+          anchor.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}}));
+        }}
+        try {{ anchor.click(); }} catch (err) {{}}
+        return {{clicked: true, href, rel, aria, text, currentUrl: document.location.href}};
+      }}
+      return {{clicked: false, reason: 'next_anchor_not_found', nextPage}};
+    }})();
+    """
+    result = driver.execute_script(script)
+    if not isinstance(result, dict):
+        result = {"clicked": bool(result)}
+    href = result.get("href") or ""
+    if href:
+        log_func(f"Module2 click-next href={href}")
+    else:
+        log_func(f"Module2 click-next failed reason={result.get('reason', 'unknown')}")
+    return result
+
+
+def _is_realestate_list_page_url(url: str | None) -> bool:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.netloc or "").lower()
+    return host.endswith("realestate.com.au") and _parse_list_page(parsed.path or "") is not None
 
 
 # =========================
@@ -732,8 +961,16 @@ def infer_prices_window_based_with_checkpoint(
         window_seen_ids = set()
         window_timed_out = False
         detected_max_pages = None  # از pagination استخراج می‌کنیم
+        module2_nav_mode = _module2_pagination_nav_mode()
+        pagination_landed_by_click = False
+        pending_page_nav: str | None = None
+        window_page_stats = ck.setdefault("window_page_stats", [])
+        fallback_paths = ck.setdefault("fallback_paths", [])
+        ended_window_reasons = ck.setdefault("ended_window_reasons", [])
+        log_func(f"Module2 pagination nav mode={module2_nav_mode} window={window_idx}")
 
-        for page in range(1, max_pages_per_window + 1):
+        page = 1
+        while page <= max_pages_per_window:
             if getattr(cancel_token, "is_set", lambda: False)():
                 log_func("Cancel requested in module2 page loop.")
                 return inferred, driver, "cancelled"
@@ -750,14 +987,30 @@ def infer_prices_window_based_with_checkpoint(
 
             nav_phase = "window" if page == 1 else "page"
             nav_apply_delay = (page > 1) or (page == 1 and checked_this_run > 1)
-            driver, ok, err = get_with_retries(
-                driver,
-                url,
-                tries=2,
-                phase=nav_phase,
-                apply_delay=nav_apply_delay,
-                log_func=log_func,
-            )
+            page_nav = "direct_url"
+            if page == 1 or module2_nav_mode == "direct_url":
+                driver, ok, err = get_with_retries(
+                    driver,
+                    url,
+                    tries=2,
+                    phase=nav_phase,
+                    apply_delay=nav_apply_delay,
+                    log_func=log_func,
+                )
+                pagination_landed_by_click = False
+                pending_page_nav = None
+            elif module2_nav_mode == "fresh_context_per_page" or not pagination_landed_by_click:
+                page_nav = "fresh_context_per_page"
+                driver, profile_dir, ok, err = _module2_fresh_context_get(driver, url, window_idx, page, log_func=log_func)
+                ck["current_profile_dir"] = profile_dir
+                fallback_paths.append(f"fresh_context_per_page:window_{window_idx}:page_{page}")
+                pagination_landed_by_click = False
+                pending_page_nav = None
+            else:
+                page_nav = pending_page_nav or "click_next"
+                ok = not _is_chrome_error_url(_current_url(driver))
+                err = None
+                log_func(f"Module2 click-next landed current_url={_current_url(driver)}")
             session_health.record_navigation(url, ok, err, str(getattr(driver, "current_url", "") or ""))
             if not ok:
                 consecutive_get_failures += 1
@@ -841,18 +1094,17 @@ def infer_prices_window_based_with_checkpoint(
                     body_len=state_result.body_text_length,
                 )
             )
-            state_result, cards = same_session_kpsdk_recheck(
-                driver=driver,
-                url=url,
-                wait_func=wait_for_search_page_state,
-                safe_get_func=_same_driver_get,
-                log_func=log_func,
-                module_name="Module2",
-                timeout=wait_timeout,
+            state_result, cards = _module2_same_page_kpsdk_settle(
+                driver,
+                url,
+                state_result,
+                cards,
                 min_cards=1,
-                initial_result=state_result,
-                initial_payload=cards,
+                timeout=wait_timeout,
+                log_func=log_func,
             )
+            if state_result.state == PageState.BLOCKED_KPSDK:
+                log_func("   Module2 KPSDK same-page settle exhausted; leaving state untrusted for recovery policy")
             session_health.record_page_state(state_result)
             trusted_window = state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}
             log_func(f"   Module2 trusted_window={trusted_window} state={state_result.state}")
@@ -950,6 +1202,7 @@ def infer_prices_window_based_with_checkpoint(
                 break
 
             cards = payload
+            window_page_stats.append({"window": window_idx, "page": page, "rows": len(cards), "cards": len(cards), "url": _current_url(driver) or url, "nav": page_nav})
             ck["last_successful_url"] = driver.current_url
             ck["last_successful_window_idx"] = window_idx
             ck["last_successful_page"] = page
@@ -992,15 +1245,48 @@ def infer_prices_window_based_with_checkpoint(
 
             # ✅ اگر pagination می‌گوید فقط ۱ صفحه است، همینجا قطع
             if detected_max_pages is not None and page >= detected_max_pages:
+                ended_window_reasons.append({"window": window_idx, "page": page, "reason": "detected_last_page", "cards_found": len(cards)})
                 break
 
-            # ✅ next واقعی نیست => stop
-            if len(cards) < 20 and not has_next_results_page(driver, page):
-                log_func("No next page detected. Stop paging this window.")
+            if page >= max_pages_per_window:
                 break
-            if page < max_pages_per_window and not has_next_results_page(driver, page):
-                log_func("No next page detected. Stop paging this window.")
+
+            next_page = page + 1
+            next_info = _module2_next_anchor_info(driver, page)
+            has_real_next = bool(next_info.get("exists"))
+            if not has_real_next:
+                log_func(f"Module2 window pagination ended page={page} reason=no_next_anchor cards_found={len(cards)}")
+                ended_window_reasons.append({"window": window_idx, "page": page, "reason": "no_next_anchor", "cards_found": len(cards)})
                 break
+
+            pagination_landed_by_click = False
+            pending_page_nav = None
+            if module2_nav_mode == "click_next":
+                log_func(f"Module2 pagination nav mode=click_next window={window_idx} page={page} next_page={next_page}")
+                click_result = _module2_click_next_anchor(driver, next_page, log_func)
+                log_func(f"Module2 click-next dispatch_result={click_result}")
+                time.sleep(max(0.5, float(getattr(config, "MODULE2_INTER_PAGE_DELAY_SECONDS", 0)) / 4.0))
+                current_after_click = _current_url(driver)
+                actual_next = _parse_list_page(current_after_click)
+                chrome_error = _is_chrome_error_url(current_after_click)
+                click_success = actual_next == next_page and not chrome_error and _is_realestate_list_page_url(current_after_click)
+                log_func(
+                    "Module2 click-next landed_page={landed} expected_page={expected} chrome_error={chrome_error} success={success}".format(
+                        landed=actual_next, expected=next_page, chrome_error=chrome_error, success=click_success
+                    )
+                )
+                if click_success:
+                    pagination_landed_by_click = True
+                    pending_page_nav = "click_next"
+                else:
+                    log_func(f"Module2 click-next fallback fresh_context_per_page window={window_idx} page={next_page} reason={click_result.get('reason') or 'landing_verification_failed'}")
+                    driver, profile_dir, ok_fresh, err_fresh = _module2_fresh_context_get(driver, build_between_url(base_list_url, low, high, page=next_page), window_idx, next_page, log_func=log_func)
+                    ck["current_profile_dir"] = profile_dir
+                    session_health.record_navigation(build_between_url(base_list_url, low, high, page=next_page), ok_fresh, err_fresh, _current_url(driver))
+                    fallback_paths.append(f"click_next_to_fresh_context_per_page:window_{window_idx}:page_{next_page}")
+                    pagination_landed_by_click = True
+                    pending_page_nav = "fresh_context_per_page"
+            page = next_page
 
         log_func(f"Remaining after window: {len(remaining)}")
         if window_timed_out:
@@ -1421,6 +1707,11 @@ def module2_run(
             "stopped_reason": ck.get("stopped_reason"),
             "browser_profile_used": ck.get("current_profile_dir"),
             "browser_recovery_action": ck.get("browser_recovery_action"),
+            "session_failure_windows": ck.get("session_failure_windows", 0),
+            "pagination_nav_mode": _module2_pagination_nav_mode(),
+            "window_page_stats": ck.get("window_page_stats", []),
+            "fallback_paths": ck.get("fallback_paths", []),
+            "ended_window_reasons": ck.get("ended_window_reasons", []),
             **_target_listing_debug(rows, remaining_after),
         })
         log(f"Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")
