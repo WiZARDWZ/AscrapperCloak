@@ -399,6 +399,103 @@ class Module2PaginationNavigationTests(unittest.TestCase):
         self.assertFalse(any("/list-2" in url for url in get_urls))
         self.assertEqual(ck["window_page_stats"][1]["nav"], "click_next")
 
+    def test_window2_goto_failure_uses_fresh_context_retry_and_continues(self):
+        driver = FakeModule2PaginationDriver(has_next=False)
+        fresh_driver = FakeModule2PaginationDriver(has_next=False)
+        ck = {"inferred_map": {}, "remaining_ids": ["target-1"], "next_window_index": 0, "window_idx": 0, "profile_rotations": 0}
+        calls = []
+        states = [
+            (_state(PageState.LISTINGS, cards=4, html_length=50000, body_text_length=1200), [object() for _ in range(4)]),
+            (_state(PageState.LISTINGS, cards=4, html_length=50000, body_text_length=1200), [object() for _ in range(4)]),
+        ]
+
+        def fake_get(drv, url, *, phase="page", **_kwargs):
+            calls.append((phase, url))
+            if "between-100-200" in url and phase == "window":
+                return drv, False, module2_infer_prices.WebDriverException("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+            drv.current_url = url
+            return drv, True, None
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_WINDOW_NAV_MODE", "fresh_context_on_failure"), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_PAGINATION_NAV_MODE", "click_next"), \
+             mock.patch.object(module2_infer_prices, "get_with_retries", side_effect=fake_get), \
+             mock.patch.object(module2_infer_prices, "build_driver", return_value=fresh_driver), \
+             mock.patch.object(module2_infer_prices, "wait_for_search_page_state", side_effect=states), \
+             mock.patch.object(module2_infer_prices, "wait_for_cards_or_no_results", side_effect=[("cards", [object() for _ in range(4)]), ("cards", [object() for _ in range(4)])]), \
+             mock.patch.object(module2_infer_prices, "extract_listing_ids_from_cards", side_effect=[set(), {"target-1"}]), \
+             mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", 0):
+            inferred, _driver, status = module2_infer_prices.infer_prices_window_based_with_checkpoint(
+                driver=driver,
+                base_list_url="https://www.realestate.com.au/buy/in-test/list-1",
+                target_ids={"target-1"},
+                window_width=100,
+                step=100,
+                start_low=0,
+                max_high=200,
+                max_pages_per_window=1,
+                wait_timeout=1,
+                ck_path=f"{tmp}/ck.json",
+                ck=ck,
+                log_func=lambda _msg: None,
+                sweep_windows=[(0, 100, 100), (100, 200, 100)],
+                max_windows_per_run=2,
+            )
+
+        self.assertEqual(status, "done")
+        self.assertIn("target-1", inferred)
+        self.assertEqual(len(ck["window_page_stats"]), 2)
+        self.assertEqual(ck["window_page_stats"][0]["window"], 1)
+        self.assertEqual(ck["window_page_stats"][1]["nav"], "fresh_context_retry")
+        self.assertTrue(any(path.startswith("fresh_context_retry:window_2:page_1") for path in ck["window_fallback_paths"]))
+        self.assertTrue(any(item.get("action") == "fresh_context_retry" for item in ck["recovery_attempts"]))
+
+    def test_window_fresh_context_retry_exhaustion_returns_network_retry_without_traceback(self):
+        driver = FakeModule2PaginationDriver(has_next=False)
+        fresh_driver = FakeModule2PaginationDriver(has_next=False)
+        ck = {"inferred_map": {}, "remaining_ids": ["target-1"], "next_window_index": 0, "window_idx": 0, "profile_rotations": 0}
+        logs = []
+
+        def fake_get(drv, url, *, phase="page", **_kwargs):
+            if "between-100-200" in url:
+                return drv, False, module2_infer_prices.WebDriverException("net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+            drv.current_url = url
+            return drv, True, None
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_WINDOW_NAV_MODE", "fresh_context_on_failure"), \
+             mock.patch.object(module2_infer_prices, "get_with_retries", side_effect=fake_get), \
+             mock.patch.object(module2_infer_prices, "build_driver", return_value=fresh_driver), \
+             mock.patch.object(module2_infer_prices, "wait_for_search_page_state", return_value=(_state(PageState.LISTINGS, cards=4, html_length=50000, body_text_length=1200), [object() for _ in range(4)])), \
+             mock.patch.object(module2_infer_prices, "wait_for_cards_or_no_results", return_value=("cards", [object() for _ in range(4)])), \
+             mock.patch.object(module2_infer_prices, "extract_listing_ids_from_cards", return_value=set()), \
+             mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", 0):
+            _inferred, _driver, status = module2_infer_prices.infer_prices_window_based_with_checkpoint(
+                driver=driver,
+                base_list_url="https://www.realestate.com.au/buy/in-test/list-1",
+                target_ids={"target-1"},
+                window_width=100,
+                step=100,
+                start_low=0,
+                max_high=200,
+                max_pages_per_window=1,
+                wait_timeout=1,
+                ck_path=f"{tmp}/ck.json",
+                ck=ck,
+                log_func=logs.append,
+                sweep_windows=[(0, 100, 100), (100, 200, 100)],
+                max_windows_per_run=2,
+            )
+
+        self.assertEqual(status, "retry_wait_network_interrupted")
+        self.assertEqual(len(ck["window_page_stats"]), 1)
+        self.assertTrue(any(path.startswith("fresh_context_retry:window_2:page_1") for path in ck["window_fallback_paths"]))
+        self.assertTrue(any("fresh_context window retry failed window=2" in msg for msg in logs))
+
     def test_click_next_script_does_not_use_selenium_arguments(self):
         import inspect
         script = inspect.getsource(module2_infer_prices._module2_click_next_anchor)
@@ -455,6 +552,9 @@ class Module2SmallWindowSmokeToolTests(unittest.TestCase):
         self.assertIn("ended_window_reasons", summary)
         self.assertIn("fallback_paths", summary)
         self.assertIn("pagination_nav_mode", summary)
+        self.assertIn("window_nav_mode", summary)
+        self.assertIn("window_fallback_paths", summary)
+        self.assertIn("recovery_attempts", summary)
         self.assertTrue(summary["retry_wait_logged"])
 
 

@@ -266,6 +266,10 @@ _MODULE2_PAGINATION_NAV_MODE_DEFAULT = "click_next" if BROWSER_ENGINE == "cloak"
 MODULE2_PAGINATION_NAV_MODE = os.getenv("MODULE2_PAGINATION_NAV_MODE", _MODULE2_PAGINATION_NAV_MODE_DEFAULT).strip().lower() or _MODULE2_PAGINATION_NAV_MODE_DEFAULT
 if MODULE2_PAGINATION_NAV_MODE not in {"click_next", "direct_url", "fresh_context_per_page"}:
     MODULE2_PAGINATION_NAV_MODE = _MODULE2_PAGINATION_NAV_MODE_DEFAULT
+_MODULE2_WINDOW_NAV_MODE_DEFAULT = "fresh_context_on_failure" if BROWSER_ENGINE == "cloak" else "direct_url"
+MODULE2_WINDOW_NAV_MODE = os.getenv("MODULE2_WINDOW_NAV_MODE", _MODULE2_WINDOW_NAV_MODE_DEFAULT).strip().lower() or _MODULE2_WINDOW_NAV_MODE_DEFAULT
+if MODULE2_WINDOW_NAV_MODE not in {"direct_url", "fresh_context_on_failure", "fresh_context_per_window"}:
+    MODULE2_WINDOW_NAV_MODE = _MODULE2_WINDOW_NAV_MODE_DEFAULT
 CLOAK_PROFILE_DIR = os.getenv("CLOAK_PROFILE_DIR", os.getenv("CHROME_PROFILE_DIR", "rea_profile"))
 CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", _bool_env("HEADLESS", False))
 CLOAK_PROXY = _optional_str_env("CLOAK_PROXY")

@@ -17,7 +17,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, safe_realestate_get_with_reset, safe_driver_get
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, reset_chrome_error_tab, safe_realestate_get_with_reset, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -292,6 +292,13 @@ def _module2_pagination_nav_mode() -> str:
     if mode in {"click_next", "direct_url", "fresh_context_per_page"}:
         return mode
     return "click_next" if getattr(config, "BROWSER_ENGINE", "") == "cloak" else "direct_url"
+
+
+def _module2_window_nav_mode() -> str:
+    mode = str(getattr(config, "MODULE2_WINDOW_NAV_MODE", "") or "").strip().lower()
+    if mode in {"direct_url", "fresh_context_on_failure", "fresh_context_per_window"}:
+        return mode
+    return "fresh_context_on_failure" if getattr(config, "BROWSER_ENGINE", "") == "cloak" else "direct_url"
 
 
 def _make_fresh_module2_profile_dir(window_idx: int, page: int) -> str:
@@ -962,12 +969,16 @@ def infer_prices_window_based_with_checkpoint(
         window_timed_out = False
         detected_max_pages = None  # از pagination استخراج می‌کنیم
         module2_nav_mode = _module2_pagination_nav_mode()
+        module2_window_nav_mode = _module2_window_nav_mode()
         pagination_landed_by_click = False
         pending_page_nav: str | None = None
         window_page_stats = ck.setdefault("window_page_stats", [])
         fallback_paths = ck.setdefault("fallback_paths", [])
+        window_fallback_paths = ck.setdefault("window_fallback_paths", [])
         ended_window_reasons = ck.setdefault("ended_window_reasons", [])
+        recovery_attempts = ck.setdefault("recovery_attempts", [])
         log_func(f"Module2 pagination nav mode={module2_nav_mode} window={window_idx}")
+        log_func(f"Module2 window nav mode={module2_window_nav_mode} window={window_idx}")
 
         page = 1
         while page <= max_pages_per_window:
@@ -992,7 +1003,41 @@ def infer_prices_window_based_with_checkpoint(
             nav_phase = "window" if page == 1 else "page"
             nav_apply_delay = (page > 1) or (page == 1 and checked_this_run > 1)
             page_nav = "direct_url"
-            if page == 1 or module2_nav_mode == "direct_url":
+            if page == 1:
+                if module2_window_nav_mode == "fresh_context_per_window":
+                    page_nav = "fresh_context_per_window"
+                    driver, profile_dir, ok, err = _module2_fresh_context_get(driver, url, window_idx, page, log_func=log_func)
+                    ck["current_profile_dir"] = profile_dir
+                    window_fallback_paths.append(f"fresh_context_per_window:window_{window_idx}:page_{page}")
+                else:
+                    driver, ok, err = get_with_retries(
+                        driver,
+                        url,
+                        tries=2,
+                        phase=nav_phase,
+                        apply_delay=nav_apply_delay,
+                        log_func=log_func,
+                    )
+                    if not ok and module2_window_nav_mode == "fresh_context_on_failure":
+                        log_func(f"Module2 window navigation failed window={window_idx} page={page} action=fresh_context_retry")
+                        recovery_attempts.append({"window": window_idx, "page": page, "action": "fresh_context_retry", "reason": str(err or "navigation_failed")})
+                        try:
+                            reset_chrome_error_tab(driver, log_func=log_func)
+                        except Exception:
+                            pass
+                        driver, profile_dir, ok_fresh, err_fresh = _module2_fresh_context_get(driver, url, window_idx, page, log_func=log_func)
+                        ck["current_profile_dir"] = profile_dir
+                        window_fallback_paths.append(f"fresh_context_retry:window_{window_idx}:page_{page}")
+                        if ok_fresh:
+                            log_func(f"Module2 fresh_context window retry success window={window_idx} page={page}")
+                            ok, err = ok_fresh, None
+                            page_nav = "fresh_context_retry"
+                        else:
+                            log_func(f"Module2 fresh_context window retry failed window={window_idx} page={page} error={config.mask_sensitive_text(err_fresh)}")
+                            ok, err = ok_fresh, err_fresh
+                pagination_landed_by_click = False
+                pending_page_nav = None
+            elif module2_nav_mode == "direct_url":
                 driver, ok, err = get_with_retries(
                     driver,
                     url,
@@ -1113,6 +1158,8 @@ def infer_prices_window_based_with_checkpoint(
             trusted_window = state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}
             log_func(f"   Module2 trusted_window={trusted_window} state={state_result.state}")
             if trusted_window:
+                if page_nav == "fresh_context_retry":
+                    log_func(f"Module2 fresh_context window retry success window={window_idx} state={state_result.state}")
                 log_session_health(session_health, url_type="price_window", page_state=state_result.state, action="success", log_func=log_func)
             if state_result.is_blocked or state_result.state == PageState.CHROME_ERROR:
                 retry_page1_after_rotate = page == 1 and int(ck.get("last_429_page1_window_idx", -1)) != window_idx
@@ -1713,9 +1760,12 @@ def module2_run(
             "browser_recovery_action": ck.get("browser_recovery_action"),
             "session_failure_windows": ck.get("session_failure_windows", 0),
             "pagination_nav_mode": _module2_pagination_nav_mode(),
+            "window_nav_mode": _module2_window_nav_mode(),
             "window_page_stats": ck.get("window_page_stats", []),
             "fallback_paths": ck.get("fallback_paths", []),
+            "window_fallback_paths": ck.get("window_fallback_paths", []),
             "ended_window_reasons": ck.get("ended_window_reasons", []),
+            "recovery_attempts": ck.get("recovery_attempts", []),
             **_target_listing_debug(rows, remaining_after),
         })
         log(f"Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")
