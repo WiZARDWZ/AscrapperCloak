@@ -775,7 +775,7 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
             else:
                 cur.execute("INSERT INTO dbo.Listing(ExternalID,AgencyID,AgentID,PropertyID,FirstTimeSeen,LastTimeSeen,Price,Description,ListingURL,CurrentStatus,CurrentPriceDisplay,CurrentDescriptionHash) OUTPUT INSERTED.listingID VALUES (?,?,?, ?,SYSDATETIME(),SYSDATETIME(),?,?,?,'active',?,?)", ext, agency_id, primary_agent_id, property_id, n["price_value"], n["description"], n["url"], n["price_display"], desc_hash); lid=int(cur.fetchone()[0])
             summary["listings_upserted"]+=1
-            cur.execute("MERGE dbo.ListingSearchState t USING (SELECT ? ListingID, ? SearchID) s ON t.ListingID=s.ListingID AND t.SearchID=s.SearchID WHEN MATCHED THEN UPDATE SET LastSeenAt=SYSDATETIME(), Status='active', ListingLifecycleStatus='active', NotFoundCount=0, FirstNotFoundAt=NULL, LastNotFoundAt=NULL, UpdatedAt=SYSDATETIME() WHEN NOT MATCHED THEN INSERT(ListingID,SearchID,FirstSeenAt,LastSeenAt,Status,ListingLifecycleStatus,NotFoundCount) VALUES(?,?,SYSDATETIME(),SYSDATETIME(),'active','active',0);", lid,sid,lid,sid)
+            cur.execute("MERGE dbo.ListingSearchState t USING (SELECT ? ListingID, ? SearchID) s ON t.ListingID=s.ListingID AND t.SearchID=s.SearchID WHEN MATCHED THEN UPDATE SET LastSeenAt=SYSDATETIME(), Status='active', ListingLifecycleStatus='active', StatusReason='active_list_observed', StatusEvidence=NULL, NotFoundCount=0, FirstNotFoundAt=NULL, LastNotFoundAt=NULL, RemovedAt=NULL, SoldAt=NULL, UpdatedAt=SYSDATETIME() WHEN NOT MATCHED THEN INSERT(ListingID,SearchID,FirstSeenAt,LastSeenAt,Status,ListingLifecycleStatus,NotFoundCount) VALUES(?,?,SYSDATETIME(),SYSDATETIME(),'active','active',0);", lid,sid,lid,sid)
             if listing_lifecycle_status_from_row(rr) == "sold":
                 apply_listing_lifecycle_signal(conn, sid, lid, "sold", rr.get("StatusReason") or "sold_evidence", rr.get("StatusEvidence"), run_id=run_id, create_event=emit_events)
             snap_payload={"price_display":n["price_display"],"price_low":str(n["price_low"] or ""),"price_high":str(n["price_high"] or ""),"price_method":n["price_method"],"primary_agent_id":primary_agent_id,"inspection_short":n["inspection_short_label"],"inspection_long":n["inspection_long_label"],"auction_label":n["auction_label"],"description_hash":desc_hash,"url":n["url"],"land_size_display":n["land_size_display"],"land_size_sqm":str(n["land_size_sqm"] or ""),"building_size_display":n["building_size_display"],"building_size_sqm":str(n["building_size_sqm"] or ""),"floor_area_display":n["floor_area_display"],"floor_area_sqm":str(n["floor_area_sqm"] or "")}
@@ -1289,6 +1289,8 @@ def detect_and_record_changes_for_row(conn, search_url: str, row: dict, run_id: 
         "inspection_explicitly_absent": row.get("inspection_explicitly_absent"),
         "old_agents_reliable": row.get("old_agents_reliable"),
     }
+    sold_guard = _sold_guard_diagnostics(conn, search_url, row, old_state, new_state)
+    warnings.extend(sold_guard.get("warnings", []))
     if row.get("detail_extraction_quality") == "partial":
         if "detail_price_display" not in row and "price" not in row and "price_display" not in row and "AdPriceDisplay" not in row:
             for key in ("price_display", "price_low", "price_high", "price_method", "detail_price_display"):
@@ -1343,6 +1345,10 @@ def detect_and_record_changes_for_row(conn, search_url: str, row: dict, run_id: 
         "events_created": created,
         "should_notify_events": [e for e in events if e.get("should_notify")],
         "warnings": warnings,
+        "suppressed_sold_count": int(sold_guard.get("suppressed_sold_count", 0)),
+        "weak_sold_evidence_count": int(sold_guard.get("weak_sold_evidence_count", 0)),
+        "strong_sold_evidence_count": int(sold_guard.get("strong_sold_evidence_count", 0)),
+        "effective_lifecycle_status": sold_guard.get("effective_lifecycle_status"),
     }
 
 
@@ -1696,6 +1702,123 @@ def listing_lifecycle_status_from_row(row: dict | None) -> str:
     )
 
 
+def sold_evidence_strength_from_row(row: dict | None) -> str:
+    row = row or {}
+    strength = clean_text(
+        row.get("SoldEvidenceStrength")
+        or row.get("sold_evidence_strength")
+        or row.get("StatusEvidenceStrength"),
+        32,
+    )
+    if strength and strength.lower() in {"strong", "weak"}:
+        return strength.lower()
+    reason = clean_text(row.get("StatusReason") or row.get("status_reason"), 128) or ""
+    evidence = clean_text(row.get("StatusEvidence") or row.get("status_evidence"), 1000) or ""
+    if reason.lower() in {"sold_evidence", "strong_sold_evidence"}:
+        return "strong"
+    if "weak_sold_evidence" in reason.lower():
+        return "weak"
+    if listing_lifecycle_status_from_row(row) == "sold" and evidence:
+        return "weak"
+    return "none"
+
+
+def _search_id_if_exists(conn, search_url: str) -> int | None:
+    try:
+        normalized, *_ = _parse_search_url(search_url)
+        row = _one(conn.cursor(), "SELECT SearchID FROM dbo.SuburbSearch WHERE SearchHash=? OR NormalizedSearchURL=?", _sha(normalized), normalized)
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _recent_active_list_evidence(conn, search_id: int | None, listing_id: int | None, hours: int = 72) -> dict:
+    if not search_id or not listing_id:
+        return {"recent_active": False}
+    try:
+        row = _one(
+            conn.cursor(),
+            """
+            SELECT lss.Status, lss.ListingLifecycleStatus, lss.LastSeenAt, l.CurrentStatus
+            FROM dbo.ListingSearchState lss
+            JOIN dbo.Listing l ON l.listingID=lss.ListingID
+            WHERE lss.SearchID=? AND lss.ListingID=?
+            """,
+            int(search_id),
+            int(listing_id),
+        )
+    except Exception:
+        return {"recent_active": False}
+    if not row:
+        return {"recent_active": False}
+    area_status = normalize_listing_lifecycle_status(row[0])
+    lifecycle_status = normalize_listing_lifecycle_status(row[1])
+    listing_status = normalize_listing_lifecycle_status(row[3])
+    recent = False
+    last_seen = row[2]
+    if isinstance(last_seen, datetime):
+        recent = last_seen >= datetime.now() - timedelta(hours=hours)
+    elif last_seen:
+        # SQL Server returns DATETIME2 as datetime in production. If a fake/test
+        # connector supplies any LastSeenAt value, treat it as active evidence.
+        recent = True
+    return {
+        "recent_active": area_status == "active" and lifecycle_status == "active" and listing_status == "active" and recent,
+        "area_status": area_status,
+        "lifecycle_status": lifecycle_status,
+        "listing_status": listing_status,
+        "last_seen_at": str(last_seen) if last_seen is not None else None,
+    }
+
+
+def _sold_guard_diagnostics(conn, search_url: str, row: dict, old_state: dict | None, new_state: dict) -> dict:
+    diagnostics = {
+        "suppressed_sold_count": 0,
+        "weak_sold_evidence_count": 0,
+        "strong_sold_evidence_count": 0,
+        "effective_lifecycle_status": listing_lifecycle_status_from_row(row),
+        "warnings": [],
+    }
+    incoming_status = normalize_listing_lifecycle_status(new_state.get("status") or listing_lifecycle_status_from_row(row))
+    strength = sold_evidence_strength_from_row(row)
+    if strength == "weak":
+        diagnostics["weak_sold_evidence_count"] = 1
+    elif strength == "strong":
+        diagnostics["strong_sold_evidence_count"] = 1
+    if incoming_status != "sold":
+        diagnostics["effective_lifecycle_status"] = incoming_status
+        return diagnostics
+    if strength == "strong":
+        diagnostics["effective_lifecycle_status"] = "sold"
+        return diagnostics
+
+    listing_id = old_state.get("listing_id") if old_state else row.get("db_listing_id") or row.get("internal_listing_id")
+    search_id = _search_id_if_exists(conn, search_url)
+    active_evidence = _recent_active_list_evidence(conn, search_id, int(listing_id) if listing_id is not None else None)
+    old_status = normalize_listing_lifecycle_status((old_state or {}).get("status") or (old_state or {}).get("CurrentStatus") or row.get("area_status"))
+    if active_evidence.get("recent_active") or old_status == "active":
+        new_state["status"] = old_status if old_status == "active" else "unknown"
+        diagnostics["effective_lifecycle_status"] = new_state["status"]
+        diagnostics["suppressed_sold_count"] = 1
+        warning = {
+            "warning": "suppressed_sold_due_to_recent_active_list_evidence",
+            "external_id": row.get("external_id") or row.get("listing_id"),
+            "sold_evidence_strength": strength,
+            "active_evidence": active_evidence,
+        }
+        diagnostics["warnings"].append(warning)
+    else:
+        diagnostics["effective_lifecycle_status"] = "unknown"
+        new_state["status"] = "unknown"
+        diagnostics["suppressed_sold_count"] = 1
+        diagnostics["warnings"].append({
+            "warning": "suppressed_sold_without_strong_evidence",
+            "external_id": row.get("external_id") or row.get("listing_id"),
+            "sold_evidence_strength": strength,
+        })
+    return diagnostics
+
+
 def listing_is_active_for_module2(row: dict | None) -> bool:
     return listing_lifecycle_status_from_row(row) in MODULE2_ELIGIBLE_LIFECYCLE_STATUSES
 
@@ -1771,13 +1894,13 @@ def apply_listing_lifecycle_signal(
             NotFoundCount=?,
             FirstNotFoundAt=CASE WHEN ?='not_found' THEN COALESCE(FirstNotFoundAt, SYSDATETIME()) WHEN ?='active' THEN NULL ELSE FirstNotFoundAt END,
             LastNotFoundAt=CASE WHEN ?='not_found' THEN SYSDATETIME() WHEN ?='active' THEN NULL ELSE LastNotFoundAt END,
-            RemovedAt=CASE WHEN ?='removed' THEN COALESCE(RemovedAt, SYSDATETIME()) ELSE RemovedAt END,
-            SoldAt=CASE WHEN ?='sold' THEN COALESCE(SoldAt, SYSDATETIME()) ELSE SoldAt END,
+            RemovedAt=CASE WHEN ?='active' THEN NULL WHEN ?='removed' THEN COALESCE(RemovedAt, SYSDATETIME()) ELSE RemovedAt END,
+            SoldAt=CASE WHEN ?='active' THEN NULL WHEN ?='sold' THEN COALESCE(SoldAt, SYSDATETIME()) ELSE SoldAt END,
             LastStatusChangeAt=CASE WHEN COALESCE(ListingLifecycleStatus, Status, 'active')<>? THEN SYSDATETIME() ELSE LastStatusChangeAt END,
             UpdatedAt=SYSDATETIME()
         WHERE SearchID=? AND ListingID=?
         """, new_status, new_status, clean_text(reason, 128), clean_text(evidence), not_found_count,
-        new_status, new_status, new_status, new_status, new_status, new_status, new_status,
+        new_status, new_status, new_status, new_status, new_status, new_status, new_status, new_status, new_status,
         int(search_id), int(listing_id))
     if new_status == "active":
         cur.execute("UPDATE dbo.Listing SET CurrentStatus='active', UpdatedAt=SYSDATETIME() WHERE listingID=?", int(listing_id))
@@ -1985,7 +2108,17 @@ def ingest_detail_refresh_rows_conn(
     ensure_listing_event_metadata_columns(conn)
     ensure_listing_snapshot_size_columns(conn)
     sid = _upsert_search(conn, search_url)
-    summary = {"rows_input": len(rows), "rows_processed": 0, "snapshots_inserted": 0, "events_created": 0, "run_id": run_id, "items": []}
+    summary = {
+        "rows_input": len(rows),
+        "rows_processed": 0,
+        "snapshots_inserted": 0,
+        "events_created": 0,
+        "run_id": run_id,
+        "items": [],
+        "suppressed_sold_count": 0,
+        "weak_sold_evidence_count": 0,
+        "strong_sold_evidence_count": 0,
+    }
     cur = conn.cursor()
     for row in rows:
         try:
@@ -2002,7 +2135,14 @@ def ingest_detail_refresh_rows_conn(
             "events_created": 0,
             "should_notify_events": [e for e in change_result.get("events_detected", []) if e.get("should_notify")],
             "warnings": change_result.get("warnings", []),
+            "suppressed_sold_count": int(change_result.get("suppressed_sold_count", 0)),
+            "weak_sold_evidence_count": int(change_result.get("weak_sold_evidence_count", 0)),
+            "strong_sold_evidence_count": int(change_result.get("strong_sold_evidence_count", 0)),
+            "effective_lifecycle_status": change_result.get("effective_lifecycle_status"),
         }
+        summary["suppressed_sold_count"] += item["suppressed_sold_count"]
+        summary["weak_sold_evidence_count"] += item["weak_sold_evidence_count"]
+        summary["strong_sold_evidence_count"] += item["strong_sold_evidence_count"]
         if dry_run:
             summary["rows_processed"] += 1
             summary["items"].append(item)
@@ -2043,8 +2183,8 @@ def ingest_detail_refresh_rows_conn(
         for pos, (agid, agent_data) in enumerate(agents_data, start=1):
             cur.execute("INSERT INTO dbo.ListingSnapshotAgent(SnapshotID,AgentID,Position,PhoneAtSnapshot,RatingAtSnapshot,ReviewsTextAtSnapshot) VALUES (?,?,?,?,?,?)", snap_id, agid, pos, agent_data.get("phone"), None, None)
             cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingAgentAssignment WHERE ListingID=? AND AgentID=? AND SearchID=? AND EndedAt IS NULL) INSERT INTO dbo.ListingAgentAssignment(ListingID,AgentID,SearchID,StartedAt) VALUES (?,?,?,SYSDATETIME())", lid, agid, sid, lid, agid, sid)
-        lifecycle_status = listing_lifecycle_status_from_row(persisted_row)
-        if lifecycle_status == "sold":
+        lifecycle_status = normalize_listing_lifecycle_status(item.get("effective_lifecycle_status") or listing_lifecycle_status_from_row(persisted_row))
+        if lifecycle_status == "sold" and sold_evidence_strength_from_row(persisted_row) == "strong":
             apply_listing_lifecycle_signal(conn, sid, lid, "sold", persisted_row.get("StatusReason") or "sold_evidence", persisted_row.get("StatusEvidence"), run_id=run_id, create_event=True)
         else:
             apply_listing_lifecycle_signal(conn, sid, lid, "active", None, None, run_id=run_id, create_event=False)

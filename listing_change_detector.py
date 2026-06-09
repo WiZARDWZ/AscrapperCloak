@@ -37,11 +37,16 @@ def normalize_status(text_or_row: Any) -> str:
             candidates.append(str(v))
 
     text = " | ".join(candidates).lower()
-    if "sold" in text:
+    parts = [p.strip() for p in re.split(r"\s*\|\s*", text) if p.strip()]
+    if any(
+        re.fullmatch(r"sold", part)
+        or re.search(r"\bsold\s+(?:prior\s+to\s+auction|at\s+auction|on\s+\d{1,2}\s+[a-z]{3,9}\s+\d{4}|for\s+\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?)\b", part)
+        for part in parts
+    ):
         return "sold"
-    if "withdrawn" in text or "off market" in text:
+    if any("withdrawn" in part or "off market" in part for part in parts):
         return "removed"
-    if "active" in text or "current" in text or "for sale" in text:
+    if any("active" in part or "current" in part or "for sale" in part for part in parts):
         return "active"
     return "unknown"
 

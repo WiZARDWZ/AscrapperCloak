@@ -557,20 +557,117 @@ def _set_detail_price_fields(out: Dict[str, Any], price_text: str | None) -> Non
     out["PriceSource"] = "ad_price"
 
 
+STRONG_SOLD_PATTERNS = (
+    r"\bSold\s+prior\s+to\s+auction\b",
+    r"\bSold\s+at\s+auction\b",
+    r"\bSold\s+on\s+\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\b",
+    r"\bSold\s+for\s+\$?\s*[0-9][0-9,]*(?:\.[0-9]+)?\b",
+)
+
+
 def _extract_sold_evidence(text: str | None) -> str | None:
+    """Return strong listing-level sold evidence only.
+
+    This intentionally does not treat a generic occurrence of "sold" as a
+    sold listing. REA detail pages can contain unrelated scripts, recommendations,
+    ad copy (for example "must be sold"), or historical text with that word.
+    """
     if not text:
         return None
-    patterns = (
-        r"\bSold\s+prior\s+to\s+auction\b",
-        r"\bSold\s+at\s+auction\b",
-        r"\bSold\s+on\s+[^<\n|]+",
-        r"\bSold\b",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.I)
+    normalized = normalize_text(text) or ""
+    for pattern in STRONG_SOLD_PATTERNS:
+        match = re.search(pattern, normalized, flags=re.I)
         if match:
             return normalize_text(match.group(0))
+    if re.fullmatch(r"sold", normalized, flags=re.I):
+        return "Sold"
     return None
+
+
+def _contains_weak_sold_text(text: str | None) -> bool:
+    return bool(text and re.search(r"\bsold\b", str(text), flags=re.I))
+
+
+def _iter_json_values(value: Any, path: tuple[str, ...] = ()):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _iter_json_values(item, path + (str(key),))
+    elif isinstance(value, list):
+        for idx, item in enumerate(value):
+            yield from _iter_json_values(item, path + (str(idx),))
+    else:
+        yield path, value
+
+
+def _extract_structured_sold_evidence(soup: BeautifulSoup) -> str | None:
+    status_keys = {
+        "status", "listingstatus", "listing_status", "propertystatus",
+        "property_status", "adstatus", "ad_status", "lifecyclestatus",
+        "lifecycle_status", "currentstatus", "current_status",
+    }
+    for script in soup.select('script[type="application/ld+json"], script[type="application/json"]'):
+        text = script.string or script.get_text()
+        if not text or "sold" not in text.lower():
+            continue
+        try:
+            payload = json.loads(text)
+        except Exception:
+            continue
+        for path, value in _iter_json_values(payload):
+            key = path[-1].lower() if path else ""
+            key_norm = re.sub(r"[^a-z0-9_]", "", key)
+            if key_norm in status_keys and isinstance(value, str) and value.strip().lower() == "sold":
+                return f"structured status sold ({'.'.join(path)})"
+    return None
+
+
+def _extract_primary_sold_evidence_from_soup(soup: BeautifulSoup) -> tuple[str | None, bool]:
+    structured = _extract_structured_sold_evidence(soup)
+    if structured:
+        return structured, True
+
+    primary_selectors = (
+        "main [data-testid*='status' i]",
+        "main [data-testid*='badge' i]",
+        "main [class*='status' i]",
+        "main [class*='badge' i]",
+        "main [class*='label' i]",
+        "header [data-testid*='status' i]",
+        "header [class*='status' i]",
+        "header [class*='badge' i]",
+        "[data-testid='listing-details__summary-title']",
+        "[data-testid='property-price']",
+        ".property-info__price",
+        ".property-price",
+        "h1",
+    )
+    seen_text: set[str] = set()
+    weak = False
+    for selector in primary_selectors:
+        for el in soup.select(selector):
+            text = normalize_text(el.get_text(" ", strip=True))
+            if not text or text in seen_text:
+                continue
+            seen_text.add(text)
+            evidence = _extract_sold_evidence(text)
+            if evidence:
+                return evidence, True
+            weak = weak or _contains_weak_sold_text(text)
+
+    full_text = soup.get_text(" ", strip=True)
+    return None, bool(weak or _contains_weak_sold_text(full_text) or _contains_weak_sold_text(str(soup)))
+
+
+def _apply_sold_status_evidence(out: Dict[str, Any], evidence: str | None, weak: bool = False) -> None:
+    if evidence:
+        out["status"] = "sold"
+        out["ListingLifecycleStatus"] = "sold"
+        out["StatusReason"] = "sold_evidence"
+        out["StatusEvidence"] = evidence
+        out["SoldEvidenceStrength"] = "strong"
+    elif weak:
+        out["SoldEvidenceStrength"] = "weak"
+        out["StatusReason"] = "weak_sold_evidence_ignored"
 
 
 def _int_from_text(text: str | None) -> Optional[int]:
@@ -665,12 +762,10 @@ def _extract_detail_data_from_html_regex(html_text: str) -> Dict[str, Any]:
     price = re.search(r'<span[^>]*class=["\'][^"\']*property-price[^"\']*["\'][^>]*>(.*?)</span>', html_text or "", flags=re.I | re.S)
     if price:
         _set_detail_price_fields(out, _strip_tags(price.group(1)))
-    sold_evidence = _extract_sold_evidence(_strip_tags(html_text or ""))
-    if sold_evidence:
-        out["status"] = "sold"
-        out["ListingLifecycleStatus"] = "sold"
-        out["StatusReason"] = "sold_evidence"
-        out["StatusEvidence"] = sold_evidence
+    price_text = _strip_tags(price.group(1)) if price else None
+    h1_text = _strip_tags(h1.group(1)) if h1 else None
+    sold_evidence = _extract_sold_evidence(price_text) or _extract_sold_evidence(h1_text)
+    _apply_sold_status_evidence(out, sold_evidence, weak=bool(_contains_weak_sold_text(html_text) and not sold_evidence))
     ul = re.search(r'<ul[^>]*property-info__primary-features[^>]*aria-label=["\']([^"\']+)["\'][^>]*>(.*?)</ul>', html_text or "", flags=re.I | re.S)
     pairs: list[tuple[str, str]] = []
     if ul:
@@ -742,12 +837,8 @@ def extract_detail_data_from_html(html_text: str) -> Dict[str, Any]:
                 price_dom = txt
                 break
     _set_detail_price_fields(out, price_dom or extract_price_from_meta_description(meta_desc))
-    sold_evidence = _extract_sold_evidence(soup.get_text(" ", strip=True))
-    if sold_evidence:
-        out["status"] = "sold"
-        out["ListingLifecycleStatus"] = "sold"
-        out["StatusReason"] = "sold_evidence"
-        out["StatusEvidence"] = sold_evidence
+    sold_evidence, weak_sold_evidence = _extract_primary_sold_evidence_from_soup(soup)
+    _apply_sold_status_evidence(out, sold_evidence, weak=weak_sold_evidence)
 
     agents = []
     seen = set()
