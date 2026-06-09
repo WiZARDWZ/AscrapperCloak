@@ -4,6 +4,7 @@ import shutil
 import time
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from html import unescape
 
@@ -13,7 +14,122 @@ from realestate_page_state import (
     PageState,
     classify_current_page,
     get_html_block_reason,
+    is_chrome_error_url,
 )
+
+
+@dataclass
+class BrowserSessionHealth:
+    module_name: str
+    requested_url: str = ""
+    current_url: str = ""
+    consecutive_goto_failures: int = 0
+    consecutive_chrome_error_pages: int = 0
+    successful_page_loads_since_rotation: int = 0
+    attempted_urls_since_rotation: int = 0
+    recovery_attempts_for_current_url: int = 0
+    rotations_count: int = 0
+    last_recovery_reason: str = ""
+    last_page_state: str = ""
+
+    def begin_url(self, requested_url: str) -> None:
+        if requested_url != self.requested_url:
+            self.requested_url = requested_url
+            self.recovery_attempts_for_current_url = 0
+        self.attempted_urls_since_rotation += 1
+
+    def record_navigation(self, requested_url: str, ok: bool, exc: Exception | None = None, current_url: str = "") -> None:
+        self.begin_url(requested_url)
+        self.current_url = current_url or self.current_url
+        if ok:
+            self.consecutive_goto_failures = 0
+        else:
+            self.consecutive_goto_failures += 1
+            self.last_recovery_reason = config.mask_sensitive_text(exc or "navigation_failed")
+
+    def record_page_state(self, state_result) -> None:
+        self.current_url = str(getattr(state_result, "current_url", "") or self.current_url)
+        self.last_page_state = str(getattr(state_result, "state", "") or "")
+        if is_chrome_error_url(self.current_url) or self.last_page_state == PageState.CHROME_ERROR:
+            self.consecutive_chrome_error_pages += 1
+        elif self.last_page_state in TRUSTED_RECOVERY_STATES:
+            self.consecutive_chrome_error_pages = 0
+            self.consecutive_goto_failures = 0
+            self.successful_page_loads_since_rotation += 1
+
+    def record_same_url_retry(self, reason: str) -> None:
+        self.recovery_attempts_for_current_url += 1
+        self.last_recovery_reason = config.mask_sensitive_text(reason)
+
+    def record_rotation(self, reason: str) -> None:
+        self.rotations_count += 1
+        self.consecutive_goto_failures = 0
+        self.consecutive_chrome_error_pages = 0
+        self.successful_page_loads_since_rotation = 0
+        self.attempted_urls_since_rotation = 0
+        self.recovery_attempts_for_current_url = 0
+        self.last_recovery_reason = config.mask_sensitive_text(reason)
+
+
+class RecoveryPolicy:
+    def __init__(
+        self,
+        *,
+        same_url_max_retries: int | None = None,
+        goto_failure_threshold: int | None = None,
+        chrome_error_threshold: int | None = None,
+        zero_success_hard_failure_threshold: int | None = None,
+        min_attempted_urls_before_rotation: int = 1,
+    ) -> None:
+        self.same_url_max_retries = max(0, int(same_url_max_retries if same_url_max_retries is not None else getattr(config, "BROWSER_SAME_URL_MAX_RETRIES", 2)))
+        self.goto_failure_threshold = max(1, int(goto_failure_threshold if goto_failure_threshold is not None else getattr(config, "BROWSER_CONSECUTIVE_GOTO_FAILURE_ROTATION_THRESHOLD", 3)))
+        self.chrome_error_threshold = max(1, int(chrome_error_threshold if chrome_error_threshold is not None else getattr(config, "BROWSER_CONSECUTIVE_CHROME_ERROR_ROTATION_THRESHOLD", 3)))
+        self.zero_success_hard_failure_threshold = max(1, int(zero_success_hard_failure_threshold if zero_success_hard_failure_threshold is not None else getattr(config, "BROWSER_ZERO_SUCCESS_HARD_FAILURE_THRESHOLD", 3)))
+        self.min_attempted_urls_before_rotation = max(1, int(min_attempted_urls_before_rotation or 1))
+
+    def should_retry_same_profile(self, health: BrowserSessionHealth) -> bool:
+        return health.recovery_attempts_for_current_url < self.same_url_max_retries
+
+    def should_rotate(self, health: BrowserSessionHealth, *, explicit_trusted_block: bool = False) -> bool:
+        if explicit_trusted_block:
+            return True
+        if health.attempted_urls_since_rotation < self.min_attempted_urls_before_rotation:
+            if health.successful_page_loads_since_rotation > 0:
+                return False
+            hard_failures = max(health.consecutive_goto_failures, health.consecutive_chrome_error_pages)
+            return hard_failures >= self.zero_success_hard_failure_threshold
+        if health.consecutive_chrome_error_pages >= self.chrome_error_threshold:
+            return True
+        if health.consecutive_goto_failures >= self.goto_failure_threshold:
+            return True
+        if health.successful_page_loads_since_rotation == 0:
+            hard_failures = max(health.consecutive_goto_failures, health.consecutive_chrome_error_pages)
+            return hard_failures >= self.zero_success_hard_failure_threshold
+        return False
+
+
+def log_session_health(health: BrowserSessionHealth, *, url_type: str, page_state: str, action: str, log_func=print) -> None:
+    if not log_func:
+        return
+    log_func(
+        "session_health module={module} url_type={url_type} requested_url={requested} current_url={current} "
+        "page_state={state} same_url_retry_count={same_retries} consecutive_chrome_errors={chrome_errors} "
+        "successful_page_loads_since_rotation={successes} attempted_urls_since_rotation={attempted} "
+        "consecutive_goto_failures={goto_failures} rotations_count={rotations} action={action}".format(
+            module=health.module_name,
+            url_type=url_type,
+            requested=config.mask_sensitive_text(health.requested_url)[:240],
+            current=config.mask_sensitive_text(health.current_url)[:240],
+            state=page_state,
+            same_retries=health.recovery_attempts_for_current_url,
+            chrome_errors=health.consecutive_chrome_error_pages,
+            successes=health.successful_page_loads_since_rotation,
+            attempted=health.attempted_urls_since_rotation,
+            goto_failures=health.consecutive_goto_failures,
+            rotations=health.rotations_count,
+            action=action,
+        )
+    )
 
 
 def _looks_like_windows_path(path: str) -> bool:
@@ -161,6 +277,7 @@ UNTRUSTED_RECOVERY_STATES = {
     PageState.BLANK_RENDER,
     PageState.RENDER_TIMEOUT,
     PageState.UNKNOWN,
+    PageState.CHROME_ERROR,
 }
 
 TRUSTED_RECOVERY_STATES = {

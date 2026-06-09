@@ -125,6 +125,17 @@ class RealEstatePageStateTests(unittest.TestCase):
         self.assertFalse(result.is_blocked)
 
 
+    def test_chrome_error_url_never_classifies_detail_ready(self):
+        driver = FakeDriver(
+            url="chrome-error://chromewebdata/",
+            html='<html><body><h1>12 Test Street</h1><script id="__NEXT_DATA__">{}</script></body></html>',
+            body="12 Test Street 2 bed 1 bath parking guide",
+            elements={"h1": [FakeElement("12 Test Street")]},
+        )
+        result = classify_detail_page(driver, timeout=1)
+        self.assertEqual(result.state, PageState.CHROME_ERROR)
+        self.assertFalse(result.is_usable)
+
+
 if __name__ == "__main__":
     unittest.main()
-
