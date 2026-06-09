@@ -55,6 +55,36 @@ class DeploymentConfigTests(unittest.TestCase):
             finally:
                 importlib.reload(config)
 
+
+    def test_cloak_env_parses_humanize_geoip_viewport_and_http2_default(self):
+        overrides = {
+            "BROWSER_ENGINE": "cloak",
+            "HEADLESS": "0",
+            "CLOAK_HUMANIZE": "1",
+            "CLOAK_GEOIP": "1",
+            "CLOAK_PROXY": "http://user:pass@example.test:8080",
+            "CLOAK_VIEWPORT": "1365x768",
+            "CLOAK_DISABLE_HTTP2": "0",
+        }
+        with mock.patch.dict(os.environ, overrides, clear=False):
+            reloaded = importlib.reload(config)
+            try:
+                self.assertTrue(reloaded.CLOAK_HUMANIZE)
+                self.assertTrue(reloaded.CLOAK_GEOIP)
+                self.assertEqual(reloaded.CLOAK_PROXY, "http://user:pass@example.test:8080")
+                self.assertEqual(reloaded.CLOAK_VIEWPORT_WIDTH, 1365)
+                self.assertEqual(reloaded.CLOAK_VIEWPORT_HEIGHT, 768)
+                self.assertEqual(reloaded.CLOAK_HTTP2_MODE, "default")
+                self.assertFalse(reloaded.CLOAK_DISABLE_HTTP2)
+            finally:
+                importlib.reload(config)
+
+    def test_invalid_cloak_human_config_json_fails_fast(self):
+        with mock.patch.dict(os.environ, {"CLOAK_HUMAN_CONFIG_JSON": "[]"}, clear=False):
+            with self.assertRaises(ValueError):
+                importlib.reload(config)
+        importlib.reload(config)
+
     def test_effective_profile_respects_chrome_and_cloak(self):
         with mock.patch.object(config, "BROWSER_ENGINE", "cloak"), \
              mock.patch.object(config, "CLOAK_PROFILE_DIR", "cloak-profile"), \

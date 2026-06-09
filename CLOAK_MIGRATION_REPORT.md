@@ -25,22 +25,22 @@ Network-only 429/KPSDK no longer triggers recovery when cards or normal detail c
 
 ## Browser Configuration
 
-Default production browser settings:
+Default production browser settings (do not set a fixed fingerprint seed or storage quota unless explicitly testing that behavior):
 
 ```dotenv
 BROWSER_ENGINE=cloak
 CLOAK_PROFILE_DIR=rea_profile
-CLOAK_FINGERPRINT_SEED=42069
 CLOAK_FINGERPRINT_PLATFORM=windows
-CLOAK_FINGERPRINT_STORAGE_QUOTA=5000
-CLOAK_VIEWPORT_WIDTH=1365
-CLOAK_VIEWPORT_HEIGHT=768
+CLOAK_VIEWPORT=1365x768
 CLOAK_LOCALE=en-AU
 CLOAK_TIMEZONE=Australia/Sydney
-CLOAK_DISABLE_HTTP2=1
+CLOAK_DISABLE_HTTP2=0
+CLOAK_HTTP2_MODE=default
+CLOAK_HUMANIZE=1
+CLOAK_GEOIP=0
 CLOAK_USE_PERSISTENT_CONTEXT=1
 CLOAK_HEADLESS=0
-MODULE2_PROFILE_BASE_DIR=
+MODULE2_PROFILE_BASE_DIR=rea_profile
 LOW_BANDWIDTH_MODE=0
 BLOCK_HEAVY_RESOURCES=0
 BLOCK_TRACKERS=0

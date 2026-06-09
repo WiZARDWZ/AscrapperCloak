@@ -50,6 +50,29 @@ def _module3_retryable_last_result() -> Dict[str, Any] | None:
     return None
 
 
+
+
+def _module3_output_is_reliable(rows: List[Dict[str, Any]]) -> bool:
+    result = getattr(module3_enrich_details.module3_run, "last_result", {}) or {}
+    status = str(result.get("status") or "").lower()
+    if status.startswith("retry_wait"):
+        return False
+    success_count = result.get("success_count")
+    if success_count is not None:
+        try:
+            return int(success_count) > 0
+        except (TypeError, ValueError):
+            return False
+    return any(str(row.get("detail_scraped_at") or row.get("detail_status") or row.get("description") or "").strip() for row in rows)
+
+
+def _module2_retryable_last_result() -> Dict[str, Any] | None:
+    result = getattr(module2_infer_prices.module2_run, "last_result", {}) or {}
+    status = str(result.get("status") or "").lower()
+    if status.startswith("retry_wait") or status in {"retry_wait_browser_recovery", "429_retry_wait"}:
+        return result
+    return None
+
 def _area_slug(search_url: str) -> str:
     slug = search_url.replace("https://", "").replace("http://", "")
     slug = slug.replace("/", "_").replace("?", "_").replace("&", "_").replace("=", "_")
@@ -442,6 +465,12 @@ def full_run_area(
 
     with open(json3, "r", encoding="utf-8") as f:
         rows_after_module3 = json.load(f)
+    if not _module3_output_is_reliable(rows_after_module3):
+        retryable_module3 = _module3_retryable_last_result() or {"reason": "Module3 output unreliable", "retry_after_seconds": getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)}
+        raise RealEstateBlockedError(
+            retryable_module3.get("reason") or "Module3 output unreliable",
+            retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+        )
 
     rows_for_module2 = _module2_targets(rows_after_module3)
 
@@ -474,6 +503,12 @@ def full_run_area(
         if getattr(cancel_token, "is_set", lambda: False)():
             return {"status": "cancelled", "area_id": None, "run_id": None, "excel_path": None, "events_count": 0}
         if not json2:
+            retryable_module2 = _module2_retryable_last_result()
+            if retryable_module2:
+                raise RealEstateBlockedError(
+                    retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
+                    retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                )
             raise RuntimeError("Module2 failed to produce JSON output")
         with open(json2, "r", encoding="utf-8") as f:
             rows_after_module2 = json.load(f)
@@ -615,6 +650,25 @@ def baseline_setup_area(
         raise RuntimeError("Module3 failed to produce JSON output")
     with open(json3, "r", encoding="utf-8") as f:
         rows_after_module3 = json.load(f)
+    if not _module3_output_is_reliable(rows_after_module3):
+        retryable_module3 = _module3_retryable_last_result() or {"reason": "Module3 output unreliable", "retry_after_seconds": getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)}
+        conn = connect(config.DB_PATH)
+        try:
+            upsert_area_monitoring_state(
+                conn,
+                area_id,
+                setup_status="retry_wait",
+                module3_status="retry_wait",
+                module2_status="pending",
+                last_error=retryable_module3.get("reason") or "Module3 output unreliable",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        raise RealEstateBlockedError(
+            retryable_module3.get("reason") or "Module3 output unreliable",
+            retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+        )
     conn = connect(config.DB_PATH)
     try:
         upsert_area_monitoring_state(conn, area_id, setup_status="preparing", module3_status="completed", active_listing_count=len(rows_after_module3))
@@ -669,12 +723,27 @@ def baseline_setup_area(
         if getattr(cancel_token, "is_set", lambda: False)():
             return {"status": "cancelled", "area_id": area_id}
         if not json2:
+            retryable_module2 = _module2_retryable_last_result()
             conn = connect(config.DB_PATH)
             try:
-                upsert_area_monitoring_state(conn, area_id, setup_status="failed", module2_status="failed", last_error="Module2 failed to produce JSON output")
+                if retryable_module2:
+                    upsert_area_monitoring_state(
+                        conn,
+                        area_id,
+                        setup_status="retry_wait",
+                        module2_status="retry_wait",
+                        last_error=retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
+                    )
+                else:
+                    upsert_area_monitoring_state(conn, area_id, setup_status="failed", module2_status="failed", last_error="Module2 failed to produce JSON output")
                 conn.commit()
             finally:
                 conn.close()
+            if retryable_module2:
+                raise RealEstateBlockedError(
+                    retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
+                    retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                )
             raise RuntimeError("Module2 failed to produce JSON output")
         with open(json2, "r", encoding="utf-8") as f:
             rows_after_module2 = json.load(f)
