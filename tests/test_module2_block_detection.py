@@ -8,6 +8,7 @@ sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **k
 
 import module2_infer_prices
 import browser_recovery
+import tools.test_module2_cloak_small_windows as module2_smoke
 from realestate_page_state import PageState, PageStateResult
 
 
@@ -100,7 +101,7 @@ class Module2BlockDetectionTests(unittest.TestCase):
         self.assertEqual(status, "done")
         self.assertIn("target-1", inferred)
         recover.assert_not_called()
-        self.assertTrue(any("Module2 KPSDK same-session recheck attempt=1 state=listings" in msg for msg in logs))
+        self.assertTrue(any("Module2 KPSDK same-page settle attempt=1 state=listings" in msg for msg in logs))
         self.assertTrue(any("Module2 trusted_window=True state=listings" in msg for msg in logs))
 
     def test_kpsdk_then_no_results_is_valid_empty_window(self):
@@ -114,6 +115,33 @@ class Module2BlockDetectionTests(unittest.TestCase):
         recover.assert_not_called()
         wait_cards.assert_not_called()
         self.assertTrue(any("Module2 trusted_window=True state=no_results" in msg for msg in logs))
+
+    def test_module2_kpsdk_same_page_settle_does_not_call_safe_get(self):
+        driver = FakeDriver()
+        blocked = _state(PageState.BLOCKED_KPSDK)
+        listings = _state(PageState.LISTINGS, cards=1, html_length=50000, body_text_length=1200)
+        logs = []
+
+        with mock.patch.object(module2_infer_prices, "wait_for_search_page_state", return_value=(listings, [object()])) as wait_state, \
+             mock.patch.object(module2_infer_prices, "_same_driver_get") as same_get, \
+             mock.patch.object(module2_infer_prices.time, "sleep", return_value=None), \
+             mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
+             mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2):
+            result, cards = module2_infer_prices._module2_same_page_kpsdk_settle(
+                driver,
+                driver.current_url,
+                blocked,
+                [],
+                min_cards=1,
+                timeout=1,
+                log_func=logs.append,
+            )
+
+        self.assertEqual(result.state, PageState.LISTINGS)
+        self.assertEqual(len(cards), 1)
+        wait_state.assert_called_once()
+        same_get.assert_not_called()
+        self.assertTrue(any("same-page settle attempt=1 state=listings" in msg for msg in logs))
 
     def test_persistent_kpsdk_returns_existing_recovery_status(self):
         _inferred, status, recover, _wait_cards, logs = self._run_window([
@@ -136,6 +164,51 @@ class Module2BlockDetectionTests(unittest.TestCase):
         recover.assert_not_called()
         wait_cards.assert_not_called()
         self.assertTrue(any("Module2 trusted_window=False state=render_timeout" in msg for msg in logs))
+
+    def test_no_results_first_window_is_trusted_and_advances_to_next_window(self):
+        driver = FakeDriver()
+        ck = {"inferred_map": {}, "remaining_ids": ["target-1"], "next_window_index": 0, "window_idx": 0, "profile_rotations": 0}
+        states = [
+            _state(PageState.BLOCKED_KPSDK),
+            _state(PageState.NO_RESULTS),
+            _state(PageState.LISTINGS, cards=1, html_length=50000, body_text_length=1200),
+        ]
+        logs = []
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.object(module2_infer_prices, "get_with_retries", return_value=(driver, True, None)), \
+             mock.patch.object(module2_infer_prices, "wait_for_search_page_state", side_effect=[(s, [] if not s.has_cards else [object()]) for s in states]), \
+             mock.patch.object(module2_infer_prices, "wait_for_cards_or_no_results", return_value=("cards", [object()])), \
+             mock.patch.object(module2_infer_prices, "extract_listing_ids_from_cards", return_value={"target-1"}), \
+             mock.patch.object(module2_infer_prices, "recover_browser_after_429") as recover, \
+             mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
+             mock.patch.object(module2_infer_prices.time, "sleep", return_value=None), \
+             mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
+             mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", 0), \
+             mock.patch.object(module2_infer_prices.config, "MODULE2_MIN_WINDOWS_BEFORE_SESSION_RECOVERY", 5):
+            inferred, _driver, status = module2_infer_prices.infer_prices_window_based_with_checkpoint(
+                driver=driver,
+                base_list_url="https://www.realestate.com.au/buy/in-test/list-1",
+                target_ids={"target-1"},
+                window_width=100,
+                step=100,
+                start_low=0,
+                max_high=200,
+                max_pages_per_window=1,
+                wait_timeout=1,
+                ck_path=f"{tmp}/ck.json",
+                ck=ck,
+                log_func=logs.append,
+                sweep_windows=[(0, 100, 100), (100, 200, 100)],
+                max_windows_per_run=2,
+            )
+
+        self.assertEqual(status, "done")
+        self.assertIn("target-1", inferred)
+        recover.assert_not_called()
+        self.assertGreaterEqual(int(ck["window_idx"]), 2)
+        self.assertTrue(any("Module2 trusted_window=True state=no_results" in msg for msg in logs))
 
     def test_test_max_windows_limits_setup_full_sweep(self):
         driver = FakeDriver()
@@ -208,6 +281,56 @@ class Module2BlockDetectionTests(unittest.TestCase):
 
         self.assertEqual(status, "done")
         self.assertEqual(int(ck["window_idx"]), 5)
+
+
+class BrowserRecoveryKpsdkRecheckTests(unittest.TestCase):
+    def test_same_session_kpsdk_recheck_catches_safe_get_exception(self):
+        driver = FakeDriver()
+        logs = []
+        blocked = _state(PageState.BLOCKED_KPSDK)
+        chrome_error = _state(PageState.CHROME_ERROR)
+        chrome_error.current_url = "chrome-error://chromewebdata/"
+
+        def safe_get_raises(_driver, _url):
+            _driver.current_url = "chrome-error://chromewebdata/"
+            raise module2_infer_prices.WebDriverException("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
+
+        result, cards = browser_recovery.same_session_kpsdk_recheck(
+            driver=driver,
+            url="https://www.realestate.com.au/buy/in-test/list-1",
+            wait_func=mock.Mock(return_value=(chrome_error, [])),
+            safe_get_func=safe_get_raises,
+            log_func=logs.append,
+            module_name="Module2",
+            timeout=1,
+            min_cards=1,
+            initial_result=blocked,
+            initial_payload=[],
+        )
+
+        self.assertEqual(result.state, PageState.CHROME_ERROR)
+        self.assertEqual(cards, [])
+        self.assertTrue(any("Module2 KPSDK recheck navigation failed" in msg for msg in logs))
+
+
+class Module2SmallWindowSmokeToolTests(unittest.TestCase):
+    def test_build_summary_reports_graceful_crash_json_fields(self):
+        module2_infer_prices.module2_run.last_result = {"status": "retry_wait_browser_recovery", "target_count": 3, "remaining_count": 2, "session_failure_windows": 1}
+        logs = [
+            "Window 1: between-0-200000 | page 1",
+            "   Module2 trusted_window=True state=no_results",
+            "retry_wait",
+        ]
+
+        summary = module2_smoke.build_summary(logs=logs, crash=False)
+
+        self.assertEqual(summary["status"], "retry_wait_browser_recovery")
+        self.assertEqual(summary["windows_attempted"], 1)
+        self.assertEqual(summary["trusted_windows"], 1)
+        self.assertFalse(summary["crash"])
+        self.assertEqual(summary["inferred_count"], 1)
+        self.assertEqual(summary["session_failure_count"], 1)
+        self.assertTrue(summary["retry_wait_logged"])
 
 
 if __name__ == "__main__":
