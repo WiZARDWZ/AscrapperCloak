@@ -17,7 +17,7 @@ import config
 from json_safe import json_safe
 from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 from module2_price_utils import price_needs_inference as _price_needs_inference_impl
-from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, safe_realestate_get_with_reset, safe_driver_get
 from realestate_page_state import PageState, wait_for_search_page_state
 
 
@@ -132,9 +132,7 @@ def get_with_retries(driver, url, tries=2, *, phase: str = "page", apply_delay: 
 
 
 def _same_driver_get(driver, url: str):
-    _driver, ok, err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
-    if not ok and err:
-        raise err
+    _driver, ok, _err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
     return ok
 
 
@@ -223,6 +221,70 @@ def build_between_url(base_list_url: str, low: int, high: int, page: int = 1) ->
 def _parse_list_page(url: str) -> int | None:
     m = re.search(r"/list-(\d+)", url or "")
     return int(m.group(1)) if m else None
+
+
+def _current_url(driver, state_result=None) -> str:
+    if state_result is not None and getattr(state_result, "current_url", None):
+        return str(state_result.current_url or "")
+    try:
+        return str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        return ""
+
+
+def _is_chrome_error_url(value: str | None) -> bool:
+    return str(value or "").strip().lower().startswith("chrome-error://chromewebdata")
+
+
+def _module2_is_same_page_kpsdk_candidate(driver, requested_url: str, state_result) -> bool:
+    if getattr(state_result, "state", None) != PageState.BLOCKED_KPSDK:
+        return False
+    current_url = _current_url(driver, state_result)
+    if _is_chrome_error_url(current_url):
+        return False
+    current_l = str(current_url or "").lower()
+    requested_l = str(requested_url or "").lower()
+    if "realestate.com.au" not in current_l or "realestate.com.au" not in requested_l:
+        return False
+    current_parsed = urlparse(current_l)
+    requested_parsed = urlparse(requested_l)
+    return (current_parsed.netloc, current_parsed.path) == (requested_parsed.netloc, requested_parsed.path)
+
+
+def _module2_same_page_kpsdk_settle(driver, requested_url: str, state_result, cards, *, min_cards: int, timeout: int | float, log_func):
+    """Let a transient Module2 KPSDK shell hydrate without re-navigating the URL."""
+    if not _module2_is_same_page_kpsdk_candidate(driver, requested_url, state_result):
+        return state_result, cards
+
+    log_func(
+        "   Module2 transient KPSDK detected; same-page settle start "
+        f"state={getattr(state_result, 'state', None)} current_url={_current_url(driver, state_result)} "
+        f"html_length={getattr(state_result, 'html_length', 0) or 0} "
+        f"body_text_length={getattr(state_result, 'body_text_length', 0) or 0}"
+    )
+    rechecks = max(1, int(getattr(config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2)))
+    settle_seconds = max(0.0, float(getattr(config, "BROWSER_KPSDK_SETTLE_SECONDS", 10)))
+    last_result = state_result
+    last_cards = cards or []
+    for attempt in range(1, rechecks + 1):
+        if settle_seconds:
+            time.sleep(settle_seconds)
+        last_result, last_cards = wait_for_search_page_state(driver, timeout=timeout, min_cards=min_cards)
+        log_func(
+            "   Module2 KPSDK same-page settle attempt={attempt} state={state} cards_found={cards} "
+            "html_length={html_len} body_text_length={body_len}".format(
+                attempt=attempt,
+                state=getattr(last_result, "state", None),
+                cards=getattr(last_result, "cards_count", 0),
+                html_len=getattr(last_result, "html_length", 0),
+                body_len=getattr(last_result, "body_text_length", 0),
+            )
+        )
+        if getattr(last_result, "state", None) in {PageState.LISTINGS, PageState.NO_RESULTS}:
+            return last_result, last_cards
+        if getattr(last_result, "state", None) != PageState.BLOCKED_KPSDK:
+            return last_result, last_cards
+    return last_result, last_cards
 
 
 # =========================
@@ -845,18 +907,17 @@ def infer_prices_window_based_with_checkpoint(
                     body_len=state_result.body_text_length,
                 )
             )
-            state_result, cards = same_session_kpsdk_recheck(
-                driver=driver,
-                url=url,
-                wait_func=wait_for_search_page_state,
-                safe_get_func=_same_driver_get,
-                log_func=log_func,
-                module_name="Module2",
-                timeout=wait_timeout,
+            state_result, cards = _module2_same_page_kpsdk_settle(
+                driver,
+                url,
+                state_result,
+                cards,
                 min_cards=1,
-                initial_result=state_result,
-                initial_payload=cards,
+                timeout=wait_timeout,
+                log_func=log_func,
             )
+            if state_result.state == PageState.BLOCKED_KPSDK:
+                log_func("   Module2 KPSDK same-page settle exhausted; leaving state untrusted for recovery policy")
             session_health.record_page_state(state_result)
             trusted_window = state_result.state in {PageState.LISTINGS, PageState.NO_RESULTS}
             log_func(f"   Module2 trusted_window={trusted_window} state={state_result.state}")
@@ -1425,6 +1486,7 @@ def module2_run(
             "stopped_reason": ck.get("stopped_reason"),
             "browser_profile_used": ck.get("current_profile_dir"),
             "browser_recovery_action": ck.get("browser_recovery_action"),
+            "session_failure_windows": ck.get("session_failure_windows", 0),
             **_target_listing_debug(rows, remaining_after),
         })
         log(f"Inferred so far: {len(inferred)} / {len(target_ids)} | remaining={len(remaining_after)}")

@@ -236,7 +236,20 @@ def same_session_kpsdk_recheck(
     for attempt in range(1, rechecks + 1):
         if settle_seconds:
             time.sleep(settle_seconds)
-        safe_get_func(driver, url)
+        try:
+            safe_get_func(driver, url)
+        except Exception as exc:
+            if log_func:
+                log_func(
+                    f"{module_name} KPSDK recheck navigation failed; returning chrome_error/untrusted state "
+                    f"error={config.mask_sensitive_text(exc)}"
+                )
+            try:
+                state_result, payload = _unpack_wait_result(_call_wait_func(wait_func, driver, 0.1, min_cards))
+            except Exception:
+                state_result = classify_current_page(driver)
+                payload = []
+            return state_result, payload
         state_result, payload = _unpack_wait_result(_call_wait_func(wait_func, driver, timeout, min_cards))
         if log_func:
             log_func(
