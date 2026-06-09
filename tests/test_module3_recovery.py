@@ -6,6 +6,7 @@ from unittest import mock
 
 sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **kwargs: None))
 
+import browser_recovery
 import job_queue
 import monitoring_scheduler
 import module3_enrich_details
@@ -83,15 +84,18 @@ def test_module3_chrome_error_recovery_retries_same_detail_and_succeeds(tmp_path
     chrome_unknown = _detail_state(PageState.UNKNOWN, current_url="chrome-error://chromewebdata/", html_length=100, body_text_length=0)
     requested_url = "https://www.realestate.com.au/property-house-nsw-cobar-151402500"
 
+    attempts = {"count": 0}
+
     def fake_safe_get(driver, url, log_func=print):
-        if driver is failed:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
             driver.current_url = "chrome-error://chromewebdata/"
             return False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE")
         driver.current_url = url
         return True, None
 
     with mock.patch.object(module3_enrich_details, "build_driver", return_value=failed), \
-         mock.patch.object(module3_enrich_details, "safe_driver_get", side_effect=fake_safe_get) as safe_get, \
+         mock.patch.object(browser_recovery, "safe_driver_get", side_effect=fake_safe_get) as safe_get, \
          mock.patch.object(module3_enrich_details, "classify_detail_page", return_value=chrome_unknown), \
          mock.patch.object(module3_enrich_details, "wait_for_detail_page_state", return_value=ready), \
          mock.patch.object(module3_enrich_details, "recover_browser_after_429", return_value=(recovered, 1, "rea_profile_recovered", "recovered")) as recover, \
@@ -99,6 +103,7 @@ def test_module3_chrome_error_recovery_retries_same_detail_and_succeeds(tmp_path
          mock.patch.object(module3_enrich_details, "wait_for_detail_ready", return_value=True), \
          mock.patch.object(module3_enrich_details, "extract_detail_data", return_value={"description": "ready"}), \
          mock.patch.object(module3_enrich_details.time, "sleep", return_value=None), \
+         mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
          mock.patch("builtins.print"):
         _csv_path, json_path = module3_enrich_details.module3_run(
             area_search_url="https://www.realestate.com.au/buy/in-cobar,+nsw+2835/list-1",
@@ -112,7 +117,7 @@ def test_module3_chrome_error_recovery_retries_same_detail_and_succeeds(tmp_path
     rows = json.loads(Path(json_path).read_text(encoding="utf-8"))
     assert rows[0]["description"] == "ready"
     assert [call.args[1] for call in safe_get.call_args_list[:2]] == [requested_url, requested_url]
-    recover.assert_called_once()
+    recover.assert_not_called()
 
 
 def test_module3_transient_detail_kpsdk_settles_without_recovery(tmp_path):
@@ -123,7 +128,7 @@ def test_module3_transient_detail_kpsdk_settles_without_recovery(tmp_path):
     logs = []
 
     with mock.patch.object(module3_enrich_details, "build_driver", return_value=driver), \
-         mock.patch.object(module3_enrich_details, "safe_driver_get", return_value=(True, None)) as safe_get, \
+         mock.patch.object(browser_recovery, "safe_driver_get", return_value=(True, None)) as safe_get, \
          mock.patch.object(module3_enrich_details, "wait_for_detail_page_state", return_value=blocked), \
          mock.patch.object(module3_enrich_details, "classify_detail_page", return_value=ready) as classify, \
          mock.patch.object(module3_enrich_details, "recover_browser_after_429") as recover, \
@@ -134,6 +139,7 @@ def test_module3_transient_detail_kpsdk_settles_without_recovery(tmp_path):
          mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
          mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
          mock.patch.object(module3_enrich_details.time, "sleep", return_value=None), \
+         mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
          mock.patch("builtins.print"):
         _csv_path, json_path = module3_enrich_details.module3_run(
             area_search_url="https://www.realestate.com.au/buy/in-cobar,+nsw+2835/list-1",
@@ -158,10 +164,11 @@ def test_module3_recovery_limit_records_retry_wait_result(tmp_path):
     chrome_unknown = _detail_state(PageState.UNKNOWN, current_url="chrome-error://chromewebdata/", html_length=100, body_text_length=0)
 
     with mock.patch.object(module3_enrich_details, "build_driver", return_value=failed), \
-         mock.patch.object(module3_enrich_details, "safe_driver_get", return_value=(False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"))), \
+         mock.patch.object(browser_recovery, "safe_driver_get", return_value=(False, RuntimeError("Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE"))), \
          mock.patch.object(module3_enrich_details, "classify_detail_page", return_value=chrome_unknown), \
          mock.patch.object(module3_enrich_details, "recover_browser_after_429", return_value=(failed, 0, "rea_profile", "rotation_limit")), \
          mock.patch.object(module3_enrich_details.time, "sleep", return_value=None), \
+         mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
          mock.patch("builtins.print"):
         csv_path, json_path = module3_enrich_details.module3_run(
             area_search_url="https://www.realestate.com.au/buy/in-cobar,+nsw+2835/list-1",

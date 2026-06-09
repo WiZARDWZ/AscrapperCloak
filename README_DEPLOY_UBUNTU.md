@@ -44,6 +44,8 @@ If `packages-microsoft-prod` is already installed, the script reuses it to avoid
 Fill real values on the server only:
 
 ```dotenv
+# Secrets: fill these only on the server. If a token/password was pasted into
+# chat or logs, rotate it before deploying.
 TELEGRAM_BOT_TOKEN=
 DB_HOST=127.0.0.1
 DB_PORT=1433
@@ -54,26 +56,39 @@ DB_DRIVER=ODBC Driver 18 for SQL Server
 DB_ENCRYPT=yes
 DB_TRUST_SERVER_CERTIFICATE=yes
 DB_TIMEOUT=30
+
 HEADLESS=0
+PYTHONUNBUFFERED=1
 PERF_PROFILE=normal
 OUTPUT_DIR=output
 LOG_DIR=logs
 RUNTIME_DIR=runtime
-PYTHONUNBUFFERED=1
 APP_ENV=production
+
 BROWSER_ENGINE=cloak
+BROWSER_USE_RUNTIME_PROFILE_STATE=0
+BROWSER_PAGE_STATE_DEBUG=1
+
+CHROME_PROFILE_DIR=rea_profile
 CLOAK_PROFILE_DIR=rea_profile
-CLOAK_FINGERPRINT_SEED=42069
-CLOAK_FINGERPRINT_PLATFORM=windows
-CLOAK_FINGERPRINT_STORAGE_QUOTA=5000
-CLOAK_VIEWPORT_WIDTH=1365
-CLOAK_VIEWPORT_HEIGHT=768
+MODULE2_PROFILE_BASE_DIR=rea_profile
+
+# Match the successful raw CloakBrowser launch: humanized, no forced HTTP/2
+# disable, no fixed fingerprint seed, and no forced fingerprint storage quota.
+CLOAK_DISABLE_HTTP2=0
+CLOAK_HTTP2_MODE=default
+CLOAK_HUMANIZE=1
+CLOAK_GEOIP=0
 CLOAK_LOCALE=en-AU
 CLOAK_TIMEZONE=Australia/Sydney
-CLOAK_DISABLE_HTTP2=1
+CLOAK_VIEWPORT=1365x768
 CLOAK_USE_PERSISTENT_CONTEXT=1
 CLOAK_HEADLESS=0
-MODULE2_PROFILE_BASE_DIR=
+# Optional only when explicitly needed; do not commit real credentials.
+CLOAK_PROXY=
+# CLOAK_FINGERPRINT_SEED=
+# CLOAK_FINGERPRINT_STORAGE_QUOTA=
+
 LOW_BANDWIDTH_MODE=0
 BLOCK_HEAVY_RESOURCES=0
 BLOCK_TRACKERS=0
@@ -83,16 +98,45 @@ BLOCK_FONTS=0
 BLOCK_MAPS=0
 BLOCK_ADS=0
 BLOCK_ANALYTICS=0
-BROWSER_BLOCK_GRACE_SECONDS=30
-BROWSER_BLOCK_POLL_SECONDS=1.0
-BROWSER_NO_RESULTS_STABLE_SECONDS=1.0
+
+BROWSER_KPSDK_SETTLE_SECONDS=25
+BROWSER_BLOCK_GRACE_SECONDS=45
+BROWSER_BLOCK_POLL_SECONDS=1
+BROWSER_COOLDOWN_ON_429_SECONDS=0
 BROWSER_KPSDK_SAME_SESSION_RECHECKS=2
-BROWSER_KPSDK_SETTLE_SECONDS=10
-BROWSER_PAGE_STATE_DEBUG=1
-BROWSER_USE_RUNTIME_PROFILE_STATE=1
+BROWSER_SAME_URL_MAX_RETRIES=2
+BROWSER_CONSECUTIVE_GOTO_FAILURE_ROTATION_THRESHOLD=4
+BROWSER_CONSECUTIVE_CHROME_ERROR_ROTATION_THRESHOLD=4
+BROWSER_ZERO_SUCCESS_HARD_FAILURE_THRESHOLD=4
+MODULE1_INTER_PAGE_DELAY_SECONDS=10
+MODULE1_INTER_PAGE_DELAY_JITTER_SECONDS=5
+MODULE2_INTER_PAGE_DELAY_SECONDS=10
+MODULE2_INTER_PAGE_DELAY_JITTER_SECONDS=5
+MODULE2_INTER_WINDOW_DELAY_SECONDS=12
+MODULE2_INTER_WINDOW_DELAY_JITTER_SECONDS=6
+MODULE3_INTER_DETAIL_DELAY_SECONDS=10
+MODULE3_INTER_DETAIL_DELAY_JITTER_SECONDS=5
+
+MODULE1_MAX_PROFILE_ROTATIONS_PER_RUN=2
+MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN=2
+MODULE3_MAX_PROFILE_ROTATIONS_PER_RUN=2
+MODULE2_MIN_WINDOWS_BEFORE_SESSION_RECOVERY=5
 ```
 
+
 Optional compatibility names are still accepted by the app: `SQLSERVER_DRIVER`, `SQLSERVER_SERVER`, `SQLSERVER_DATABASE`, `SQLSERVER_USERNAME`, `SQLSERVER_PASSWORD`, `SQLSERVER_ENCRYPT`, and `SQLSERVER_TRUST_SERVER_CERTIFICATE`. Prefer the `DB_*` names for Ubuntu production.
+
+Avoid duplicate keys in `.env`: systemd and python-dotenv use the last value they see, which can hide the intended browser settings. Keep one value per key and never commit real `TELEGRAM_BOT_TOKEN`, `DB_PASSWORD`, `SQLSERVER_PASSWORD`, proxy credentials, or session cookies.
+
+For raw-vs-wrapper diagnostics, compare:
+
+```bash
+python tools/test_cloak_raw_official_rea.py
+python tools/test_cloak_project_helper_rea.py
+xvfb-run -a -s "-screen 0 1365x768x24" python tools/test_module1_cloak_two_pages.py
+```
+
+Both tools should keep `current_url` on `realestate.com.au`, classify the page as `listings`, and avoid fake success if Chrome lands on `chrome-error://chromewebdata/`.
 
 For browser diagnosis, the `LOW_BANDWIDTH_MODE` and `BLOCK_*` values above disable resource blocking so Ubuntu matches the proven Windows browser behavior as closely as possible. Turn them back on only after the normal profile/page flow is confirmed.
 

@@ -16,7 +16,7 @@ from cloak_browser_helper import By, EC, WebDriverWait, TimeoutException, WebDri
 
 from config import AREA_SEARCH_URL
 import config
-from browser_recovery import is_429_page, is_retryable_navigation_error, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_driver_get, UNTRUSTED_RECOVERY_STATES
+from browser_recovery import BrowserSessionHealth, RecoveryPolicy, is_429_page, is_retryable_navigation_error, log_session_health, recover_browser_for_untrusted_state as recover_browser_after_429, same_session_kpsdk_recheck, safe_realestate_get_with_reset, safe_driver_get, UNTRUSTED_RECOVERY_STATES
 from realestate_errors import RealEstateBlockedError
 from realestate_page_state import PageState, classify_detail_page, wait_for_detail_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
@@ -54,11 +54,18 @@ def is_internet_disconnected(err: Exception) -> bool:
     ])
 
 
-def get_with_retries(driver, url, tries=2):
+def get_with_retries(driver, url, tries=2, *, phase: str = "detail", apply_delay: bool = False, log_func=print):
     last_err = None
-    for _ in range(tries):
+    for attempt in range(tries):
         try:
-            ok, exc = safe_driver_get(driver, url)
+            ok, exc = safe_realestate_get_with_reset(
+                driver,
+                url,
+                module_name="Module3",
+                phase=phase,
+                log_func=log_func,
+                apply_delay=apply_delay and attempt == 0,
+            )
             try:
                 driver._module3_last_navigation = {
                     "url": url,
@@ -91,7 +98,7 @@ def get_with_retries(driver, url, tries=2):
 
 
 def _same_driver_get(driver, url: str):
-    _driver, ok, err = get_with_retries(driver, url, tries=2)
+    _driver, ok, err = get_with_retries(driver, url, tries=2, phase="same_url_recheck", apply_delay=False)
     if not ok and err:
         raise err
     return ok
@@ -208,16 +215,19 @@ def _module3_detail_state_is_recoverable(driver, detail_state, navigation_info: 
     return bool(navigation_info.get("navigation_failed") and state not in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD})
 
 
-def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotations_used: int, wait_timeout: int, log):
+def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotations_used: int, wait_timeout: int, log, *, apply_delay: bool = False):
     """Load one detail URL with DOM-first classification and bounded profile recovery."""
     retry_after = int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
     max_rotations = min(config.BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN, config.MODULE3_MAX_PROFILE_ROTATIONS_PER_RUN)
-    max_attempts = max(1, int(getattr(config, "MODULE3_RETRY_SAME_LISTING_AFTER_429", 1)) + max_rotations + 1)
+    max_attempts = max(1, int(getattr(config, "MODULE3_RETRY_SAME_LISTING_AFTER_429", 1)) + max_rotations + int(getattr(config, "BROWSER_SAME_URL_MAX_RETRIES", 2)) + 1)
+    health = BrowserSessionHealth(module_name="Module3")
+    policy = RecoveryPolicy()
     last_state = None
     last_error = None
     for attempt in range(1, max_attempts + 1):
-        driver, ok, err = get_with_retries(driver, url, tries=1)
+        driver, ok, err = get_with_retries(driver, url, tries=1, phase="detail", apply_delay=apply_delay and attempt == 1, log_func=log)
         navigation_info = _module3_last_navigation(driver)
+        health.record_navigation(url, ok, err or navigation_info.get("navigation_error"), _module3_current_url(driver))
         last_error = err or navigation_info.get("navigation_error")
         if ok:
             try:
@@ -231,6 +241,7 @@ def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotati
         else:
             detail_state = classify_detail_page(driver, timeout=True)
         last_state = detail_state
+        health.record_page_state(detail_state)
         log(
             "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
             "html_length={html_len} body_text_length={body_len} attempt={attempt}".format(
@@ -256,11 +267,24 @@ def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotati
             initial_result=detail_state,
         )
         last_state = detail_state
-        if detail_state.state in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
+        health.record_page_state(detail_state)
+        current_url = _module3_current_url(driver, detail_state)
+        trusted_detail_url = (not _module3_is_chrome_error_url(current_url)) and "realestate.com.au" in str(current_url).lower()
+        if detail_state.state in {PageState.DETAIL_READY, PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD} and trusted_detail_url:
+            log_session_health(health, url_type="detail", page_state=detail_state.state, action="success", log_func=log)
             return driver, profile_dir_current, rotations_used, detail_state, True, None
         if not (config.BROWSER_RECOVERY_ON_429 and _module3_detail_state_is_recoverable(driver, detail_state, navigation_info)):
             return driver, profile_dir_current, rotations_used, detail_state, ok, last_error
         reason = _module3_detail_recovery_reason(driver, detail_state, navigation_info)
+        should_same_url_retry = _module3_is_chrome_error_url(_module3_current_url(driver, detail_state)) or bool(navigation_info.get("navigation_failed"))
+        if should_same_url_retry and policy.should_retry_same_profile(health):
+            health.record_same_url_retry(reason)
+            log_session_health(health, url_type="detail", page_state=detail_state.state, action="retry_same_profile", log_func=log)
+            continue
+        if not policy.should_rotate(health, explicit_trusted_block=detail_state.state == PageState.BLOCKED_ACCESS_DENIED):
+            log_session_health(health, url_type="detail", page_state=detail_state.state, action="retry_wait", log_func=log)
+            return driver, profile_dir_current, rotations_used, detail_state, False, RealEstateBlockedError(reason, retry_after_seconds=retry_after)
+        log_session_health(health, url_type="detail", page_state=detail_state.state, action="rotate_profile", log_func=log)
         log(f"Module3 untrusted detail state={detail_state.state} current_url={_module3_current_url(driver, detail_state)}. Recovering profile/session reason={reason}.")
         driver, rotations_used, profile_dir_current, recovery_status = recover_browser_after_429(
             driver=driver,
@@ -273,6 +297,7 @@ def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotati
         )
         if recovery_status != "recovered":
             return driver, profile_dir_current, rotations_used, detail_state, False, RealEstateBlockedError(reason, retry_after_seconds=retry_after)
+        health.record_rotation(reason)
     reason = _module3_detail_recovery_reason(driver, last_state, _module3_last_navigation(driver)) if last_state is not None else config.mask_sensitive_text(last_error or "module3_detail_retry_limit")
     return driver, profile_dir_current, rotations_used, last_state, False, RealEstateBlockedError(reason, retry_after_seconds=retry_after)
 
@@ -1097,13 +1122,15 @@ def module3_run(
     out_dir: str = "output",
     only_if_missing: bool = True,
     wait_timeout: int = 25,
-    sleep_between: float = 0.35,
+    sleep_between: float | None = None,
     empty_retry: int = 1,
     cancel_token=None,
     on_progress=None,
     on_log=None,
 ):
     module3_run.last_result = {"status": "running"}
+    success_count = 0
+    session_failure_count = 0
     os.makedirs(out_dir, exist_ok=True)
 
     def log(msg: str) -> None:
@@ -1146,6 +1173,7 @@ def module3_run(
 
     try:
         driver = build_driver(profile_dir_override=profile_dir_current)
+        attempted_detail_navigations = 0
 
         for idx in range(start_from, len(rows)):
             if getattr(cancel_token, "is_set", lambda: False)():
@@ -1189,15 +1217,21 @@ def module3_run(
                 rotations_used,
                 wait_timeout,
                 log,
+                apply_delay=attempted_detail_navigations > 0,
             )
+            attempted_detail_navigations += 1
             if not ok:
                 consecutive_get_failures += 1
+                if isinstance(err, RealEstateBlockedError) or is_retryable_navigation_error(err):
+                    session_failure_count += 1
+                    module3_run.last_result = _module3_retryable_result(err)
+                    module3_run.last_result["success_count"] = success_count
+                    module3_run.last_result["session_failure_count"] = session_failure_count
+                    save_checkpoint(ck_path, ck)
+                    log("Retryable Module3 browser/navigation interruption. Checkpoint saved without advancing this listing; job should retry_wait.")
+                    return None, None
                 ck["last_index"] = idx
                 save_checkpoint(ck_path, ck)
-                if isinstance(err, RealEstateBlockedError) or is_retryable_navigation_error(err):
-                    module3_run.last_result = _module3_retryable_result(err)
-                    log("Retryable Module3 browser/navigation interruption. Checkpoint saved; job should retry_wait.")
-                    return None, None
                 log("   -> GET failed/timeout (renderer).")
                 if consecutive_get_failures >= 2:
                     log("   -> Restarting driver ...")
@@ -1206,6 +1240,7 @@ def module3_run(
                 continue
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(r, detail_state)
+                success_count += 1
                 done.add(lid)
                 ck["done_listing_ids"] = list(done)
                 ck["last_index"] = idx
@@ -1248,7 +1283,7 @@ def module3_run(
                         return None, None
                     r["detail_error"] = "blocked_after_retries"
                     break
-                driver, ok, err = get_with_retries(driver, url, tries=2)
+                driver, ok, err = get_with_retries(driver, url, tries=2, phase="blocked_retry", apply_delay=False, log_func=log)
                 if not ok:
                     break
             if r.get("detail_error") == "blocked_after_retries":
@@ -1292,6 +1327,14 @@ def module3_run(
                 else:
                     data = {"detail_error": "detail_parse_empty"}
 
+            if _module3_is_chrome_error_url(_module3_current_url(driver)):
+                session_failure_count += 1
+                module3_run.last_result = _module3_retryable_result("chrome_error_after_detail_load")
+                module3_run.last_result["success_count"] = success_count
+                module3_run.last_result["session_failure_count"] = session_failure_count
+                log("Module3 chrome-error before extraction. Checkpoint unchanged for this listing; job should retry_wait.")
+                return None, None
+
             # merge into row
             r["detail_scraped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for k, v in data.items():
@@ -1302,17 +1345,25 @@ def module3_run(
                 else:
                     r[k] = v
 
+            if data and not data.get("detail_error"):
+                success_count += 1
+
             # done + checkpoint
             done.add(lid)
             ck["done_listing_ids"] = list(done)
             ck["last_index"] = idx
             save_checkpoint(ck_path, ck)
 
-            time.sleep(sleep_between)
 
         # خروجی FULL
         out_csv, out_json = write_outputs(rows, out_dir=out_dir)
-        module3_run.last_result = {"status": "completed", "rows": len(rows), "output_json": out_json}
+        if success_count <= 0 and rows:
+            module3_run.last_result = _module3_retryable_result("module3_no_successful_detail_extractions")
+            module3_run.last_result["success_count"] = success_count
+            module3_run.last_result["session_failure_count"] = session_failure_count
+            log("Module3 produced no successful detail extractions; refusing FULL success output and requesting retry_wait.")
+            return None, None
+        module3_run.last_result = {"status": "completed", "rows": len(rows), "output_json": out_json, "success_count": success_count, "session_failure_count": session_failure_count}
         log("\nModule3 done. FULL files saved:")
         log(f" - {out_csv}")
         log(f" - {out_json}")
@@ -1349,7 +1400,7 @@ if __name__ == "__main__":
         out_dir="output",
         only_if_missing=True,
         wait_timeout=25,
-        sleep_between=0.35,
+        sleep_between=None,
         empty_retry=1,
     )
 

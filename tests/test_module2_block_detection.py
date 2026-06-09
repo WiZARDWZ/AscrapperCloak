@@ -122,7 +122,7 @@ class Module2BlockDetectionTests(unittest.TestCase):
             _state(PageState.BLOCKED_KPSDK),
         ])
 
-        self.assertTrue(str(status).startswith("429"))
+        self.assertEqual(status, "retry_wait_browser_recovery")
         recover.assert_not_called()
         self.assertTrue(any("Module2 trusted_window=False state=blocked_kpsdk" in msg for msg in logs))
 

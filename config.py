@@ -1,5 +1,7 @@
+import json
 import os
 import platform
+import re
 import shutil
 from importlib.util import find_spec
 
@@ -38,6 +40,37 @@ def _optional_int_env(name: str, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
     return int(value)
+
+
+def _optional_str_env(name: str, default: str | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text or default
+
+
+def _json_object_env(name: str) -> dict | None:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{name} must be valid JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return parsed
+
+
+def _viewport_env(name: str, default_width: int, default_height: int) -> tuple[int, int]:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default_width, default_height
+    match = re.match(r"^\s*(\d+)\s*[x,]\s*(\d+)\s*$", raw)
+    if not match:
+        raise ValueError(f"{name} must be WIDTHxHEIGHT, e.g. 1365x768")
+    return int(match.group(1)), int(match.group(2))
 
 
 def _windows_default_chrome_path() -> str:
@@ -148,10 +181,24 @@ MODULE2_MAX_PROFILE_ROTATIONS_PER_RUN = 2
 MODULE2_COOLDOWN_ON_429_SECONDS = 60
 MODULE2_PROFILE_BASE_DIR = os.getenv("MODULE2_PROFILE_BASE_DIR", "").strip() or None
 MODULE2_PROFILE_BACKUP_PREFIX = "rea_profile_429_backup_"
-MODULE2_SLEEP_BETWEEN_WINDOWS_MIN = 3
-MODULE2_SLEEP_BETWEEN_WINDOWS_MAX = 7
-MODULE2_SLEEP_BETWEEN_PAGES_MIN = 2
-MODULE2_SLEEP_BETWEEN_PAGES_MAX = 5
+MODULE1_INTER_PAGE_DELAY_SECONDS = float(os.getenv("MODULE1_INTER_PAGE_DELAY_SECONDS", "8"))
+MODULE1_INTER_PAGE_DELAY_JITTER_SECONDS = float(os.getenv("MODULE1_INTER_PAGE_DELAY_JITTER_SECONDS", "4"))
+MODULE1_CHROME_ERROR_RETRY_DELAY_SECONDS = float(os.getenv("MODULE1_CHROME_ERROR_RETRY_DELAY_SECONDS", "3"))
+MODULE1_CHROME_ERROR_NAV_RESET = _bool_env("MODULE1_CHROME_ERROR_NAV_RESET", True)
+MODULE2_INTER_PAGE_DELAY_SECONDS = float(os.getenv("MODULE2_INTER_PAGE_DELAY_SECONDS", "8"))
+MODULE2_INTER_PAGE_DELAY_JITTER_SECONDS = float(os.getenv("MODULE2_INTER_PAGE_DELAY_JITTER_SECONDS", "4"))
+MODULE2_INTER_WINDOW_DELAY_SECONDS = float(os.getenv("MODULE2_INTER_WINDOW_DELAY_SECONDS", "10"))
+MODULE2_INTER_WINDOW_DELAY_JITTER_SECONDS = float(os.getenv("MODULE2_INTER_WINDOW_DELAY_JITTER_SECONDS", "5"))
+MODULE2_CHROME_ERROR_RETRY_DELAY_SECONDS = float(os.getenv("MODULE2_CHROME_ERROR_RETRY_DELAY_SECONDS", "3"))
+MODULE2_CHROME_ERROR_NAV_RESET = _bool_env("MODULE2_CHROME_ERROR_NAV_RESET", True)
+MODULE2_SLEEP_BETWEEN_WINDOWS_MIN = float(os.getenv("MODULE2_SLEEP_BETWEEN_WINDOWS_MIN", str(MODULE2_INTER_WINDOW_DELAY_SECONDS)))
+MODULE2_SLEEP_BETWEEN_WINDOWS_MAX = float(os.getenv("MODULE2_SLEEP_BETWEEN_WINDOWS_MAX", str(MODULE2_INTER_WINDOW_DELAY_SECONDS + MODULE2_INTER_WINDOW_DELAY_JITTER_SECONDS)))
+MODULE2_SLEEP_BETWEEN_PAGES_MIN = float(os.getenv("MODULE2_SLEEP_BETWEEN_PAGES_MIN", str(MODULE2_INTER_PAGE_DELAY_SECONDS)))
+MODULE2_SLEEP_BETWEEN_PAGES_MAX = float(os.getenv("MODULE2_SLEEP_BETWEEN_PAGES_MAX", str(MODULE2_INTER_PAGE_DELAY_SECONDS + MODULE2_INTER_PAGE_DELAY_JITTER_SECONDS)))
+MODULE3_INTER_DETAIL_DELAY_SECONDS = float(os.getenv("MODULE3_INTER_DETAIL_DELAY_SECONDS", "8"))
+MODULE3_INTER_DETAIL_DELAY_JITTER_SECONDS = float(os.getenv("MODULE3_INTER_DETAIL_DELAY_JITTER_SECONDS", "4"))
+MODULE3_CHROME_ERROR_RETRY_DELAY_SECONDS = float(os.getenv("MODULE3_CHROME_ERROR_RETRY_DELAY_SECONDS", "3"))
+MODULE3_CHROME_ERROR_NAV_RESET = _bool_env("MODULE3_CHROME_ERROR_NAV_RESET", True)
 MODULE2_MAX_CONSECUTIVE_TIMEOUT_WINDOWS = 3
 MODULE2_MAX_WINDOWS_PER_RUN = 12
 PRICE_INFERENCE_ENABLED = os.getenv("PRICE_INFERENCE_ENABLED", "true").lower() == "true"
@@ -185,8 +232,13 @@ BROWSER_NO_RESULTS_STABLE_SECONDS = float(os.getenv("BROWSER_NO_RESULTS_STABLE_S
 BROWSER_KPSDK_SAME_SESSION_RECHECKS = int(os.getenv("BROWSER_KPSDK_SAME_SESSION_RECHECKS", "2"))
 BROWSER_KPSDK_SETTLE_SECONDS = float(os.getenv("BROWSER_KPSDK_SETTLE_SECONDS", "10"))
 BROWSER_PAGE_STATE_DEBUG = _bool_env("BROWSER_PAGE_STATE_DEBUG", True)
+BROWSER_SAME_URL_MAX_RETRIES = int(os.getenv("BROWSER_SAME_URL_MAX_RETRIES", "1"))
+BROWSER_CONSECUTIVE_GOTO_FAILURE_ROTATION_THRESHOLD = int(os.getenv("BROWSER_CONSECUTIVE_GOTO_FAILURE_ROTATION_THRESHOLD", "3"))
+BROWSER_CONSECUTIVE_CHROME_ERROR_ROTATION_THRESHOLD = int(os.getenv("BROWSER_CONSECUTIVE_CHROME_ERROR_ROTATION_THRESHOLD", "3"))
+BROWSER_ZERO_SUCCESS_HARD_FAILURE_THRESHOLD = int(os.getenv("BROWSER_ZERO_SUCCESS_HARD_FAILURE_THRESHOLD", "3"))
+MODULE2_MIN_WINDOWS_BEFORE_SESSION_RECOVERY = int(os.getenv("MODULE2_MIN_WINDOWS_BEFORE_SESSION_RECOVERY", "5"))
 
-MODULE3_SLEEP_BETWEEN = 0.35
+MODULE3_SLEEP_BETWEEN = float(os.getenv("MODULE3_SLEEP_BETWEEN", "0"))
 MODULE3_WAIT_TIMEOUT = 25
 MODULE3_EMPTY_RETRY = 1
 
@@ -207,17 +259,29 @@ CHROME_WINDOW_SIZE = PROFILE_SETTINGS["CHROME_WINDOW_SIZE"]
 IMAGES_DISABLED = PROFILE_SETTINGS["IMAGES_DISABLED"]
 BROWSER_ENGINE = os.getenv("BROWSER_ENGINE", "cloak").strip().lower() or "cloak"
 CLOAK_PROFILE_DIR = os.getenv("CLOAK_PROFILE_DIR", os.getenv("CHROME_PROFILE_DIR", "rea_profile"))
-CLOAK_FINGERPRINT_SEED = int(os.getenv("CLOAK_FINGERPRINT_SEED", "42069"))
+CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", _bool_env("HEADLESS", False))
+CLOAK_PROXY = _optional_str_env("CLOAK_PROXY")
+CLOAK_GEOIP = _bool_env("CLOAK_GEOIP", False)
+CLOAK_HUMANIZE = _bool_env("CLOAK_HUMANIZE", BROWSER_ENGINE == "cloak" and not CLOAK_HEADLESS)
+CLOAK_HUMAN_PRESET = _optional_str_env("CLOAK_HUMAN_PRESET")
+CLOAK_HUMAN_CONFIG = _json_object_env("CLOAK_HUMAN_CONFIG_JSON")
+CLOAK_FINGERPRINT_SEED = _optional_str_env("CLOAK_FINGERPRINT_SEED")
 CLOAK_FINGERPRINT_PLATFORM = os.getenv("CLOAK_FINGERPRINT_PLATFORM", "windows")
-CLOAK_FINGERPRINT_STORAGE_QUOTA = int(os.getenv("CLOAK_FINGERPRINT_STORAGE_QUOTA", "5000"))
-CLOAK_VIEWPORT_WIDTH = int(os.getenv("CLOAK_VIEWPORT_WIDTH", "1365"))
-CLOAK_VIEWPORT_HEIGHT = int(os.getenv("CLOAK_VIEWPORT_HEIGHT", "768"))
+CLOAK_FINGERPRINT_STORAGE_QUOTA = _optional_str_env("CLOAK_FINGERPRINT_STORAGE_QUOTA")
+_CLOAK_VIEWPORT_DEFAULT = _viewport_env("CLOAK_VIEWPORT", 1365, 768)
+CLOAK_VIEWPORT_WIDTH = int(os.getenv("CLOAK_VIEWPORT_WIDTH", str(_CLOAK_VIEWPORT_DEFAULT[0])))
+CLOAK_VIEWPORT_HEIGHT = int(os.getenv("CLOAK_VIEWPORT_HEIGHT", str(_CLOAK_VIEWPORT_DEFAULT[1])))
 CLOAK_LOCALE = os.getenv("CLOAK_LOCALE", "en-AU")
 CLOAK_TIMEZONE = os.getenv("CLOAK_TIMEZONE", "Australia/Sydney")
-CLOAK_DISABLE_HTTP2 = _bool_env("CLOAK_DISABLE_HTTP2", True)
+_CLOAK_HTTP2_MODE_RAW = os.getenv("CLOAK_HTTP2_MODE", "").strip().lower()
+if not _CLOAK_HTTP2_MODE_RAW:
+    _CLOAK_HTTP2_MODE_RAW = "disable" if _bool_env("CLOAK_DISABLE_HTTP2", False) else "default"
+if _CLOAK_HTTP2_MODE_RAW not in {"default", "disable", "warmup_only"}:
+    raise ValueError("CLOAK_HTTP2_MODE must be one of: default, disable, warmup_only")
+CLOAK_HTTP2_MODE = _CLOAK_HTTP2_MODE_RAW
+CLOAK_DISABLE_HTTP2 = CLOAK_HTTP2_MODE == "disable"
 CLOAK_USE_PERSISTENT_CONTEXT = _bool_env("CLOAK_USE_PERSISTENT_CONTEXT", True)
 CLOAK_CONTEXT_REUSE_MODE = os.getenv("CLOAK_CONTEXT_REUSE_MODE", "per_driver")
-CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", _bool_env("HEADLESS", False))
 _DEFAULT_BLOCK_RESOURCES = BROWSER_ENGINE != "cloak"
 LOW_BANDWIDTH_MODE = _bool_env("LOW_BANDWIDTH_MODE", _DEFAULT_BLOCK_RESOURCES)
 BLOCK_HEAVY_RESOURCES = _bool_env("BLOCK_HEAVY_RESOURCES", _DEFAULT_BLOCK_RESOURCES)
