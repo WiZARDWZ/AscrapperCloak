@@ -996,6 +996,10 @@ def infer_prices_window_based_with_checkpoint(
                     {"window": window_idx, "page": page, "remaining": len(remaining), "range_low": low, "range_high": high},
                 )
 
+            # TODO(Module2 pagination): Cloak production evidence from Module1 shows same-context
+            # direct driver.get(list-N) can fail for page > 1 while the real Next anchor succeeds.
+            # Add a click-next / fresh-context fallback inside each price window before relying on
+            # direct URL pagination here, preserving inferred rows and checkpoints.
             nav_phase = "window" if page == 1 else "page"
             nav_apply_delay = (page > 1) or (page == 1 and checked_this_run > 1)
             page_nav = "direct_url"
