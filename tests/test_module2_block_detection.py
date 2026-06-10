@@ -69,6 +69,7 @@ class Module2BlockDetectionTests(unittest.TestCase):
              mock.patch.object(module2_infer_prices, "WebDriverWait", FakeWait), \
              mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(module2_infer_prices.config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2), \
+             mock.patch.object(module2_infer_prices.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
              mock.patch.object(browser_recovery.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(browser_recovery.config, "BROWSER_KPSDK_SAME_SESSION_RECHECKS", 2), \
              mock.patch.object(browser_recovery.time, "sleep", return_value=None), \

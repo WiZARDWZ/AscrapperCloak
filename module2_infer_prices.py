@@ -25,6 +25,29 @@ def price_needs_inference(price_text: str | None) -> bool:
     return _price_needs_inference_impl(price_text)
 
 
+def _verbose_page_state_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_PAGE_STATE", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
+def _should_emit_default_log(message: str) -> bool:
+    text = str(message or "")
+    noisy_tokens = ("page_state=", "html_length=", "body_text_length=", "session_health ", "same-page settle", "KPSDK same-session recheck")
+    if any(token in text for token in noisy_tokens) and not _verbose_page_state_enabled():
+        return False
+    return True
+
+
+def _filtered_log_func(log_func):
+    if not log_func:
+        return log_func
+
+    def _log(message: str) -> None:
+        if _should_emit_default_log(message):
+            log_func(message)
+
+    return _log
+
+
 # =========================
 # Selectors
 # =========================
@@ -937,6 +960,7 @@ def infer_prices_window_based_with_checkpoint(
     effective_max_windows = int(config.MODULE2_MAX_WINDOWS_PER_RUN if max_windows_per_run is None else max_windows_per_run)
     checked_this_run = 0
     session_failure_windows = int(ck.get("session_failure_windows", 0) or 0)
+    log_func = _filtered_log_func(log_func)
     log_func(f"Resume: inferred={len(inferred)} remaining={len(remaining)} window_cursor={window_cursor} window_idx={window_idx}")
 
     while window_cursor < len(sweep_windows) and remaining and (effective_max_windows <= 0 or checked_this_run < effective_max_windows):

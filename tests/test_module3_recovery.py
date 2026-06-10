@@ -138,6 +138,7 @@ def test_module3_transient_detail_kpsdk_settles_without_recovery(tmp_path):
          mock.patch.object(module3_enrich_details.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
          mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
          mock.patch.object(module3_enrich_details.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+         mock.patch.object(module3_enrich_details.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
          mock.patch.object(module3_enrich_details.time, "sleep", return_value=None), \
          mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
          mock.patch("builtins.print"):

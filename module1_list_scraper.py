@@ -107,6 +107,25 @@ def is_headless_enabled() -> bool:
     return os.getenv("HEADLESS", "0") == "1"
 
 
+def _verbose_page_state_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_PAGE_STATE", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
+def _verbose_network_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_NETWORK", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
+def _should_emit_default_log(message: str) -> bool:
+    text = str(message or "")
+    noisy_page_tokens = ("page_state=", "html_length=", "body_text_length=", "session_health ", "KPSDK same-session recheck")
+    noisy_network_tokens = ("Page network summary", "Top downloaded resources", "Top domains by transferred bytes", "Resource type totals")
+    if any(token in text for token in noisy_page_tokens) and not _verbose_page_state_enabled():
+        return False
+    if any(token in text for token in noisy_network_tokens) and not _verbose_network_enabled():
+        return False
+    return True
+
+
 def safe_get(driver, url: str, *, phase: str = "list", apply_delay: bool = False, log_func=print):
     """Navigate while retaining retryable failures for DOM-first recovery decisions."""
     ok, exc = safe_realestate_get_with_reset(
@@ -990,6 +1009,8 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
     recovery_policy = RecoveryPolicy()
 
     def log(msg: str) -> None:
+        if not _should_emit_default_log(msg):
+            return
         print(msg)
         if on_log:
             try:
@@ -1174,6 +1195,8 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
     scrape_search.last_result = {"status": "running", "rows": 0, "stop_reason": None, "page_state": None}
 
     def log(msg: str) -> None:
+        if not _should_emit_default_log(msg):
+            return
         print(msg)
         if on_log:
             try:

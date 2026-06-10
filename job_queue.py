@@ -58,6 +58,32 @@ PRIORITY_PRICE_REFRESH = 35
 PRIORITY_DAILY_SWEEP = 45
 PRIORITY_MAINTENANCE = 40
 
+JOB_STALE_TIMEOUT_ENV_NAMES: dict[str, str] = {
+    JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS: "JOB_STALE_TIMEOUT_MINUTES_LIGHT_CHECK",
+    JOB_TYPE_PROCESS_NEW_LISTING: "JOB_STALE_TIMEOUT_MINUTES_PROCESS_NEW_LISTING",
+    JOB_TYPE_DETAIL_REFRESH_EXISTING: "JOB_STALE_TIMEOUT_MINUTES_DETAIL_REFRESH",
+    JOB_TYPE_MODULE2_PRICE_REFRESH_AREA: "JOB_STALE_TIMEOUT_MINUTES_MODULE2_REFRESH",
+    JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP: "JOB_STALE_TIMEOUT_MINUTES_MODULE1_SWEEP",
+    JOB_TYPE_BASELINE_SETUP_AREA: "JOB_STALE_TIMEOUT_MINUTES_BASELINE_SETUP",
+    JOB_TYPE_SETUP_DETAIL_BASELINE: "JOB_STALE_TIMEOUT_MINUTES_SETUP_DETAIL_BASELINE",
+    JOB_TYPE_SETUP_PRICE_BASELINE: "JOB_STALE_TIMEOUT_MINUTES_SETUP_PRICE_BASELINE",
+    JOB_TYPE_PRICE_RETRY_UNKNOWNS: "JOB_STALE_TIMEOUT_MINUTES_PRICE_RETRY_UNKNOWNS",
+    JOB_TYPE_LISTING_STATUS_RECHECK: "JOB_STALE_TIMEOUT_MINUTES_LISTING_STATUS_RECHECK",
+}
+
+JOB_STALE_TIMEOUT_DEFAULT_MINUTES: dict[str, int] = {
+    JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS: 45,
+    JOB_TYPE_PROCESS_NEW_LISTING: 90,
+    JOB_TYPE_DETAIL_REFRESH_EXISTING: 180,
+    JOB_TYPE_MODULE2_PRICE_REFRESH_AREA: 300,
+    JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP: 120,
+    JOB_TYPE_BASELINE_SETUP_AREA: 480,
+    JOB_TYPE_SETUP_DETAIL_BASELINE: 120,
+    JOB_TYPE_SETUP_PRICE_BASELINE: 300,
+    JOB_TYPE_PRICE_RETRY_UNKNOWNS: 180,
+    JOB_TYPE_LISTING_STATUS_RECHECK: 45,
+}
+
 _TEST_STORE: list[dict[str, Any]] | None = None
 _TEST_NEXT_ID = 1
 
@@ -502,6 +528,7 @@ def enqueue_job_once(job_type: str, search_id: int | None = None, user_area_id: 
 
 def claim_next_job(worker_id: str | None = None) -> dict[str, Any] | None:
     ensure_job_tables()
+    recover_stale_running_jobs()
     worker_id = (worker_id or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}")[:200]
     now = _now()
     if _TEST_STORE is not None:
@@ -580,7 +607,7 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
         if retryable and row["AttemptCount"] < int(row.get("MaxAttempts") or 3):
             row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         else:
-            row.update({"Status": "failed", "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
+            row.update({"Status": "failed", "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         return dict(row)
     conn = _connect()
     try:
@@ -590,11 +617,11 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
             SET AttemptCount=AttemptCount+1,
                 Status=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN 'retry_wait' ELSE 'failed' END,
                 RunAfter=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN DATEADD(second, ?, SYSDATETIME()) ELSE RunAfter END,
-                LockedAt=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN NULL ELSE LockedAt END,
-                LockedBy=CASE WHEN ?=1 AND AttemptCount+1 < MaxAttempts THEN NULL ELSE LockedBy END,
+                LockedAt=NULL,
+                LockedBy=NULL,
                 FinishedAt=SYSDATETIME(), LastError=?, UpdatedAt=SYSDATETIME()
             WHERE JobID=?
-        """, 1 if retryable else 0, 1 if retryable else 0, retry_after_seconds, 1 if retryable else 0, 1 if retryable else 0, error_text, int(job_id))
+        """, 1 if retryable else 0, 1 if retryable else 0, retry_after_seconds, error_text, int(job_id))
         conn.commit()
         return {"job_id": int(job_id), "status": "retry_wait_or_failed", "retryable": bool(retryable)}
     finally:
@@ -698,6 +725,205 @@ def cancel_jobs_for_search(search_id: int, reason: Any = "cancelled because area
         if owns_conn:
             conn.close()
 
+
+
+def stale_timeout_minutes_for_job_type(job_type: str | None) -> int:
+    """Return the job-type-aware stale-running timeout in minutes.
+
+    Environment-backed values live in config.py so production can tune recovery
+    without code changes. Unknown job types use JOB_STALE_TIMEOUT_MINUTES_DEFAULT.
+    """
+    normalized = str(job_type or "").strip()
+    env_attr = JOB_STALE_TIMEOUT_ENV_NAMES.get(normalized)
+    fallback = JOB_STALE_TIMEOUT_DEFAULT_MINUTES.get(normalized, int(getattr(config, "JOB_STALE_TIMEOUT_MINUTES_DEFAULT", 120)))
+    if env_attr:
+        return int(getattr(config, env_attr, fallback))
+    return int(getattr(config, "JOB_STALE_TIMEOUT_MINUTES_DEFAULT", fallback))
+
+
+def _job_heartbeat_at(row: dict[str, Any]):
+    values = [row.get("UpdatedAt"), row.get("LockedAt"), row.get("StartedAt")]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def recover_stale_running_jobs(conn=None, now: datetime | None = None) -> dict[str, Any]:
+    """Requeue or fail stale running jobs so dead worker locks cannot block areas.
+
+    A running job is considered stale only when its latest heartbeat timestamp
+    (UpdatedAt preferred via max with LockedAt/StartedAt) is older than the
+    job-type-specific timeout. Jobs with attempts left go back to queued with
+    cleared locks; exhausted jobs move to failed and no longer block dedupe.
+    """
+    ensure_job_tables(conn)
+    now = now or _now()
+    result: dict[str, Any] = {
+        "recovered_count": 0,
+        "failed_count": 0,
+        "stale_job_ids": [],
+        "recovered_job_types": [],
+        "failed_job_types": [],
+    }
+    recovery_note_prefix = "recovered stale running job after worker timeout"
+    failed_note_prefix = "failed after stale running timeout and max attempts reached"
+
+    if _TEST_STORE is not None:
+        for row in _TEST_STORE:
+            if str(row.get("Status") or "").lower() != "running":
+                continue
+            heartbeat_at = _job_heartbeat_at(row)
+            timeout_minutes = stale_timeout_minutes_for_job_type(row.get("JobType"))
+            if heartbeat_at is None or heartbeat_at > now - timedelta(minutes=timeout_minutes):
+                continue
+            job_id = int(row["JobID"])
+            job_type = str(row.get("JobType") or "unknown")
+            result["stale_job_ids"].append(job_id)
+            attempts = int(row.get("AttemptCount") or 0)
+            max_attempts = int(row.get("MaxAttempts") or 3)
+            if attempts < max_attempts:
+                row.update({
+                    "Status": "queued",
+                    "RunAfter": now,
+                    "LockedAt": None,
+                    "LockedBy": None,
+                    "StartedAt": None,
+                    "FinishedAt": None,
+                    "LastError": f"{recovery_note_prefix}: job_type={job_type}, timeout_minutes={timeout_minutes}",
+                    "UpdatedAt": now,
+                })
+                result["recovered_count"] += 1
+                result["recovered_job_types"].append(job_type)
+            else:
+                row.update({
+                    "Status": "failed",
+                    "FinishedAt": now,
+                    "LockedAt": None,
+                    "LockedBy": None,
+                    "LastError": f"{failed_note_prefix}: job_type={job_type}, timeout_minutes={timeout_minutes}",
+                    "UpdatedAt": now,
+                })
+                result["failed_count"] += 1
+                result["failed_job_types"].append(job_type)
+        result["recovered_job_types"] = sorted(set(result["recovered_job_types"]))
+        result["failed_job_types"] = sorted(set(result["failed_job_types"]))
+        return result
+
+    owns_conn = conn is None
+    conn = conn or _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT JobID, JobType, AttemptCount, MaxAttempts, LockedAt, StartedAt, UpdatedAt
+            FROM dbo.Job WITH (UPDLOCK, HOLDLOCK)
+            WHERE Status='running'
+        """)
+        running_rows = _rows_to_dicts(cur)
+        for row in running_rows:
+            heartbeat_at = _job_heartbeat_at(row)
+            timeout_minutes = stale_timeout_minutes_for_job_type(row.get("JobType"))
+            if heartbeat_at is None or heartbeat_at > now - timedelta(minutes=timeout_minutes):
+                continue
+            job_id = int(row["JobID"])
+            job_type = str(row.get("JobType") or "unknown")
+            attempts = int(row.get("AttemptCount") or 0)
+            max_attempts = int(row.get("MaxAttempts") or 3)
+            result["stale_job_ids"].append(job_id)
+            if attempts < max_attempts:
+                cur.execute("""
+                    UPDATE dbo.Job
+                    SET Status='queued',
+                        RunAfter=SYSDATETIME(),
+                        LockedAt=NULL,
+                        LockedBy=NULL,
+                        StartedAt=NULL,
+                        FinishedAt=NULL,
+                        LastError=?,
+                        UpdatedAt=SYSDATETIME()
+                    WHERE JobID=? AND Status='running'
+                """, f"{recovery_note_prefix}: job_type={job_type}, timeout_minutes={timeout_minutes}", job_id)
+                result["recovered_count"] += int(cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)
+                result["recovered_job_types"].append(job_type)
+            else:
+                cur.execute("""
+                    UPDATE dbo.Job
+                    SET Status='failed',
+                        FinishedAt=SYSDATETIME(),
+                        LastError=?,
+                        LockedAt=NULL,
+                        LockedBy=NULL,
+                        UpdatedAt=SYSDATETIME()
+                    WHERE JobID=? AND Status='running'
+                """, f"{failed_note_prefix}: job_type={job_type}, timeout_minutes={timeout_minutes}", job_id)
+                result["failed_count"] += int(cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)
+                result["failed_job_types"].append(job_type)
+        conn.commit()
+        result["recovered_job_types"] = sorted(set(result["recovered_job_types"]))
+        result["failed_job_types"] = sorted(set(result["failed_job_types"]))
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+# Backward-compatible aliases requested by the production incident runbook.
+requeue_stale_running_jobs = recover_stale_running_jobs
+cleanup_stale_job_locks = recover_stale_running_jobs
+
+
+def touch_job_heartbeat(job_id: int) -> dict[str, Any]:
+    """Update UpdatedAt/LockedAt for an actively running job without schema changes."""
+    ensure_job_tables()
+    now = _now()
+    if _TEST_STORE is not None:
+        row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        if str(row.get("Status") or "").lower() == "running":
+            row.update({"UpdatedAt": now, "LockedAt": now})
+        return dict(row)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE dbo.Job
+            SET UpdatedAt=SYSDATETIME(), LockedAt=SYSDATETIME()
+            WHERE JobID=? AND Status='running'
+        """, int(job_id))
+        conn.commit()
+        return {"job_id": int(job_id), "heartbeat_updated": int(cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)}
+    finally:
+        conn.close()
+
+
+def requeue_running_job(job_id: int, reason: Any = "job interrupted before completion", retry_after_seconds: int = 0) -> dict[str, Any]:
+    """Safely release a running job without consuming an attempt."""
+    ensure_job_tables()
+    reason_text = config.mask_sensitive_text(reason)
+    now = _now()
+    if _TEST_STORE is not None:
+        row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        row.update({"Status": "queued", "RunAfter": now + timedelta(seconds=int(retry_after_seconds)), "LockedAt": None, "LockedBy": None, "StartedAt": None, "FinishedAt": None, "LastError": reason_text, "UpdatedAt": now})
+        return dict(row)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE dbo.Job
+            SET Status='queued',
+                RunAfter=DATEADD(second, ?, SYSDATETIME()),
+                LockedAt=NULL,
+                LockedBy=NULL,
+                StartedAt=NULL,
+                FinishedAt=NULL,
+                LastError=?,
+                UpdatedAt=SYSDATETIME()
+            WHERE JobID=? AND Status='running'
+        """, int(retry_after_seconds), reason_text, int(job_id))
+        conn.commit()
+        return {"job_id": int(job_id), "status": "queued", "released_count": int(cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)}
+    finally:
+        conn.close()
 
 def release_stale_running_jobs(max_age_minutes: int = 60) -> dict[str, Any]:
     ensure_job_tables()
