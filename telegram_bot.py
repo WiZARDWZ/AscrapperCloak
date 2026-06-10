@@ -122,13 +122,19 @@ def _safe_register_chat(update: Update) -> None:
 
 def _summarize_scheduler_result(result: dict[str, Any] | None) -> dict[str, Any]:
     result = result or {}
+    stale = result.get("stale_recovery") or {}
     return {
         "status": "completed",
         "created": len(result.get("created") or []),
         "skipped_duplicates": len(result.get("skipped_duplicates") or []),
+        "blocked_by_active_duplicate": len(result.get("skipped_duplicates") or []),
         "ready_searches": len(result.get("ready_search_ids_considered") or []),
         "not_ready_searches": len(result.get("not_ready_search_ids_considered") or []),
         "not_due": len(result.get("not_due") or []),
+        "stale_running_recovered": stale.get("recovered_count", 0),
+        "stale_running_failed": stale.get("failed_count", 0),
+        "stale_job_ids": stale.get("stale_job_ids") or [],
+        "recovered_job_types": stale.get("recovered_job_types") or [],
         "errors": len(result.get("errors") or []),
     }
 
@@ -244,8 +250,20 @@ def ensure_runtime_schema() -> None:
     try:
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
+        recovery = job_queue.recover_stale_running_jobs(conn=conn)
+        logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:
         conn.close()
+
+
+def _summarize_stale_recovery(recovery: dict[str, Any] | None) -> dict[str, Any]:
+    recovery = recovery or {}
+    return {
+        "stale_running_recovered": recovery.get("recovered_count", 0),
+        "stale_running_failed": recovery.get("failed_count", 0),
+        "stale_job_ids": recovery.get("stale_job_ids") or [],
+        "recovered_job_types": recovery.get("recovered_job_types") or [],
+    }
 
 
 async def scheduler_loop() -> None:
@@ -418,15 +436,17 @@ def _status_label(subscription: dict) -> str:
     baseline = str(subscription.get("BaselineStatus") or "pending").lower()
     detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
     price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
-    if baseline == "failed" or detail == "failed" or price == "failed":
-        return "Failed"
-    if detail == "retry_wait":
-        return "Retrying"
-    if baseline == "completed" and detail == "completed" and price != "completed":
-        return "Preparing prices"
     if subscription.get("NotificationReadyAt") and detail == "completed" and price == "completed":
         return "Ready"
-    return "Preparing"
+    if baseline == "failed" or detail == "failed" or price == "failed":
+        return "Failed — retry option coming soon"
+    if baseline == "retry_wait" or detail == "retry_wait" or price == "retry_wait":
+        return "Preparing — retrying setup"
+    if baseline == "running" or detail == "running" or price == "running":
+        return "Preparing — setup in progress"
+    if baseline == "completed" and detail == "completed" and price != "completed":
+        return "Preparing — price setup in progress"
+    return "Preparing — setup queued"
 
 
 def _session(telegram_user_id: int) -> dict:
