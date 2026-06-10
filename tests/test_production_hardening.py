@@ -1,7 +1,9 @@
+import asyncio
 import sys
 import types
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **kwargs: None))
 
@@ -273,3 +275,847 @@ def test_browser_recovery_logs_requested_and_completed(monkeypatch):
     assert profile == "/tmp/new_profile"
     assert any("[recovery] requested" in item and "old_profile=/tmp/old_profile" in item and "job_id=123" in item and "search_id=42" in item for item in logs)
     assert any("[recovery] completed" in item and "new_profile=/tmp/new_profile" in item and "reason=chrome_error:unknown" in item for item in logs)
+
+
+def _running_job(job_type=job_queue.JOB_TYPE_BASELINE_SETUP_AREA, minutes_old=600, attempts=0, max_attempts=3, search_id=2):
+    old = datetime.now() - timedelta(minutes=minutes_old)
+    return {
+        "JobID": 1296,
+        "JobType": job_type,
+        "SearchID": search_id,
+        "UserAreaID": 20,
+        "Priority": 0,
+        "Status": "running",
+        "RunAfter": old,
+        "AttemptCount": attempts,
+        "MaxAttempts": max_attempts,
+        "LockedBy": "test-stale-worker",
+        "LockedAt": old,
+        "StartedAt": old,
+        "FinishedAt": None,
+        "LastError": None,
+        "PayloadJson": '{"area_id": 2, "search_url": "url"}',
+        "DedupeKey": f"{job_queue.JOB_TYPE_BASELINE_SETUP_AREA}:area_id={search_id}",
+        "CreatedAt": old,
+        "UpdatedAt": old,
+    }
+
+
+def test_baseline_setup_area_stale_running_job_recovers_to_queued_and_clears_lock():
+    job_queue.enable_in_memory_store([_running_job(minutes_old=10 * 60, attempts=0, max_attempts=3)])
+    out = job_queue.recover_stale_running_jobs(now=datetime.now())
+    stored = job_queue._TEST_STORE[0]
+    assert out["recovered_count"] == 1
+    assert out["failed_count"] == 0
+    assert out["stale_job_ids"] == [1296]
+    assert stored["Status"] == "queued"
+    assert stored["LockedAt"] is None
+    assert stored["LockedBy"] is None
+    assert stored["StartedAt"] is None
+    assert stored["FinishedAt"] is None
+    assert "recovered stale running job after worker timeout" in stored["LastError"]
+
+
+def test_baseline_setup_area_running_job_not_stale_remains_running():
+    job_queue.enable_in_memory_store([_running_job(minutes_old=60, attempts=0, max_attempts=3)])
+    out = job_queue.recover_stale_running_jobs(now=datetime.now())
+    stored = job_queue._TEST_STORE[0]
+    assert out["recovered_count"] == 0
+    assert stored["Status"] == "running"
+    assert stored["LockedBy"] == "test-stale-worker"
+
+
+def test_stale_running_job_at_max_attempts_is_marked_failed():
+    job_queue.enable_in_memory_store([_running_job(minutes_old=10 * 60, attempts=3, max_attempts=3)])
+    out = job_queue.recover_stale_running_jobs(now=datetime.now())
+    stored = job_queue._TEST_STORE[0]
+    assert out["failed_count"] == 1
+    assert stored["Status"] == "failed"
+    assert stored["LockedAt"] is None
+    assert stored["LockedBy"] is None
+    assert "failed after stale running timeout and max attempts reached" in stored["LastError"]
+
+
+def test_scheduler_not_ready_area_with_stale_baseline_requeues_without_duplicate(monkeypatch):
+    now = datetime.now()
+    stale = _running_job(minutes_old=10 * 60, attempts=0, max_attempts=3, search_id=2)
+    job_queue.enable_in_memory_store([stale])
+    sub = {"UserAreaID": 20, "SearchID": 2, "SearchURL": "url", "BaselineStatus": "pending", "DetailBaselineStatus": "pending", "PriceBaselineStatus": "pending"}
+
+    class Conn:
+        def cursor(self): return self
+        def close(self): pass
+        def execute(self, *a, **k): return self
+        def fetchone(self): return [now]
+
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: [sub])
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, area_id: {"setup_status": "preparing"})
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+    assert out["stale_recovery"]["recovered_count"] == 1
+    assert out["created"] == []
+    assert len(out["skipped_duplicates"]) == 1
+    assert len(job_queue._TEST_STORE) == 1
+    claimed = job_queue.claim_next_job("worker-recovery")
+    assert claimed["JobID"] == 1296
+    assert claimed["Status"] == "running"
+    assert claimed["LockedBy"] == "worker-recovery"
+
+
+def test_scheduler_not_ready_area_with_no_baseline_job_creates_baseline(monkeypatch):
+    now = datetime.now()
+    sub = {"UserAreaID": 20, "SearchID": 2, "SearchURL": "url", "BaselineStatus": "pending", "DetailBaselineStatus": "pending", "PriceBaselineStatus": "pending"}
+
+    class Conn:
+        def cursor(self): return self
+        def close(self): pass
+        def execute(self, *a, **k): return self
+        def fetchone(self): return [now]
+
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: [sub])
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, area_id: {"setup_status": "preparing"})
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+    assert len(out["created"]) == 1
+    assert out["created"][0]["JobType"] == job_queue.JOB_TYPE_BASELINE_SETUP_AREA
+    assert out["created"][0]["DedupeKey"] == "baseline_setup_area:area_id=2"
+
+
+def test_startup_schema_recovers_stale_jobs(monkeypatch):
+    import telegram_bot
+
+    called = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(telegram_bot, "_connect", lambda: Conn())
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(telegram_bot.db_layer, "sanitize_notification_outbox", lambda conn: {"notifications_skipped_by_revalidation": 0})
+    monkeypatch.setattr(telegram_bot.job_queue, "ensure_job_tables", lambda conn=None: None)
+    monkeypatch.setattr(telegram_bot.job_queue, "recover_stale_running_jobs", lambda conn=None: called.append(conn) or {"recovered_count": 1, "failed_count": 0, "stale_job_ids": [1296], "recovered_job_types": [job_queue.JOB_TYPE_BASELINE_SETUP_AREA]})
+    telegram_bot.ensure_runtime_schema()
+    assert len(called) == 1
+
+
+def test_scheduler_summary_includes_stale_recovery_diagnostics():
+    import telegram_bot
+
+    summary = telegram_bot._summarize_scheduler_result({
+        "created": [],
+        "skipped_duplicates": [{}],
+        "ready_search_ids_considered": [],
+        "not_ready_search_ids_considered": [2],
+        "not_due": [],
+        "errors": [],
+        "stale_recovery": {"recovered_count": 1, "failed_count": 0, "stale_job_ids": [1296], "recovered_job_types": [job_queue.JOB_TYPE_BASELINE_SETUP_AREA]},
+    })
+    assert summary["stale_running_recovered"] == 1
+    assert summary["stale_running_failed"] == 0
+    assert summary["stale_job_ids"] == [1296]
+    assert summary["recovered_job_types"] == [job_queue.JOB_TYPE_BASELINE_SETUP_AREA]
+    assert summary["not_ready_searches"] == 1
+    assert summary["blocked_by_active_duplicate"] == 1
+
+
+def test_run_next_job_once_does_not_leave_job_running_on_handled_exception(monkeypatch):
+    job_queue.enable_in_memory_store()
+    job_queue.enqueue_job(job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, search_id=1, max_attempts=1)
+
+    def fail(_job, send_telegram=True):
+        raise RuntimeError("deterministic parser failure")
+
+    monkeypatch.setattr(monitoring_scheduler, "execute_job", fail)
+    monkeypatch.setattr(monitoring_scheduler, "is_retryable_navigation_error", lambda exc: False)
+    out = monitoring_scheduler.run_next_job_once(worker_id="worker-a", send_telegram=False)
+    stored = job_queue._TEST_STORE[0]
+    assert out["status"] == "failed"
+    assert stored["Status"] == "failed"
+    assert stored["LockedAt"] is None
+    assert stored["LockedBy"] is None
+    assert stored["Status"] != "running"
+
+
+
+def test_production_area_setup_status_writes_use_supported_contract():
+    import re
+
+    unsupported = {"completed", "retry_wait", "failed_ingest"}
+    offenders = []
+    for path in ["monitor.py", "monitoring_scheduler.py", "db_layer.py", "telegram_bot.py"]:
+        text = Path(path).read_text(encoding="utf-8")
+        for match in re.finditer(r"setup_status\s*=\s*['\"]([^'\"]+)['\"]", text):
+            if match.group(1) in unsupported:
+                offenders.append(f"{path}:{match.start()}:{match.group(1)}")
+    assert offenders == []
+
+
+def test_baseline_true_no_results_marks_area_ready_and_activates(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): calls.append(("close",))
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "no_results", "stop_reason": "no_results"}
+
+    out = monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
+
+    assert out["status"] == "ready"
+    assert out["active_listing_count"] == 0
+    state_calls = [item for item in calls if item[0] == "state"]
+    assert state_calls[-1][2]["setup_status"] == "ready"
+    assert state_calls[-1][2]["active_listing_count"] == 0
+    assert state_calls[-1][2]["inferred_price_count"] == 0
+    assert state_calls[-1][2]["unknown_price_count"] == 0
+    assert ("activate", 42) in calls
+
+
+def test_baseline_untrusted_zero_rows_fails_without_ready(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: (_ for _ in ()).throw(AssertionError("should not activate")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "render_timeout", "page_state": "render_timeout", "stop_reason": "render_timeout"}
+
+    try:
+        monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
+    except RuntimeError as exc:
+        assert "Module1 returned 0 rows" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert calls[-1]["setup_status"] == "failed"
+    assert calls[-1]["module1_status"] == "failed"
+
+
+def test_retryable_baseline_error_uses_supported_preparing_area_state(monkeypatch):
+    import monitoring_scheduler
+
+    written = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    job = {"JobID": 10, "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "SearchID": 42, "UserAreaID": 7, "PayloadJson": '{"search_url": "url"}'}
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.job_queue if hasattr(monitoring_scheduler, "job_queue") else job_queue, "touch_job_heartbeat", lambda job_id: {})
+    monkeypatch.setattr(monitoring_scheduler, "baseline_setup_area", lambda *a, **k: (_ for _ in ()).throw(RealEstateBlockedError("blocked", retry_after_seconds=60)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: written.append(kwargs))
+
+    out = monitoring_scheduler.execute_job(job, send_telegram=False)
+
+    assert out["status"] == "retry_wait"
+    assert written[-1]["setup_status"] == "preparing"
+    assert written[-1]["module1_status"] == "retry_wait"
+
+
+def test_ingest_failure_uses_failed_setup_status_and_preserves_reason(monkeypatch, tmp_path):
+    import json
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    rows1 = [{"listing_id": "1", "url": "https://example.test/property-1", "price": "$1", "address": "A"}]
+    rows3 = [{"listing_id": "1", "url": "https://example.test/property-1", "price": "$1", "address": "A", "detail_scraped_at": "now"}]
+    json1 = tmp_path / "m1.json"
+    json3 = tmp_path / "m3.json"
+    json1.write_text(json.dumps(rows1), encoding="utf-8")
+    json3.write_text(json.dumps(rows3), encoding="utf-8")
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows1)
+    monkeypatch.setattr(monitor.module1_list_scraper, "save_results", lambda rows, out_dir=None: (str(tmp_path / "m1.csv"), str(json1)))
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (str(tmp_path / "m3.csv"), str(json3)))
+    monitor.module3_enrich_details.module3_run.last_result = {"status": "completed", "success_count": 1}
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (str(tmp_path / "m2.csv"), str(json3)))
+    monitor.module2_infer_prices.module2_run.last_result = {"status": "completed"}
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ingest boom")))
+
+    try:
+        monitor.baseline_setup_area("https://example.test/buy/in-area,+nsw+2999/list-1")
+    except RuntimeError as exc:
+        assert "ingest boom" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert calls[-1]["setup_status"] == "failed"
+    assert calls[-1]["last_error"].startswith("failed_ingest:")
+
+
+def test_retry_setup_area_resets_state_and_dedupes_baseline_job(monkeypatch):
+    job_queue.enable_in_memory_store()
+    executed = []
+
+    class Cursor:
+        def __init__(self): self.rowcount = 1
+        def execute(self, sql, *params):
+            executed.append((str(sql), params))
+            return self
+        def fetchone(self): return (7, 99, 42, "https://example.test/search", "Retryville, NSW 2999")
+        def fetchall(self): return []
+    class Conn:
+        def cursor(self): return Cursor()
+        def commit(self): executed.append(("commit", ()))
+        def rollback(self): pass
+
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "ensure_monitoring_state_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "get_area_monitoring_state", lambda conn, area_id: {"setup_status": "failed"})
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: executed.append(("state", (area_id, kwargs))))
+    monkeypatch.setattr(db_layer, "upsert_user_area_subscription_state", lambda conn, user_id, area_id, **kwargs: executed.append(("substate", (user_id, area_id, kwargs))))
+
+    first = db_layer.retry_setup_area(Conn(), user_area_id=7)
+    second = db_layer.retry_setup_area(Conn(), user_area_id=7)
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert second["reason"] == "baseline_job_already_active"
+    assert len(job_queue._TEST_STORE) == 1
+    state_call = next(item for item in executed if item[0] == "state")
+    assert state_call[1][1]["setup_status"] == "preparing"
+
+
+def test_failed_setup_status_label_and_keyboard_offer_retry_action(monkeypatch):
+    import telegram_bot
+
+    class FakeButton:
+        def __init__(self, text, callback_data=None):
+            self.text = text
+            self.callback_data = callback_data
+
+    class FakeMarkup:
+        def __init__(self, rows):
+            self.inline_keyboard = rows
+
+    monkeypatch.setattr(telegram_bot, "InlineKeyboardButton", FakeButton)
+    monkeypatch.setattr(telegram_bot, "InlineKeyboardMarkup", FakeMarkup)
+    sub = {"UserAreaID": 7, "AreaLabel": "Retryville, NSW 2999", "AreaSetupStatus": "failed", "BaselineStatus": "pending", "DetailBaselineStatus": "pending", "PriceBaselineStatus": "pending"}
+    assert telegram_bot._status_label(sub) == "Failed — tap Retry setup"
+    keyboard = telegram_bot._my_suburbs_keyboard([sub])
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert any(button.callback_data == "retry_setup:7" for button in buttons)
+    assert any("Retry setup" in button.text for button in buttons)
+
+
+class _NotificationFakeBot:
+    def __init__(self, exc=None):
+        self.exc = exc
+        self.sent = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        if self.exc:
+            raise self.exc
+
+
+def test_sender_skips_removed_area_notification_before_send(monkeypatch):
+    import telegram_sender
+
+    calls = []
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 1, "EventID": 10, "ChatID": "100", "MessageText": "hi"}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": False, "reason": "subscription_inactive_or_missing", "cancelled": True})
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_sending", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send")))
+    class Conn:
+        def commit(self): calls.append("commit")
+    bot = _NotificationFakeBot()
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["skipped"] == 1
+    assert out["sent"] == 0
+    assert bot.sent == []
+
+
+def test_sender_skips_disabled_notification_before_send(monkeypatch):
+    import telegram_sender
+
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 2, "EventID": 11, "ChatID": "100", "MessageText": "hi"}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": False, "reason": "notify_disabled", "cancelled": True})
+    class Conn:
+        def commit(self): pass
+    bot = _NotificationFakeBot()
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["skipped"] == 1
+    assert bot.sent == []
+
+
+def test_send_time_validation_rejects_area_not_ready(monkeypatch):
+    row = {
+        "NotificationID": 3,
+        "Status": "queued",
+        "ExistingEventID": 12,
+        "ShouldNotify": 1,
+        "EventType": "price_changed",
+        "Reason": "price_changed",
+        "UserAreaID": 7,
+        "SubscriptionIsActive": 1,
+        "TelegramUserIsActive": 1,
+        "EffectiveNotifyEnabled": 1,
+        "EffectiveSubscriptionStatus": "active",
+        "AreaSetupStatus": "preparing",
+        "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        "EventCreatedAt": datetime(2026, 6, 10, 9, 5, 0),
+    }
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 3)
+
+    assert out["valid"] is False
+    assert out["reason"] == "area_not_ready"
+
+
+def test_send_time_validation_rejects_event_before_notification_ready(monkeypatch):
+    row = {
+        "NotificationID": 4,
+        "Status": "queued",
+        "ExistingEventID": 13,
+        "ShouldNotify": 1,
+        "EventType": "price_changed",
+        "Reason": "price_changed",
+        "UserAreaID": 7,
+        "SubscriptionIsActive": 1,
+        "TelegramUserIsActive": 1,
+        "EffectiveNotifyEnabled": 1,
+        "EffectiveSubscriptionStatus": "active",
+        "AreaSetupStatus": "ready",
+        "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        "EventCreatedAt": datetime(2026, 6, 10, 8, 59, 0),
+    }
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 4)
+
+    assert out["valid"] is False
+    assert out["reason"] == "event_before_notification_ready"
+
+
+def test_send_time_validation_rejects_should_notify_false_false_sold(monkeypatch):
+    row = {"NotificationID": 5, "Status": "queued", "ExistingEventID": 14, "ShouldNotify": 0, "EventType": "sold", "Reason": "weak_sold_evidence"}
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 5)
+
+    assert out["valid"] is False
+    assert out["reason"] == "event_should_notify_false"
+
+
+def test_recover_stale_sending_notifications_requeues_or_fails(monkeypatch):
+    updates = []
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            updates.append((self.sql, params))
+            return self
+        def fetchall(self):
+            if "SELECT NotificationID" in self.sql:
+                return [(1, 1), (2, 5)]
+            return []
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    out = db_layer.recover_stale_sending_notifications(Conn(), stale_minutes=30, max_attempts=5)
+
+    assert out["stale_sending_recovered"] == 1
+    assert out["stale_sending_failed"] == 1
+    assert out["recovered_notification_ids"] == [1]
+    assert out["failed_notification_ids"] == [2]
+    assert any("Status='queued'" in sql for sql, _ in updates)
+    assert any("Status='failed'" in sql for sql, _ in updates)
+
+
+def test_recover_fresh_sending_notifications_does_nothing(monkeypatch):
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            return self
+        def fetchall(self): return []
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    out = db_layer.recover_stale_sending_notifications(Conn(), stale_minutes=30, max_attempts=5)
+
+    assert out["stale_sending_recovered"] == 0
+    assert out["stale_sending_failed"] == 0
+
+
+def test_startup_sanitizer_cancels_old_false_sold_queued_notification(monkeypatch):
+    calls = []
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            return self
+        def fetchall(self): return [(9,)]
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "recover_stale_sending_notifications", lambda conn: {"stale_sending_recovered": 0, "stale_sending_failed": 0})
+    monkeypatch.setattr(db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="startup_outbox_sanitizer": calls.append((nid, reason_prefix)) or {"valid": False, "reason": "event_should_notify_false", "cancelled": True})
+
+    out = db_layer.sanitize_notification_outbox(Conn(), limit=10)
+
+    assert out["notifications_skipped_by_revalidation"] == 1
+    assert calls == [(9, "startup_outbox_sanitizer")]
+
+
+def test_cancel_notifications_for_subscription_scopes_to_one_user_shared_area(monkeypatch):
+    executed = []
+    class Cursor:
+        rowcount = 1
+        def execute(self, sql, *params):
+            executed.append((str(sql), params))
+            return self
+        def fetchone(self): return None
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    count = db_layer.cancel_notifications_for_subscription(Conn(), telegram_user_id=101, search_id=7, reason="removed")
+
+    assert count == 1
+    sql, params = executed[-1]
+    assert "SearchID=?" in sql
+    assert "UserID=?" in sql
+    assert "ChatID IN" in sql
+    assert params[-3:] == (7, 101, 101)
+
+
+def test_telegram_transient_failure_requeues_with_backoff(monkeypatch):
+    import telegram_sender
+
+    calls = []
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 20, "EventID": 30, "ChatID": "100", "MessageText": "hi", "AttemptCount": 0}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": True, "reason": "ok"})
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_sending", lambda conn, nid: calls.append(("sending", nid)))
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_send_error", lambda conn, nid, error, max_attempts, backoff_seconds: calls.append(("retry", nid, backoff_seconds)) or {"status": "queued", "attempts": 1, "backoff_seconds": backoff_seconds})
+    class Conn:
+        def commit(self): calls.append(("commit",))
+    bot = _NotificationFakeBot(exc=TimeoutError("temporary network timeout"))
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["retried"] == 1
+    assert out["failed"] == 0
+    assert any(call[0] == "retry" for call in calls)
+
+
+def test_large_baseline_orchestration_batches_detail_without_inline_module3_or_module2(monkeypatch):
+    import monitor
+
+    rows = [{"listing_id": str(i), "url": f"https://example.test/{i}", "price": "N/A"} for i in range(924)]
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitor.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: calls.append(("ingest", k)) or 77)
+    monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
+
+    out = monitor.baseline_setup_area("https://example.test/search")
+
+    assert out["status"] == "setup_batched"
+    assert out["rows_module1"] == 924
+    assert out["detail_batch_size"] == 50
+    assert out["detail_batches_planned"] == 19
+    assert any(item[0] == "detail_job" for item in calls)
+    ingest_call = next(item for item in calls if item[0] == "ingest")
+    assert ingest_call[1]["emit_events"] is False
+
+
+def test_setup_detail_batch_processes_configured_limit_and_requeues_next(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "DetailBaselineStatus": "running"}
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda search_url, **kwargs: calls.append(("refresh", kwargs)) or {"processed_count": 50, "refreshed_count": 50, "failed_count": 0, "errors": []})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_started", lambda *a, **k: calls.append(("detail_started",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_batch_succeeded", lambda *a, **k: calls.append(("batch_ok",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_detail_baseline_progress", lambda conn, subscription: {"detail_baseline_total_count": 924, "detail_baseline_completed_count": 50, "detail_baseline_remaining_count": 874})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("next_detail", kwargs)) or {"created": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_price_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("price must not enqueue before details complete")))
+
+    out = monitoring_scheduler._run_setup_detail_batch({"JobID": 100, "SearchID": 42}, send_telegram=False)
+
+    assert out["status"] == "detail_baseline_running"
+    refresh = next(item for item in calls if item[0] == "refresh")
+    assert refresh[1]["limit"] == 50
+    assert refresh[1]["suppress_notifications"] is True
+    assert any(item[0] == "next_detail" for item in calls)
+    assert not any(item[0] == "activate" for item in calls)
+
+
+def test_final_setup_detail_batch_enqueues_one_full_price_job(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "DetailBaselineStatus": "running"}
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda *a, **k: {"processed_count": 24, "refreshed_count": 24, "failed_count": 0, "errors": []})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_completed", lambda *a, **k: calls.append(("detail_completed",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_detail_baseline_progress", lambda conn, subscription: {"detail_baseline_total_count": 924, "detail_baseline_completed_count": 924, "detail_baseline_remaining_count": 0})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_price_baseline_job", lambda conn, search_id, **kwargs: calls.append(("price_job", kwargs)) or {"created": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("detail should not requeue when complete")))
+
+    out = monitoring_scheduler._run_setup_detail_batch({"JobID": 101, "SearchID": 42}, send_telegram=False)
+
+    assert out["status"] == "price_baseline_pending"
+    assert sum(1 for item in calls if item[0] == "price_job") == 1
+    assert any(item[0] == "state" and item[1].get("module3_status") == "completed" for item in calls)
+
+
+def test_setup_price_baseline_runs_full_module2_once_and_marks_ready_with_unknowns(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "PriceBaselineStatus": "pending"}
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    def fake_price(search_id, **kwargs):
+        calls.append(("price", kwargs))
+        return {"status": "completed_with_unknowns", "processed_count": 924, "inferred_count": 800, "unknown_count": 124, "module2_runs": [{"sweep_mode": "setup_full_sweep"}]}
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "run_price_baseline_for_search", fake_price)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, search_id: {"setup_status": "preparing", "module1_status": "completed", "module3_status": "completed", "module2_status": "pending"})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_price_baseline_started", lambda *a, **k: calls.append(("price_started",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_price_baseline_completed", lambda *a, **k: calls.append(("price_completed",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_price_baseline_progress", lambda conn, subscription: {"price_baseline_total_count": 924, "price_baseline_completed_count": 924, "price_baseline_remaining_count": 0})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "is_area_setup_ready", lambda conn, search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "activate_area_subscriptions", lambda conn, search_id: calls.append(("activate", search_id)))
+    monkeypatch.setattr(monitoring_scheduler, "_send_setup_summary_once", lambda sub, kind: calls.append(("summary", kind)))
+
+    out = monitoring_scheduler._run_setup_price_batch({"JobID": 200, "SearchID": 42}, send_telegram=True)
+
+    assert out["status"] == "ready"
+    price_call = next(item for item in calls if item[0] == "price")
+    assert price_call[1]["limit"] is None
+    assert price_call[1]["setup"] is True
+    assert ("activate", 42) in calls
+    assert ("summary", "ready") in calls
+    assert any(item[0] == "state" and item[1].get("unknown_price_count") == 124 for item in calls)
+
+
+def test_telegram_setup_status_labels_show_detail_and_price_progress():
+    import telegram_bot
+
+    detail = {
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "running",
+        "AreaModule2Status": "pending",
+        "AreaLastError": "details 150/924",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "running",
+        "PriceBaselineStatus": "pending",
+    }
+    price = {**detail, "AreaModule3Status": "completed", "AreaModule2Status": "running", "DetailBaselineStatus": "completed", "PriceBaselineStatus": "running"}
+    ready = {**price, "AreaSetupStatus": "ready", "NotificationReadyAt": "2026-06-10", "BaselineListingsCollected": 924, "PriceBaselineStatus": "completed"}
+
+    assert telegram_bot._status_label(detail) == "Preparing — details 150/924"
+    assert telegram_bot._status_label(price) == "Preparing — running price setup"
+    assert telegram_bot._status_label(ready) == "Ready — 924 listings monitored"
+
+
+def test_auction_time_label_sanitizer_extracts_short_label_from_full_card_text():
+    raw = """Auction Guide $500,000
+2/50-58 Roslyn Gardens, Rushcutters Bay
+1 bed 1 bath 0 cars
+Inspection tomorrow"""
+
+    assert db_layer.sanitize_auction_time_label(raw) == "Auction Guide $500,000"
+
+
+def test_auction_time_label_sanitizer_preserves_valid_short_label():
+    assert db_layer.sanitize_auction_time_label("Auction Sat 22 Jun") == "Auction Sat 22 Jun"
+
+
+def test_limited_snapshot_fields_are_normalized_before_persistence():
+    row = db_layer.normalize_listing_row({
+        "listing_id": "safe-limits-1",
+        "url": "https://example.test/listing",
+        "address": "12 Example Street" + " very long" * 100,
+        "property_type": "House" + "x" * 200,
+        "AdPriceDisplay": "$500,000" + " guide" * 100,
+        "inspection_short_label": "Inspection tomorrow\n2 bed 1 bath\x00extra text",
+        "auction_label": "Auction Guide $500,000\n2/50-58 Roslyn Gardens\nInspection tomorrow",
+        "agency_name": "Agency" + "x" * 400,
+        "agents": [{"name": "Agent" + "x" * 300, "phone": "123\x00456"}],
+    })
+
+    assert row["auction_label"] == "Auction Guide $500,000"
+    assert "Roslyn" not in row["auction_label"]
+    assert "\n" not in (row["inspection_short_label"] or "")
+    assert "\x00" not in row["agents"][0]["phone"]
+    assert len(row["price_display"]) <= 300
+    assert len(row["address"]) <= 500
+    assert len(row["property_type"]) <= 100
+    assert len(row["agency_name"]) <= 300
+    assert len(row["agents"][0]["name"]) <= 200
+
+
+def test_baseline_setup_with_long_auction_label_batches_without_persistence_failure(monkeypatch):
+    import monitor
+
+    raw_card = """Auction Guide $500,000
+2/50-58 Roslyn Gardens, Rushcutters Bay
+1 bed 1 bath
+Inspection tomorrow"""
+    rows = [{"listing_id": "darlinghurst-1", "url": "https://example.test/1", "price": "$500,000", "auction_label": raw_card}]
+    calls = []
+
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    def fake_ingest(*args, **kwargs):
+        normalized = [db_layer.normalize_listing_row(row) for row in kwargs.get("rows", args[2] if len(args) > 2 else [])]
+        assert normalized[0]["auction_label"] == "Auction Guide $500,000"
+        calls.append(("ingest", kwargs))
+        return 1
+
+    monkeypatch.setattr(monitor.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", fake_ingest)
+    monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
+
+    out = monitor.baseline_setup_area("https://example.test/search")
+
+    assert out["status"] == "setup_batched"
+    assert any(item[0] == "detail_job" for item in calls)
+
+
+def test_telegram_ready_label_uses_area_active_count():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 28,
+        "LiveActiveListingCount": 28,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — 28 listings monitored"
+    assert "no active listings" not in label
+
+
+def test_telegram_ready_label_uses_live_active_count_fallback():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 0,
+        "LiveActiveListingCount": 28,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — 28 listings monitored"
+    assert "no active listings" not in label
+
+
+def test_telegram_ready_label_allows_true_empty_ready_area():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 0,
+        "LiveActiveListingCount": 0,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — no active listings"

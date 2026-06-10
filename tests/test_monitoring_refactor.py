@@ -265,12 +265,13 @@ class MonitoringRefactorTests(unittest.TestCase):
                 mock.patch.object(monitor, "activate_area_subscriptions"),
                 mock.patch.object(monitor, "ingest_full_rows", return_value=77),
                 mock.patch.object(monitor, "upsert_price_inference_state"),
+                mock.patch.object(monitor.db_layer, "enqueue_setup_detail_baseline_job", return_value={"created": True, "JobType": "setup_detail_baseline"}),
                 mock.patch.object(monitor.module1_list_scraper, "scrape_search", side_effect=scrape),
                 mock.patch.object(monitor.module1_list_scraper, "save_results", side_effect=save),
                 mock.patch.object(monitor.module3_enrich_details, "module3_run", side_effect=module3_run),
                 mock.patch.object(monitor.module2_infer_prices, "module2_run", side_effect=module2_run),
             ]
-            with patches[0], patches[1], patches[2], patches[3] as state, patches[4], patches[5] as ingest, patches[6] as price_state, patches[7], patches[8], patches[9], patches[10] as module2_mock:
+            with patches[0], patches[1], patches[2], patches[3] as state, patches[4], patches[5] as ingest, patches[6] as price_state, patches[7], patches[8], patches[9], patches[10], patches[11] as module2_mock:
                 result = monitor.baseline_setup_area("https://example.test/search")
 
         return {
@@ -327,13 +328,10 @@ class MonitoringRefactorTests(unittest.TestCase):
         rows3 = [dict(row, address=f"A{row['listing_id']}") for row in rows1]
         outcome = self._run_mocked_baseline(rows1, rows3)
 
-        self.assertEqual(outcome["calls"], ["module1", "module3", "module2"])
-        self.assertEqual(outcome["module2_call_count"], 1)
-        kwargs = outcome["module2_kwargs"][0]
-        self.assertEqual(kwargs["target_mode"], "all")
-        self.assertEqual(len(kwargs["target_listing_ids"]), 59)
-        self.assertEqual(len(kwargs["input_rows"]), 59)
-        self.assertEqual(outcome["result"]["module2_target_count"], 59)
+        self.assertEqual(outcome["calls"], ["module1"])
+        self.assertEqual(outcome["module2_call_count"], 0)
+        self.assertEqual(outcome["result"]["status"], "setup_batched")
+        self.assertEqual(outcome["result"]["detail_total"], 59)
         outcome["ingest"].assert_called_once()
         self.assertFalse(outcome["ingest"].call_args.kwargs["emit_events"])
 
@@ -342,16 +340,17 @@ class MonitoringRefactorTests(unittest.TestCase):
         rows3 = [dict(row, address=f"A{row['listing_id']}") for row in rows1]
         outcome = self._run_mocked_baseline(rows1, rows3)
 
-        self.assertEqual(outcome["module2_call_count"], 1)
-        self.assertEqual(len(outcome["module2_kwargs"][0]["target_listing_ids"]), 45)
-        self.assertEqual(len(outcome["module2_kwargs"][0]["input_rows"]), 45)
+        self.assertEqual(outcome["module2_call_count"], 0)
+        self.assertEqual(outcome["result"]["status"], "setup_batched")
+        self.assertEqual(outcome["result"]["detail_total"], 45)
 
     def test_direct_price_does_not_exclude_baseline_inference_target(self):
         rows = [{"listing_id": "direct-1", "url": "u1", "price": "$800,000"}]
         outcome = self._run_mocked_baseline(rows, [dict(rows[0], address="A")])
 
-        self.assertEqual(outcome["module2_call_count"], 1)
-        self.assertIn("direct-1", outcome["module2_kwargs"][0]["target_listing_ids"])
+        self.assertEqual(outcome["module2_call_count"], 0)
+        self.assertEqual(outcome["result"]["status"], "setup_batched")
+        self.assertEqual(outcome["result"]["detail_total"], 1)
 
     def test_baseline_ready_when_some_module2_targets_remain_unknown(self):
         rows1 = [{"listing_id": str(i), "url": f"u{i}", "price": "$800,000" if i % 2 == 0 else "N/A"} for i in range(1, 60)]
@@ -363,11 +362,9 @@ class MonitoringRefactorTests(unittest.TestCase):
         ]
         outcome = self._run_mocked_baseline(rows1, rows3, rows2=inferred_rows)
 
-        statuses = [call.args[3] for call in outcome["price_state"].call_args_list]
-        self.assertEqual(statuses.count("completed"), 40)
-        self.assertEqual(statuses.count("unknown_pending_retry"), 19)
-        self.assertEqual(outcome["result"]["status"], "ready")
-        self.assertEqual(outcome["result"]["unknown_price_count"], 19)
+        self.assertEqual(outcome["price_state"].call_count, 0)
+        self.assertEqual(outcome["result"]["status"], "setup_batched")
+        self.assertEqual(outcome["result"]["detail_total"], 59)
 
     def test_module2_render_states_are_retryable_interruptions(self):
         self.assertTrue(monitoring_scheduler._module2_interrupted({"status": "render_timeout"}))
@@ -1434,9 +1431,9 @@ class MonitoringRefactorTests(unittest.TestCase):
     def test_reactivated_area_runs_full_baseline_modules(self):
         rows = [{"listing_id": "1", "url": "u1", "price": "N/A"}]
         outcome = self._run_mocked_baseline(rows, [dict(rows[0], address="A")])
-        self.assertEqual(outcome["calls"], ["module1", "module3", "module2"])
-        self.assertEqual(outcome["module2_kwargs"][0]["target_mode"], "all")
-        self.assertEqual(outcome["result"]["status"], "ready")
+        self.assertEqual(outcome["calls"], ["module1"])
+        self.assertEqual(outcome["module2_call_count"], 0)
+        self.assertEqual(outcome["result"]["status"], "setup_batched")
 
 
 class TelegramExportAndReadyTests(unittest.IsolatedAsyncioTestCase):
