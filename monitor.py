@@ -578,18 +578,35 @@ def baseline_setup_area(
         if module1_state.get("status") == "no_results" or module1_state.get("stop_reason") == "no_results":
             conn = connect(config.DB_PATH)
             try:
-                upsert_area_monitoring_state(conn, area_id, setup_status="completed", module1_status="completed", active_listing_count=0, last_error=None)
+                upsert_area_monitoring_state(
+                    conn,
+                    area_id,
+                    setup_status="ready",
+                    module1_status="completed",
+                    module3_status="completed",
+                    module2_status="completed",
+                    active_listing_count=0,
+                    inferred_price_count=0,
+                    unknown_price_count=0,
+                    last_error=None,
+                    set_ready=True,
+                )
+                activate_area_subscriptions(conn, area_id)
                 conn.commit()
             finally:
                 conn.close()
             return {
-                "status": "success",
+                "status": "ready",
                 "area_id": area_id,
                 "rows_module1": 0,
                 "rows_full": 0,
+                "active_listing_count": 0,
+                "inferred_price_count": 0,
+                "unknown_price_count": 0,
                 "events_count": 0,
                 "stop_reason": "no_results",
                 "page_state": "no_results",
+                "empty_market": True,
             }
         conn = connect(config.DB_PATH)
         try:
@@ -630,7 +647,7 @@ def baseline_setup_area(
                 upsert_area_monitoring_state(
                     conn,
                     area_id,
-                    setup_status="retry_wait",
+                    setup_status="preparing",
                     module3_status="retry_wait",
                     last_error=retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
                 )
@@ -657,7 +674,7 @@ def baseline_setup_area(
             upsert_area_monitoring_state(
                 conn,
                 area_id,
-                setup_status="retry_wait",
+                setup_status="preparing",
                 module3_status="retry_wait",
                 module2_status="pending",
                 last_error=retryable_module3.get("reason") or "Module3 output unreliable",
@@ -730,7 +747,7 @@ def baseline_setup_area(
                     upsert_area_monitoring_state(
                         conn,
                         area_id,
-                        setup_status="retry_wait",
+                        setup_status="preparing",
                         module2_status="retry_wait",
                         last_error=retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
                     )
@@ -758,12 +775,12 @@ def baseline_setup_area(
             upsert_area_monitoring_state(
                 conn,
                 area_id,
-                setup_status="failed_ingest",
+                setup_status="failed",
                 module1_status="completed",
                 module3_status="completed",
                 module2_status="completed" if module2_attempted else "skipped",
                 active_listing_count=len(full_rows),
-                last_error=config.mask_sensitive_text(exc),
+                last_error=f"failed_ingest: {config.mask_sensitive_text(exc)}",
             )
             conn.commit()
         finally:

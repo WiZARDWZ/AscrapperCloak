@@ -122,13 +122,19 @@ def _safe_register_chat(update: Update) -> None:
 
 def _summarize_scheduler_result(result: dict[str, Any] | None) -> dict[str, Any]:
     result = result or {}
+    stale = result.get("stale_recovery") or {}
     return {
         "status": "completed",
         "created": len(result.get("created") or []),
         "skipped_duplicates": len(result.get("skipped_duplicates") or []),
+        "blocked_by_active_duplicate": len(result.get("skipped_duplicates") or []),
         "ready_searches": len(result.get("ready_search_ids_considered") or []),
         "not_ready_searches": len(result.get("not_ready_search_ids_considered") or []),
         "not_due": len(result.get("not_due") or []),
+        "stale_running_recovered": stale.get("recovered_count", 0),
+        "stale_running_failed": stale.get("failed_count", 0),
+        "stale_job_ids": stale.get("stale_job_ids") or [],
+        "recovered_job_types": stale.get("recovered_job_types") or [],
         "errors": len(result.get("errors") or []),
     }
 
@@ -244,8 +250,20 @@ def ensure_runtime_schema() -> None:
     try:
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
+        recovery = job_queue.recover_stale_running_jobs(conn=conn)
+        logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:
         conn.close()
+
+
+def _summarize_stale_recovery(recovery: dict[str, Any] | None) -> dict[str, Any]:
+    recovery = recovery or {}
+    return {
+        "stale_running_recovered": recovery.get("recovered_count", 0),
+        "stale_running_failed": recovery.get("failed_count", 0),
+        "stale_job_ids": recovery.get("stale_job_ids") or [],
+        "recovered_job_types": recovery.get("recovered_job_types") or [],
+    }
 
 
 async def scheduler_loop() -> None:
@@ -404,8 +422,21 @@ def _remove_area_keyboard(areas: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _setup_failed_for_retry(subscription: dict) -> bool:
+    area_status = str(subscription.get("AreaSetupStatus") or "").lower()
+    baseline = str(subscription.get("BaselineStatus") or "pending").lower()
+    detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
+    price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
+    return area_status == "failed" or baseline == "failed" or detail == "failed" or price == "failed"
+
+
 def _my_suburbs_keyboard(areas: list[dict]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"Remove {area.get('AreaLabel') or area.get('SearchURL')}", callback_data=f"remove_select:{area['UserAreaID']}")] for area in areas]
+    rows = []
+    for area in areas:
+        label = area.get("AreaLabel") or area.get("SearchURL")
+        if _setup_failed_for_retry(area):
+            rows.append([InlineKeyboardButton(f"🔁 Retry setup — {label}", callback_data=f"retry_setup:{area['UserAreaID']}")])
+        rows.append([InlineKeyboardButton(f"Remove {label}", callback_data=f"remove_select:{area['UserAreaID']}")])
     rows.append([InlineKeyboardButton(BUTTON_BACK, callback_data="menu:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -418,15 +449,23 @@ def _status_label(subscription: dict) -> str:
     baseline = str(subscription.get("BaselineStatus") or "pending").lower()
     detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
     price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
-    if baseline == "failed" or detail == "failed" or price == "failed":
-        return "Failed"
-    if detail == "retry_wait":
-        return "Retrying"
-    if baseline == "completed" and detail == "completed" and price != "completed":
-        return "Preparing prices"
-    if subscription.get("NotificationReadyAt") and detail == "completed" and price == "completed":
+    area_status = str(subscription.get("AreaSetupStatus") or "").lower()
+    module_statuses = {
+        str(subscription.get("AreaModule1Status") or "").lower(),
+        str(subscription.get("AreaModule3Status") or "").lower(),
+        str(subscription.get("AreaModule2Status") or "").lower(),
+    }
+    if subscription.get("NotificationReadyAt") and (area_status == "ready" or (detail == "completed" and price == "completed")):
         return "Ready"
-    return "Preparing"
+    if _setup_failed_for_retry(subscription):
+        return "Failed — tap Retry setup"
+    if "retry_wait" in module_statuses or baseline == "retry_wait" or detail == "retry_wait" or price == "retry_wait":
+        return "Preparing — retrying setup"
+    if area_status == "preparing" or "running" in module_statuses or baseline == "running" or detail == "running" or price == "running":
+        return "Preparing — setup in progress"
+    if baseline == "completed" and detail == "completed" and price != "completed":
+        return "Preparing — price setup in progress"
+    return "Preparing — setup queued"
 
 
 def _session(telegram_user_id: int) -> dict:
@@ -645,6 +684,35 @@ async def handle_remove_callback(update: Update, context: ContextTypes.DEFAULT_T
     await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
 
 
+async def handle_retry_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    telegram_user_id = register_chat(update)
+    try:
+        user_area_id = int(query.data.split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        await query.edit_message_text("That retry request is invalid. Please open My suburbs and try again.")
+        return
+    conn = _connect()
+    try:
+        areas = db_layer.list_user_area_subscriptions(conn, telegram_user_id)
+        area = next((item for item in areas if int(item["UserAreaID"]) == user_area_id), None)
+        if not area:
+            await query.edit_message_text("That suburb is no longer active for your account.")
+            return
+        result = db_layer.retry_setup_area(conn, user_area_id=user_area_id)
+    finally:
+        conn.close()
+    label = area.get("AreaLabel") or result.get("area_label") or "that suburb"
+    if result.get("reason") == "active_subscription_not_found":
+        await query.edit_message_text(f"{label} is no longer active for your account.")
+    elif result.get("created"):
+        await query.edit_message_text(f"🔁 Retrying setup for {label}. I’ll notify you when it is ready.")
+    else:
+        await query.edit_message_text(f"🔁 Setup retry is already queued or running for {label}. I’ll notify you when it is ready.")
+    await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     action = update.callback_query.data.split(":", 1)[1]
     await update.callback_query.answer()
@@ -815,6 +883,7 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CallbackQueryHandler(handle_area_callback, pattern="^(area_candidate:|area_confirm:).+"))
     app.add_handler(CallbackQueryHandler(handle_remove_callback, pattern="^(remove_select:|remove_confirm:).+"))
+    app.add_handler(CallbackQueryHandler(handle_retry_setup_callback, pattern="^retry_setup:"))
     app.add_handler(CallbackQueryHandler(handle_export_area_selection, pattern="^export_area:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
