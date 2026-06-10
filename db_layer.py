@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -12,6 +13,8 @@ import pyodbc
 import config
 import listing_change_detector
 from area_parser import parse_area_to_sqm
+
+logger = logging.getLogger(__name__)
 
 MISSING_TOKENS = {"", "n/a", "na", "-", "—", "null", "none"}
 NUMERIC_MISSING_EXTRA = {"unknown"}
@@ -321,6 +324,77 @@ def clean_text(value: Any, max_len: Optional[int] = None, none_if_missing: bool 
         out = out[:max_len]
     return out
 
+
+def _strip_unsafe_control_chars(value: str) -> str:
+    # SQL Server string columns should never receive embedded NULs or low
+    # control characters from scraped DOM text. Preserve normal whitespace here;
+    # callers decide whether to collapse it for labels.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value)
+
+
+def clean_limited_text(value: Any, max_len: int, *, none_if_missing: bool = True, field_name: str | None = None, normalize_whitespace: bool = True) -> Optional[str]:
+    if value is None:
+        return None if none_if_missing else ""
+    out = _strip_unsafe_control_chars(str(value)).strip()
+    if normalize_whitespace:
+        out = re.sub(r"\s+", " ", out).strip()
+    if none_if_missing and is_missing(out):
+        return None
+    if max_len and len(out) > max_len:
+        logger.debug("Truncating scraped text field %s from %s to %s characters", field_name or "unknown", len(out), max_len)
+        out = out[:max_len].rstrip()
+    return out
+
+
+_AUCTION_LABEL_RE = re.compile(r"\bauction\b", re.I)
+_FULL_CARD_HINT_RE = re.compile(
+    r"\b(?:bed|beds|bath|baths|car|cars|parking|inspection|inspect|open\s+home|agent|agency|sqm|m²|studio)\b|\d+\s*/\s*\d+|\d+\s+[A-Za-z].*(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|gardens|gdn|crescent|cres)\b",
+    re.I,
+)
+
+
+def _short_label_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw = _strip_unsafe_control_chars(str(value)).replace("\r", "\n")
+    return [re.sub(r"\s+", " ", line).strip() for line in raw.split("\n") if re.sub(r"\s+", " ", line).strip()]
+
+
+def sanitize_auction_time_label(value: Any, max_len: int = 100) -> Optional[str]:
+    """Return a short auction label or None; never persist full listing-card text."""
+    lines = _short_label_lines(value)
+    if not lines:
+        return None
+    source = str(value)
+    candidate = next((line for line in lines if _AUCTION_LABEL_RE.search(line)), lines[0] if len(lines) == 1 else None)
+    if not candidate:
+        logger.debug("Dropping multi-line auction label without auction marker")
+        return None
+    multi_line = len(lines) > 1
+    if not _AUCTION_LABEL_RE.search(candidate):
+        return None
+    if len(candidate) > max_len * 2:
+        logger.debug("Dropping overlong auction label candidate (%s chars)", len(candidate))
+        return None
+    if multi_line and _FULL_CARD_HINT_RE.search(candidate) and len(candidate) > 60:
+        logger.debug("Dropping auction label candidate that resembles full card text")
+        return None
+    sanitized = clean_limited_text(candidate, max_len, field_name="AuctionTimeLabel")
+    if sanitized and sanitized != re.sub(r"\s+", " ", _strip_unsafe_control_chars(source)).strip():
+        logger.debug("Sanitized AuctionTimeLabel from scraped card text")
+    return sanitized
+
+
+def sanitize_snapshot_label(value: Any, max_len: int, field_name: str) -> Optional[str]:
+    lines = _short_label_lines(value)
+    if not lines:
+        return None
+    if len(lines) > 1:
+        preferred = next((line for line in lines if re.search(r"\b(?:inspection|inspect|open|auction)\b", line, re.I)), lines[0])
+    else:
+        preferred = lines[0]
+    return clean_limited_text(preferred, max_len, field_name=field_name)
+
 def to_int(value: Any) -> Optional[int]:
     if is_missing(value, numeric_or_date=True):
         return None
@@ -590,8 +664,8 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
         ext = extract_external_listing_id(row)
     except ValueError as exc:
         raise ValueError("bad_listing_id") from exc
-    detail_price_display = clean_text(row.get("detail_price_display"), 300)
-    row_price_display = clean_text(row.get("AdPriceDisplay") or row.get("ad_price_display") or row.get("price_display") or row.get("CurrentPriceDisplay") or row.get("price"), 300)
+    detail_price_display = clean_limited_text(row.get("detail_price_display"), 300, field_name="PriceDisplay")
+    row_price_display = clean_limited_text(row.get("AdPriceDisplay") or row.get("ad_price_display") or row.get("price_display") or row.get("CurrentPriceDisplay") or row.get("price"), 300, field_name="PriceDisplay")
 
     detail_low, detail_high = parse_price_range(detail_price_display) if detail_price_display else (None, None)
     row_low, row_high = parse_price_range(row_price_display) if row_price_display else (None, None)
@@ -614,22 +688,23 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
     price_value = low if low is not None and high is not None and low == high else None
     parking_raw = row.get("parking")
     parking = 0 if isinstance(parking_raw, str) and parking_raw.strip().lower() in {"no parking", "no garage"} else to_tinyint(parking_raw)
-    land_size_display = clean_text(_first_row_value(row, "LandSizeDisplay", "land_size_display"), 100)
-    building_size_display = clean_text(_first_row_value(row, "BuildingSizeDisplay", "building_size_display"), 100)
-    floor_area_display = clean_text(_first_row_value(row, "FloorAreaDisplay", "floor_area_display"), 100)
+    land_size_display = clean_limited_text(_first_row_value(row, "LandSizeDisplay", "land_size_display"), 100, field_name="LandSizeDisplay")
+    building_size_display = clean_limited_text(_first_row_value(row, "BuildingSizeDisplay", "building_size_display"), 100, field_name="BuildingSizeDisplay")
+    floor_area_display = clean_limited_text(_first_row_value(row, "FloorAreaDisplay", "floor_area_display"), 100, field_name="FloorAreaDisplay")
+    auction_label_source = _first_row_value(row, "auction_label", "AuctionTimeLabel", "auction_time_label", "auction_time")
     agents_in = row.get("agents") or []
     agents = []
     for a in agents_in:
         if isinstance(a, str):
             a = {"name": a}
-        name = clean_text(a.get("name"), 200)
+        name = clean_limited_text(a.get("name"), 200, field_name="AgentName")
         if not name:
             continue
-        agents.append({"name": name, "phone": clean_text(a.get("phone"), 80), "profile_url": clean_text(a.get("profile_url"), 600), "external_id": clean_text(a.get("external_id"), 120)})
+        agents.append({"name": name, "phone": clean_limited_text(a.get("phone"), 80, field_name="AgentPhoneNumber"), "profile_url": clean_limited_text(a.get("profile_url"), 600, field_name="AgentProfileURL"), "external_id": clean_limited_text(a.get("external_id"), 120, field_name="AgentExternalID")})
     return {
         "external_id": ext,
-        "address": clean_text(row.get("address"), 500),
-        "property_type": clean_text(row.get("property_type"), 100) or "unknown",
+        "address": clean_limited_text(row.get("address"), 500, field_name="Address"),
+        "property_type": clean_limited_text(row.get("property_type"), 100, field_name="PropertyType") or "unknown",
         "bedrooms": to_tinyint(row.get("bedrooms")),
         "bathrooms": to_tinyint(row.get("bathrooms")),
         "parking": parking,
@@ -641,22 +716,22 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "building_size_sqm": _area_decimal(row, "BuildingSizeSqm", "BuildingSizeDisplay"),
         "floor_area_display": floor_area_display,
         "floor_area_sqm": _area_decimal(row, "FloorAreaSqm", "FloorAreaDisplay"),
-        "agency_name": clean_text(row.get("agency_name") or row.get("agency"), 300),
-        "agency_external_code": clean_text(row.get("agency_code"), 120),
-        "agency_profile_url": clean_text(row.get("agency_profile_url"), 600),
-        "agency_phone": clean_text(row.get("agency_phone"), 80),
-        "agency_address": clean_text(row.get("agency_address"), 500),
+        "agency_name": clean_limited_text(row.get("agency_name") or row.get("agency"), 300, field_name="AgencyName"),
+        "agency_external_code": clean_limited_text(row.get("agency_code"), 120, field_name="AgencyExternalCode"),
+        "agency_profile_url": clean_limited_text(row.get("agency_profile_url"), 600, field_name="AgencyProfileURL"),
+        "agency_phone": clean_limited_text(row.get("agency_phone"), 80, field_name="AgencyPhone"),
+        "agency_address": clean_limited_text(row.get("agency_address"), 500, field_name="AgencyAddress"),
         "agents": agents,
         "price_display": price_display,
         "price_value": price_value,
         "price_low": low,
         "price_high": high,
         "price_method": pm,
-        "description": clean_text(row.get("description"), 4000),
-        "inspection_short_label": clean_text(row.get("inspection_short_label"), 200),
-        "inspection_long_label": clean_text(row.get("inspection_long_label"), 500),
-        "auction_label": clean_text(row.get("auction_label"), 200),
-        "url": clean_text(row.get("url"), 1000),
+        "description": clean_limited_text(row.get("description"), 4000, field_name="Description", normalize_whitespace=False),
+        "inspection_short_label": sanitize_snapshot_label(row.get("inspection_short_label"), 200, "InspectionShort"),
+        "inspection_long_label": sanitize_snapshot_label(row.get("inspection_long_label"), 500, "InspectionLong"),
+        "auction_label": sanitize_auction_time_label(auction_label_source),
+        "url": clean_limited_text(row.get("url"), 1000, field_name="ListingURL"),
     }
 
 def _upsert_search(conn, url):
@@ -4381,7 +4456,8 @@ def list_user_area_subscriptions(conn, telegram_user_id: int, active_only: bool 
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4408,7 +4484,8 @@ def get_user_area_subscription(conn, user_area_id: int) -> dict | None:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4506,7 +4583,8 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -5148,7 +5226,8 @@ def get_active_user_area_subscriptions_for_search(conn, search_id: int) -> list[
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas

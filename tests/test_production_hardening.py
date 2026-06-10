@@ -994,3 +994,128 @@ def test_telegram_setup_status_labels_show_detail_and_price_progress():
     assert telegram_bot._status_label(detail) == "Preparing — details 150/924"
     assert telegram_bot._status_label(price) == "Preparing — running price setup"
     assert telegram_bot._status_label(ready) == "Ready — 924 listings monitored"
+
+
+def test_auction_time_label_sanitizer_extracts_short_label_from_full_card_text():
+    raw = """Auction Guide $500,000
+2/50-58 Roslyn Gardens, Rushcutters Bay
+1 bed 1 bath 0 cars
+Inspection tomorrow"""
+
+    assert db_layer.sanitize_auction_time_label(raw) == "Auction Guide $500,000"
+
+
+def test_auction_time_label_sanitizer_preserves_valid_short_label():
+    assert db_layer.sanitize_auction_time_label("Auction Sat 22 Jun") == "Auction Sat 22 Jun"
+
+
+def test_limited_snapshot_fields_are_normalized_before_persistence():
+    row = db_layer.normalize_listing_row({
+        "listing_id": "safe-limits-1",
+        "url": "https://example.test/listing",
+        "address": "12 Example Street" + " very long" * 100,
+        "property_type": "House" + "x" * 200,
+        "AdPriceDisplay": "$500,000" + " guide" * 100,
+        "inspection_short_label": "Inspection tomorrow\n2 bed 1 bath\x00extra text",
+        "auction_label": "Auction Guide $500,000\n2/50-58 Roslyn Gardens\nInspection tomorrow",
+        "agency_name": "Agency" + "x" * 400,
+        "agents": [{"name": "Agent" + "x" * 300, "phone": "123\x00456"}],
+    })
+
+    assert row["auction_label"] == "Auction Guide $500,000"
+    assert "Roslyn" not in row["auction_label"]
+    assert "\n" not in (row["inspection_short_label"] or "")
+    assert "\x00" not in row["agents"][0]["phone"]
+    assert len(row["price_display"]) <= 300
+    assert len(row["address"]) <= 500
+    assert len(row["property_type"]) <= 100
+    assert len(row["agency_name"]) <= 300
+    assert len(row["agents"][0]["name"]) <= 200
+
+
+def test_baseline_setup_with_long_auction_label_batches_without_persistence_failure(monkeypatch):
+    import monitor
+
+    raw_card = """Auction Guide $500,000
+2/50-58 Roslyn Gardens, Rushcutters Bay
+1 bed 1 bath
+Inspection tomorrow"""
+    rows = [{"listing_id": "darlinghurst-1", "url": "https://example.test/1", "price": "$500,000", "auction_label": raw_card}]
+    calls = []
+
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    def fake_ingest(*args, **kwargs):
+        normalized = [db_layer.normalize_listing_row(row) for row in kwargs.get("rows", args[2] if len(args) > 2 else [])]
+        assert normalized[0]["auction_label"] == "Auction Guide $500,000"
+        calls.append(("ingest", kwargs))
+        return 1
+
+    monkeypatch.setattr(monitor.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", fake_ingest)
+    monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
+
+    out = monitor.baseline_setup_area("https://example.test/search")
+
+    assert out["status"] == "setup_batched"
+    assert any(item[0] == "detail_job" for item in calls)
+
+
+def test_telegram_ready_label_uses_area_active_count():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 28,
+        "LiveActiveListingCount": 28,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — 28 listings monitored"
+    assert "no active listings" not in label
+
+
+def test_telegram_ready_label_uses_live_active_count_fallback():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 0,
+        "LiveActiveListingCount": 28,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — 28 listings monitored"
+    assert "no active listings" not in label
+
+
+def test_telegram_ready_label_allows_true_empty_ready_area():
+    import telegram_bot
+
+    label = telegram_bot._status_label({
+        "AreaSetupStatus": "ready",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
+        "NotificationReadyAt": "2026-06-10",
+        "AreaActiveListingCount": 0,
+        "LiveActiveListingCount": 0,
+        "BaselineListingsCollected": 0,
+    })
+
+    assert label == "Ready — no active listings"

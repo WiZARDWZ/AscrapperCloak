@@ -459,6 +459,31 @@ def _remove_confirm_keyboard(user_area_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, remove", callback_data=f"remove_confirm:{int(user_area_id)}"), InlineKeyboardButton("❌ Cancel", callback_data="remove_confirm:cancel")]])
 
 
+def _safe_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ready_active_listing_count(subscription: dict) -> tuple[int | None, bool]:
+    stored = _safe_int(subscription.get("AreaActiveListingCount"))
+    live = _safe_int(subscription.get("LiveActiveListingCount"))
+    baseline = _safe_int(subscription.get("BaselineListingsCollected"))
+    for count in (stored, live, baseline):
+        if count is not None and count > 0:
+            return count, True
+    if stored == 0 and live == 0:
+        return 0, True
+    if stored == 0 and live is None and baseline == 0:
+        return 0, True
+    if live == 0 and stored is None and baseline == 0:
+        return 0, True
+    return None, False
+
+
 def _status_label(subscription: dict) -> str:
     baseline = str(subscription.get("BaselineStatus") or "pending").lower()
     detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
@@ -468,13 +493,13 @@ def _status_label(subscription: dict) -> str:
     module3 = str(subscription.get("AreaModule3Status") or "").lower()
     module2 = str(subscription.get("AreaModule2Status") or "").lower()
     module_statuses = {module1, module3, module2}
-    active_count = subscription.get("BaselineListingsCollected") or subscription.get("AreaActiveListingCount")
     if subscription.get("NotificationReadyAt") and (area_status == "ready" or (detail == "completed" and price == "completed")):
-        try:
-            count = int(active_count or 0)
-        except Exception:
-            count = 0
-        return "Ready — no active listings" if count == 0 else f"Ready — {count} listings monitored"
+        count, count_is_known = _ready_active_listing_count(subscription)
+        if count is not None and count > 0:
+            return f"Ready — {count} listings monitored"
+        if count_is_known and count == 0:
+            return "Ready — no active listings"
+        return "Ready"
     if _setup_failed_for_retry(subscription):
         return "Failed — tap Retry setup"
     if module3 == "retry_wait" or detail == "retry_wait":
