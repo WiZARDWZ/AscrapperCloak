@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from datetime import datetime, timedelta
@@ -387,10 +388,12 @@ def test_startup_schema_recovers_stale_jobs(monkeypatch):
 
     called = []
     class Conn:
+        def commit(self): pass
         def close(self): pass
 
     monkeypatch.setattr(telegram_bot, "_connect", lambda: Conn())
     monkeypatch.setattr(telegram_bot.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(telegram_bot.db_layer, "sanitize_notification_outbox", lambda conn: {"notifications_skipped_by_revalidation": 0})
     monkeypatch.setattr(telegram_bot.job_queue, "ensure_job_tables", lambda conn=None: None)
     monkeypatch.setattr(telegram_bot.job_queue, "recover_stale_running_jobs", lambda conn=None: called.append(conn) or {"recovered_count": 1, "failed_count": 0, "stale_job_ids": [1296], "recovered_job_types": [job_queue.JOB_TYPE_BASELINE_SETUP_AREA]})
     telegram_bot.ensure_runtime_schema()
@@ -618,3 +621,226 @@ def test_failed_setup_status_label_and_keyboard_offer_retry_action(monkeypatch):
     buttons = [button for row in keyboard.inline_keyboard for button in row]
     assert any(button.callback_data == "retry_setup:7" for button in buttons)
     assert any("Retry setup" in button.text for button in buttons)
+
+
+class _NotificationFakeBot:
+    def __init__(self, exc=None):
+        self.exc = exc
+        self.sent = []
+
+    async def send_message(self, **kwargs):
+        self.sent.append(kwargs)
+        if self.exc:
+            raise self.exc
+
+
+def test_sender_skips_removed_area_notification_before_send(monkeypatch):
+    import telegram_sender
+
+    calls = []
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 1, "EventID": 10, "ChatID": "100", "MessageText": "hi"}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": False, "reason": "subscription_inactive_or_missing", "cancelled": True})
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_sending", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send")))
+    class Conn:
+        def commit(self): calls.append("commit")
+    bot = _NotificationFakeBot()
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["skipped"] == 1
+    assert out["sent"] == 0
+    assert bot.sent == []
+
+
+def test_sender_skips_disabled_notification_before_send(monkeypatch):
+    import telegram_sender
+
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 2, "EventID": 11, "ChatID": "100", "MessageText": "hi"}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": False, "reason": "notify_disabled", "cancelled": True})
+    class Conn:
+        def commit(self): pass
+    bot = _NotificationFakeBot()
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["skipped"] == 1
+    assert bot.sent == []
+
+
+def test_send_time_validation_rejects_area_not_ready(monkeypatch):
+    row = {
+        "NotificationID": 3,
+        "Status": "queued",
+        "ExistingEventID": 12,
+        "ShouldNotify": 1,
+        "EventType": "price_changed",
+        "Reason": "price_changed",
+        "UserAreaID": 7,
+        "SubscriptionIsActive": 1,
+        "TelegramUserIsActive": 1,
+        "EffectiveNotifyEnabled": 1,
+        "EffectiveSubscriptionStatus": "active",
+        "AreaSetupStatus": "preparing",
+        "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        "EventCreatedAt": datetime(2026, 6, 10, 9, 5, 0),
+    }
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 3)
+
+    assert out["valid"] is False
+    assert out["reason"] == "area_not_ready"
+
+
+def test_send_time_validation_rejects_event_before_notification_ready(monkeypatch):
+    row = {
+        "NotificationID": 4,
+        "Status": "queued",
+        "ExistingEventID": 13,
+        "ShouldNotify": 1,
+        "EventType": "price_changed",
+        "Reason": "price_changed",
+        "UserAreaID": 7,
+        "SubscriptionIsActive": 1,
+        "TelegramUserIsActive": 1,
+        "EffectiveNotifyEnabled": 1,
+        "EffectiveSubscriptionStatus": "active",
+        "AreaSetupStatus": "ready",
+        "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        "EventCreatedAt": datetime(2026, 6, 10, 8, 59, 0),
+    }
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 4)
+
+    assert out["valid"] is False
+    assert out["reason"] == "event_before_notification_ready"
+
+
+def test_send_time_validation_rejects_should_notify_false_false_sold(monkeypatch):
+    row = {"NotificationID": 5, "Status": "queued", "ExistingEventID": 14, "ShouldNotify": 0, "EventType": "sold", "Reason": "weak_sold_evidence"}
+    class Cursor:
+        def execute(self, *a): return self
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "_rows_to_dicts", lambda cur: [row])
+
+    out = db_layer.validate_notification_for_send(Conn(), 5)
+
+    assert out["valid"] is False
+    assert out["reason"] == "event_should_notify_false"
+
+
+def test_recover_stale_sending_notifications_requeues_or_fails(monkeypatch):
+    updates = []
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            updates.append((self.sql, params))
+            return self
+        def fetchall(self):
+            if "SELECT NotificationID" in self.sql:
+                return [(1, 1), (2, 5)]
+            return []
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    out = db_layer.recover_stale_sending_notifications(Conn(), stale_minutes=30, max_attempts=5)
+
+    assert out["stale_sending_recovered"] == 1
+    assert out["stale_sending_failed"] == 1
+    assert out["recovered_notification_ids"] == [1]
+    assert out["failed_notification_ids"] == [2]
+    assert any("Status='queued'" in sql for sql, _ in updates)
+    assert any("Status='failed'" in sql for sql, _ in updates)
+
+
+def test_recover_fresh_sending_notifications_does_nothing(monkeypatch):
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            return self
+        def fetchall(self): return []
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    out = db_layer.recover_stale_sending_notifications(Conn(), stale_minutes=30, max_attempts=5)
+
+    assert out["stale_sending_recovered"] == 0
+    assert out["stale_sending_failed"] == 0
+
+
+def test_startup_sanitizer_cancels_old_false_sold_queued_notification(monkeypatch):
+    calls = []
+    class Cursor:
+        def execute(self, sql, *params):
+            self.sql = str(sql)
+            return self
+        def fetchall(self): return [(9,)]
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "recover_stale_sending_notifications", lambda conn: {"stale_sending_recovered": 0, "stale_sending_failed": 0})
+    monkeypatch.setattr(db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="startup_outbox_sanitizer": calls.append((nid, reason_prefix)) or {"valid": False, "reason": "event_should_notify_false", "cancelled": True})
+
+    out = db_layer.sanitize_notification_outbox(Conn(), limit=10)
+
+    assert out["notifications_skipped_by_revalidation"] == 1
+    assert calls == [(9, "startup_outbox_sanitizer")]
+
+
+def test_cancel_notifications_for_subscription_scopes_to_one_user_shared_area(monkeypatch):
+    executed = []
+    class Cursor:
+        rowcount = 1
+        def execute(self, sql, *params):
+            executed.append((str(sql), params))
+            return self
+        def fetchone(self): return None
+    class Conn:
+        def cursor(self): return Cursor()
+    monkeypatch.setattr(db_layer, "ensure_notification_tables", lambda conn: None)
+
+    count = db_layer.cancel_notifications_for_subscription(Conn(), telegram_user_id=101, search_id=7, reason="removed")
+
+    assert count == 1
+    sql, params = executed[-1]
+    assert "SearchID=?" in sql
+    assert "UserID=?" in sql
+    assert "ChatID IN" in sql
+    assert params[-3:] == (7, 101, 101)
+
+
+def test_telegram_transient_failure_requeues_with_backoff(monkeypatch):
+    import telegram_sender
+
+    calls = []
+    monkeypatch.setattr(telegram_sender.db_layer, "recover_stale_sending_notifications", lambda conn: {})
+    monkeypatch.setattr(telegram_sender.db_layer, "get_queued_notifications", lambda conn, limit, channel: [{"NotificationID": 20, "EventID": 30, "ChatID": "100", "MessageText": "hi", "AttemptCount": 0}])
+    monkeypatch.setattr(telegram_sender.db_layer, "cancel_notification_if_unsafe", lambda conn, nid, reason_prefix="send_time_revalidation": {"valid": True, "reason": "ok"})
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_sending", lambda conn, nid: calls.append(("sending", nid)))
+    monkeypatch.setattr(telegram_sender.db_layer, "mark_notification_send_error", lambda conn, nid, error, max_attempts, backoff_seconds: calls.append(("retry", nid, backoff_seconds)) or {"status": "queued", "attempts": 1, "backoff_seconds": backoff_seconds})
+    class Conn:
+        def commit(self): calls.append(("commit",))
+    bot = _NotificationFakeBot(exc=TimeoutError("temporary network timeout"))
+
+    out = asyncio.run(telegram_sender.send_queued_notifications(bot, conn=Conn()))
+
+    assert out["retried"] == 1
+    assert out["failed"] == 0
+    assert any(call[0] == "retry" for call in calls)

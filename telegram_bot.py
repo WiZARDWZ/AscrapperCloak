@@ -167,8 +167,15 @@ def _format_summary(summary: dict[str, Any]) -> str:
 def _queue_status_snapshot(next_due_limit: int = 5) -> dict[str, Any]:
     active = job_queue.get_active_jobs()
     failed_by_lifecycle = job_queue.get_failed_job_summary_by_lifecycle(limit=5, include_inactive=True)
+    notification_diagnostics = {}
+    conn = _connect()
+    try:
+        notification_diagnostics = db_layer.get_notification_outbox_diagnostics(conn)
+    finally:
+        conn.close()
     return {
         "summary": job_queue.get_queue_summary(),
+        "notification_outbox": notification_diagnostics,
         "running_jobs": [row for row in active if str(row.get("Status") or "").lower() == "running"],
         "retry_wait_jobs": [row for row in active if str(row.get("Status") or "").lower() == "retry_wait"],
         "next_due_jobs": job_queue.get_next_due_jobs(limit=next_due_limit),
@@ -250,7 +257,10 @@ def ensure_runtime_schema() -> None:
     try:
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
+        notification_sanitizer = db_layer.sanitize_notification_outbox(conn)
+        conn.commit()
         recovery = job_queue.recover_stale_running_jobs(conn=conn)
+        logger.info("startup notification outbox sanitizer: %s", _format_summary(notification_sanitizer))
         logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:
         conn.close()
@@ -317,8 +327,11 @@ async def heartbeat_loop() -> None:
             try:
                 snapshot = await asyncio.to_thread(_queue_status_snapshot, 5)
                 logger.info(
-                    "heartbeat: queue=%s running=%s retry_wait=%s next_due=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
+                    "heartbeat: queue=%s notifications=%s sending=%s oldest_sending=%s running=%s retry_wait=%s next_due=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
                     _queue_counts_text(snapshot["summary"]),
+                    snapshot.get("notification_outbox", {}).get("queued_by_event_type", {}),
+                    snapshot.get("notification_outbox", {}).get("sending_count", 0),
+                    snapshot.get("notification_outbox", {}).get("oldest_sending_at"),
                     len(snapshot["running_jobs"]),
                     len(snapshot["retry_wait_jobs"]),
                     len(snapshot["next_due_jobs"]),
@@ -671,7 +684,7 @@ async def handle_remove_callback(update: Update, context: ContextTypes.DEFAULT_T
     finally:
         conn.close()
     logger.info(
-        "remove area requested: telegram_user_id=%s user_area_id=%s resolved_search_id=%s resolved_area_id=%s remaining_active_subscriptions=%s action=%s cancelled_jobs=%s",
+        "remove area requested: telegram_user_id=%s user_area_id=%s resolved_search_id=%s resolved_area_id=%s remaining_active_subscriptions=%s action=%s cancelled_jobs=%s cancelled_notifications=%s",
         telegram_user_id,
         user_area_id,
         lifecycle.get("resolved_search_id"),
@@ -679,6 +692,7 @@ async def handle_remove_callback(update: Update, context: ContextTypes.DEFAULT_T
         lifecycle.get("remaining_active_subscriptions"),
         lifecycle.get("action"),
         lifecycle.get("cancelled_jobs"),
+        lifecycle.get("cancelled_notifications"),
     )
     await query.edit_message_text(f"Stopped monitoring {area.get('AreaLabel') if area else 'that suburb'}." if lifecycle.get("removed") else "That suburb is already inactive.")
     await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
@@ -830,6 +844,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Queue loop: {'running' if RUNTIME_STATE.scheduler_loop_running else 'stopped'}\n"
             f"Worker loop: {'running' if RUNTIME_STATE.worker_loop_running else 'stopped'}\n"
             f"Queue: {_queue_counts_text(snapshot['summary'])}\n"
+            f"Notifications queued: {snapshot.get('notification_outbox', {}).get('queued_by_event_type', {})}\n"
+            f"Notifications sending: {snapshot.get('notification_outbox', {}).get('sending_count', 0)}\n"
             f"Running jobs: {len(snapshot['running_jobs'])}\n"
             f"Retry-wait jobs: {len(snapshot['retry_wait_jobs'])}\n"
             f"Next due jobs: {len(snapshot['next_due_jobs'])}\n"
@@ -858,6 +874,8 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             "Queue\n"
             f"Counts: {_queue_counts_text(snapshot['summary'])}\n"
+            f"Notifications queued: {snapshot.get('notification_outbox', {}).get('queued_by_event_type', {})}\n"
+            f"Notifications sending: {snapshot.get('notification_outbox', {}).get('sending_count', 0)}\n"
             f"Running jobs: {len(snapshot['running_jobs'])}\n"
             f"Retry-wait jobs: {len(snapshot['retry_wait_jobs'])}\n"
             "Next due jobs:\n"
