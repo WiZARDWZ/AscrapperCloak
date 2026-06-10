@@ -2756,6 +2756,98 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
     return [str(row[0]) for row in cur.fetchall() if row and row[0] is not None]
 
 
+
+def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | None = None) -> dict:
+    """Reset a failed/preparing setup to a supported preparing state and enqueue baseline once."""
+    ensure_telegram_bot_tables(conn)
+    cur = conn.cursor()
+    if user_area_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE UserAreaID=? AND IsActive=1
+            """,
+            int(user_area_id),
+        )
+    elif search_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE SearchID=? AND IsActive=1
+            ORDER BY UserAreaID ASC
+            """,
+            int(search_id),
+        )
+    else:
+        raise ValueError("user_area_id or search_id is required")
+    row = cur.fetchone()
+    if not row:
+        conn.commit()
+        return {"created": False, "reason": "active_subscription_not_found", "user_area_id": user_area_id, "search_id": search_id}
+
+    resolved_user_area_id = int(row[0])
+    resolved_telegram_user_id = int(row[1])
+    resolved_search_id = int(row[2])
+    search_url = str(row[3])
+    area_label = str(row[4] or search_url)
+    upsert_area_monitoring_state(
+        conn,
+        resolved_search_id,
+        setup_status="preparing",
+        module1_status="pending",
+        module3_status="pending",
+        module2_status="pending",
+        active_listing_count=0,
+        inferred_price_count=0,
+        unknown_price_count=0,
+        last_error=None,
+        set_started=True,
+    )
+    cur.execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET SubscriptionStatus='preparing',
+            NotifyEnabled=0,
+            BaselineStatus='pending',
+            BaselineStartedAt=NULL,
+            BaselineCompletedAt=NULL,
+            BaselineLastError=NULL,
+            DetailBaselineStatus='pending',
+            DetailBaselineStartedAt=NULL,
+            DetailBaselineCompletedAt=NULL,
+            DetailBaselineAttemptCount=0,
+            DetailBaselineLastAttemptAt=NULL,
+            DetailBaselineNextRetryAt=NULL,
+            DetailBaselineLastError=NULL,
+            PriceBaselineStatus='pending',
+            PriceBaselineStartedAt=NULL,
+            PriceBaselineCompletedAt=NULL,
+            PriceBaselineLastError=NULL,
+            NotificationReadyAt=NULL,
+            BaselineSummarySentAt=NULL,
+            DetailBaselineStartedSummarySentAt=NULL,
+            ReadySummarySentAt=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        resolved_search_id,
+    )
+    upsert_user_area_subscription_state(conn, resolved_telegram_user_id, resolved_search_id, status="preparing", notify_enabled=False)
+    conn.commit()
+    baseline_job = enqueue_baseline_setup_job(conn, resolved_search_id, search_url)
+    conn.commit()
+    return {
+        "created": bool(baseline_job and baseline_job.get("created")),
+        "reason": "setup_retry_enqueued" if bool(baseline_job and baseline_job.get("created")) else "baseline_job_already_active",
+        "user_area_id": resolved_user_area_id,
+        "search_id": resolved_search_id,
+        "area_label": area_label,
+        "baseline_job": baseline_job,
+    }
+
+
 def enqueue_baseline_setup_job(conn, area_id: int, search_url: str) -> dict | None:
     """Enqueue one active baseline_setup_area job per area."""
     ensure_monitoring_state_tables(conn)
@@ -3937,7 +4029,7 @@ def list_user_area_subscriptions(conn, telegram_user_id: int, active_only: bool 
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -3964,7 +4056,7 @@ def get_user_area_subscription(conn, user_area_id: int) -> dict | None:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4053,7 +4145,7 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4664,7 +4756,7 @@ def get_active_user_area_subscriptions_for_search(conn, search_id: int) -> list[
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas

@@ -1822,7 +1822,7 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
             if search_id:
                 conn = db_layer.connect(config.DB_PATH)
                 try:
-                    db_layer.upsert_area_monitoring_state(conn, int(search_id), setup_status="retry_wait", module1_status="retry_wait", last_error=reason)
+                    db_layer.upsert_area_monitoring_state(conn, int(search_id), setup_status="preparing", module1_status="retry_wait", last_error=reason)
                     conn.commit()
                 finally:
                     conn.close()

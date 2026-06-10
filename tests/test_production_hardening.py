@@ -2,6 +2,7 @@ import sys
 import types
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **kwargs: None))
 
@@ -432,3 +433,188 @@ def test_run_next_job_once_does_not_leave_job_running_on_handled_exception(monke
     assert stored["LockedAt"] is None
     assert stored["LockedBy"] is None
     assert stored["Status"] != "running"
+
+
+
+def test_production_area_setup_status_writes_use_supported_contract():
+    import re
+
+    unsupported = {"completed", "retry_wait", "failed_ingest"}
+    offenders = []
+    for path in ["monitor.py", "monitoring_scheduler.py", "db_layer.py", "telegram_bot.py"]:
+        text = Path(path).read_text(encoding="utf-8")
+        for match in re.finditer(r"setup_status\s*=\s*['\"]([^'\"]+)['\"]", text):
+            if match.group(1) in unsupported:
+                offenders.append(f"{path}:{match.start()}:{match.group(1)}")
+    assert offenders == []
+
+
+def test_baseline_true_no_results_marks_area_ready_and_activates(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): calls.append(("close",))
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "no_results", "stop_reason": "no_results"}
+
+    out = monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
+
+    assert out["status"] == "ready"
+    assert out["active_listing_count"] == 0
+    state_calls = [item for item in calls if item[0] == "state"]
+    assert state_calls[-1][2]["setup_status"] == "ready"
+    assert state_calls[-1][2]["active_listing_count"] == 0
+    assert state_calls[-1][2]["inferred_price_count"] == 0
+    assert state_calls[-1][2]["unknown_price_count"] == 0
+    assert ("activate", 42) in calls
+
+
+def test_baseline_untrusted_zero_rows_fails_without_ready(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: (_ for _ in ()).throw(AssertionError("should not activate")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "render_timeout", "page_state": "render_timeout", "stop_reason": "render_timeout"}
+
+    try:
+        monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
+    except RuntimeError as exc:
+        assert "Module1 returned 0 rows" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert calls[-1]["setup_status"] == "failed"
+    assert calls[-1]["module1_status"] == "failed"
+
+
+def test_retryable_baseline_error_uses_supported_preparing_area_state(monkeypatch):
+    import monitoring_scheduler
+
+    written = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    job = {"JobID": 10, "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "SearchID": 42, "UserAreaID": 7, "PayloadJson": '{"search_url": "url"}'}
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.job_queue if hasattr(monitoring_scheduler, "job_queue") else job_queue, "touch_job_heartbeat", lambda job_id: {})
+    monkeypatch.setattr(monitoring_scheduler, "baseline_setup_area", lambda *a, **k: (_ for _ in ()).throw(RealEstateBlockedError("blocked", retry_after_seconds=60)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: written.append(kwargs))
+
+    out = monitoring_scheduler.execute_job(job, send_telegram=False)
+
+    assert out["status"] == "retry_wait"
+    assert written[-1]["setup_status"] == "preparing"
+    assert written[-1]["module1_status"] == "retry_wait"
+
+
+def test_ingest_failure_uses_failed_setup_status_and_preserves_reason(monkeypatch, tmp_path):
+    import json
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    rows1 = [{"listing_id": "1", "url": "https://example.test/property-1", "price": "$1", "address": "A"}]
+    rows3 = [{"listing_id": "1", "url": "https://example.test/property-1", "price": "$1", "address": "A", "detail_scraped_at": "now"}]
+    json1 = tmp_path / "m1.json"
+    json3 = tmp_path / "m3.json"
+    json1.write_text(json.dumps(rows1), encoding="utf-8")
+    json3.write_text(json.dumps(rows3), encoding="utf-8")
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows1)
+    monkeypatch.setattr(monitor.module1_list_scraper, "save_results", lambda rows, out_dir=None: (str(tmp_path / "m1.csv"), str(json1)))
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (str(tmp_path / "m3.csv"), str(json3)))
+    monitor.module3_enrich_details.module3_run.last_result = {"status": "completed", "success_count": 1}
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (str(tmp_path / "m2.csv"), str(json3)))
+    monitor.module2_infer_prices.module2_run.last_result = {"status": "completed"}
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ingest boom")))
+
+    try:
+        monitor.baseline_setup_area("https://example.test/buy/in-area,+nsw+2999/list-1")
+    except RuntimeError as exc:
+        assert "ingest boom" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+    assert calls[-1]["setup_status"] == "failed"
+    assert calls[-1]["last_error"].startswith("failed_ingest:")
+
+
+def test_retry_setup_area_resets_state_and_dedupes_baseline_job(monkeypatch):
+    job_queue.enable_in_memory_store()
+    executed = []
+
+    class Cursor:
+        def __init__(self): self.rowcount = 1
+        def execute(self, sql, *params):
+            executed.append((str(sql), params))
+            return self
+        def fetchone(self): return (7, 99, 42, "https://example.test/search", "Retryville, NSW 2999")
+        def fetchall(self): return []
+    class Conn:
+        def cursor(self): return Cursor()
+        def commit(self): executed.append(("commit", ()))
+        def rollback(self): pass
+
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "ensure_monitoring_state_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "get_area_monitoring_state", lambda conn, area_id: {"setup_status": "failed"})
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: executed.append(("state", (area_id, kwargs))))
+    monkeypatch.setattr(db_layer, "upsert_user_area_subscription_state", lambda conn, user_id, area_id, **kwargs: executed.append(("substate", (user_id, area_id, kwargs))))
+
+    first = db_layer.retry_setup_area(Conn(), user_area_id=7)
+    second = db_layer.retry_setup_area(Conn(), user_area_id=7)
+
+    assert first["created"] is True
+    assert second["created"] is False
+    assert second["reason"] == "baseline_job_already_active"
+    assert len(job_queue._TEST_STORE) == 1
+    state_call = next(item for item in executed if item[0] == "state")
+    assert state_call[1][1]["setup_status"] == "preparing"
+
+
+def test_failed_setup_status_label_and_keyboard_offer_retry_action(monkeypatch):
+    import telegram_bot
+
+    class FakeButton:
+        def __init__(self, text, callback_data=None):
+            self.text = text
+            self.callback_data = callback_data
+
+    class FakeMarkup:
+        def __init__(self, rows):
+            self.inline_keyboard = rows
+
+    monkeypatch.setattr(telegram_bot, "InlineKeyboardButton", FakeButton)
+    monkeypatch.setattr(telegram_bot, "InlineKeyboardMarkup", FakeMarkup)
+    sub = {"UserAreaID": 7, "AreaLabel": "Retryville, NSW 2999", "AreaSetupStatus": "failed", "BaselineStatus": "pending", "DetailBaselineStatus": "pending", "PriceBaselineStatus": "pending"}
+    assert telegram_bot._status_label(sub) == "Failed — tap Retry setup"
+    keyboard = telegram_bot._my_suburbs_keyboard([sub])
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+    assert any(button.callback_data == "retry_setup:7" for button in buttons)
+    assert any("Retry setup" in button.text for button in buttons)
