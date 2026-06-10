@@ -2222,6 +2222,50 @@ def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | Non
     return {"updated": True, "listing_id": int(listing_id), "status": status, "attempts": attempts, "next_retry_at": next_retry}
 
 
+def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | None = None, external_id: str | None = None, error: str | None = None, retry_after=None, max_attempts: int | None = None) -> dict:
+    ensure_listing_search_state_detail_refresh_column(conn)
+    max_attempts = int(max_attempts or getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5))
+    safe_error = config.mask_sensitive_text(error or "setup detail technical failure")
+    cur = conn.cursor()
+    if listing_id is None and external_id is not None:
+        row = _one(cur, "SELECT listingID FROM dbo.Listing WHERE ExternalID=?", str(external_id))
+        listing_id = int(row[0]) if row else None
+    if listing_id is None:
+        return {"updated": False, "reason": "listing_not_found"}
+    cur.execute(
+        """
+        SELECT COALESCE(SetupDetailAttemptCount, 0)
+        FROM dbo.ListingSearchState
+        WHERE SearchID=? AND ListingID=?
+        """,
+        int(search_id),
+        int(listing_id),
+    )
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) + 1 if row else 1
+    status = "detail_failed_permanent" if attempts >= max_attempts else "detail_retry_wait"
+    next_retry = None if status == "detail_failed_permanent" else retry_after
+    cur.execute(
+        """
+        UPDATE dbo.ListingSearchState
+        SET SetupDetailStatus=?,
+            SetupDetailAttemptCount=?,
+            SetupDetailLastAttemptAt=SYSDATETIME(),
+            SetupDetailNextRetryAt=?,
+            SetupDetailLastError=?,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
+        attempts,
+        next_retry,
+        safe_error,
+        int(search_id),
+        int(listing_id),
+    )
+    return {"updated": True, "listing_id": int(listing_id), "status": status, "attempts": attempts, "next_retry_at": next_retry}
+
+
 def force_listing_search_state_detail_refresh_due(conn, search_id: int, hours: int | None = 3, set_null: bool = False) -> dict:
     ensure_listing_search_state_detail_refresh_column(conn)
     cur = conn.cursor()
