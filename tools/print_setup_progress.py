@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import argparse
+import json
+from typing import Any
+
+import config
+import db_layer
+
+
+def _rows(cur) -> list[dict[str, Any]]:
+    cols = [c[0] for c in cur.description]
+    return [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
+
+
+def setup_progress(search_id: int) -> dict[str, Any]:
+    conn = db_layer.connect(config.DB_PATH)
+    try:
+        state = db_layer.get_area_monitoring_state(conn, search_id) or {}
+        subs = db_layer.get_active_user_area_subscriptions_for_search(conn, search_id)
+        sub = subs[0] if subs else {"SearchID": search_id, "BaselineListingsCollected": state.get("active_listing_count")}
+        detail = db_layer.get_detail_baseline_progress(conn, sub)
+        active_jobs = db_layer.get_active_setup_pipeline_jobs(conn, search_id)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT TOP (1) JobID, JobType, Status, CreatedAt, StartedAt, FinishedAt, LastError
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType='baseline_setup_area'
+            ORDER BY JobID DESC
+            """,
+            search_id,
+        )
+        latest_baseline = _rows(cur)
+        cur.execute(
+            """
+            SELECT TOP (1) JobID, JobType, Status, CreatedAt, StartedAt, FinishedAt, LastError
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType='setup_detail_baseline'
+            ORDER BY JobID DESC
+            """,
+            search_id,
+        )
+        latest_detail = _rows(cur)
+        cur.execute(
+            """
+            SELECT TOP (10) JobID, JobType, Status, RunAfter, CreatedAt, StartedAt, FinishedAt, LastError
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType IN ('baseline_setup_area','setup_detail_baseline','setup_price_baseline')
+            ORDER BY JobID DESC
+            """,
+            search_id,
+        )
+        last_jobs = _rows(cur)
+        total = int(detail.get("detail_baseline_total_count") or state.get("active_listing_count") or 0)
+        remaining = int(detail.get("detail_baseline_remaining_count") or 0)
+        done = int(detail.get("detail_baseline_completed_count") or max(0, total - remaining))
+        active_types = {str(job.get("JobType")) for job in active_jobs}
+        return {
+            "search_id": search_id,
+            "area_display_name": (subs[0].get("AreaLabel") if subs else None),
+            "setup_status": state.get("setup_status"),
+            "module1_status": state.get("module1_status"),
+            "module3_status": state.get("module3_status"),
+            "module2_status": state.get("module2_status"),
+            "baseline_target_total": total,
+            "detail_done": done,
+            "detail_remaining": remaining,
+            "detail_percent": round(done / total * 100.0, 2) if total else 0,
+            "latest_baseline_job": latest_baseline[0] if latest_baseline else None,
+            "latest_detail_job": latest_detail[0] if latest_detail else None,
+            "active_setup_jobs": active_jobs,
+            "active_price_jobs": [job for job in active_jobs if str(job.get("JobType")) == "setup_price_baseline"],
+            "last_10_setup_jobs": last_jobs,
+            "safety_checks": {
+                "baseline_rerun_active": "baseline_setup_area" in active_types and "setup_detail_baseline" in active_types,
+                "price_premature": "setup_price_baseline" in active_types and remaining > 0,
+                "progress_stalled": total > 0 and remaining > total * 0.9 and len([j for j in last_jobs if j.get("JobType") == "setup_detail_baseline" and j.get("Status") == "succeeded"]) > total,
+            },
+        }
+    finally:
+        conn.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Print setup pipeline progress for a SearchID")
+    parser.add_argument("--search-id", type=int, required=True)
+    args = parser.parse_args()
+    print(json.dumps(setup_progress(args.search_id), ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

@@ -1724,6 +1724,19 @@ def ensure_listing_search_state_detail_refresh_column(conn) -> None:
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NULL
         ALTER TABLE dbo.ListingSearchState ADD LastDetailRefreshAt DATETIME2 NULL
         """, description="add dbo.ListingSearchState.LastDetailRefreshAt", required=False)
+    for column_name, definition in {
+        "SetupDetailStatus": "NVARCHAR(40) NULL",
+        "SetupDetailAttemptCount": "INT NOT NULL CONSTRAINT DF_ListingSearchState_SetupDetailAttemptCount DEFAULT (0)",
+        "SetupDetailLastAttemptAt": "DATETIME2 NULL",
+        "SetupDetailNextRetryAt": "DATETIME2 NULL",
+        "SetupDetailLastError": "NVARCHAR(1000) NULL",
+        "SetupDetailCompletedAt": "DATETIME2 NULL",
+    }.items():
+        _execute_ddl_safely(conn, f"""
+            IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+            AND COL_LENGTH('dbo.ListingSearchState', '{column_name}') IS NULL
+            ALTER TABLE dbo.ListingSearchState ADD {column_name} {definition}
+            """, description=f"add dbo.ListingSearchState.{column_name}", required=False)
     _execute_ddl_safely(conn, """
         IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NOT NULL
@@ -1731,6 +1744,13 @@ def ensure_listing_search_state_detail_refresh_column(conn) -> None:
         CREATE INDEX IX_ListingSearchState_DetailRefreshDue
         ON dbo.ListingSearchState(SearchID, Status, LastDetailRefreshAt, ListingID)
         """, description="create IX_ListingSearchState_DetailRefreshDue", required=False)
+    _execute_ddl_safely(conn, """
+        IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SetupDetailStatus') IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ListingSearchState_SetupDetailDue' AND object_id=OBJECT_ID('dbo.ListingSearchState'))
+        CREATE INDEX IX_ListingSearchState_SetupDetailDue
+        ON dbo.ListingSearchState(SearchID, SetupDetailStatus, SetupDetailNextRetryAt, LastDetailRefreshAt, ListingID)
+        """, description="create IX_ListingSearchState_SetupDetailDue", required=False)
 
 
 def ensure_listing_lifecycle_columns(conn) -> None:
@@ -2012,13 +2032,72 @@ def apply_listing_lifecycle_signal(
     return transition
 
 
-def mark_listing_search_state_detail_refreshed(conn, search_id: int, listing_id: int) -> None:
+SETUP_DETAIL_DONE_STATUSES = {"detail_complete", "detail_partial_complete", "detail_failed_permanent"}
+
+
+def mark_listing_search_state_detail_refreshed(conn, search_id: int, listing_id: int, setup_detail_status: str | None = None) -> None:
     ensure_listing_search_state_detail_refresh_column(conn)
+    status = setup_detail_status if setup_detail_status in {"detail_complete", "detail_partial_complete"} else "detail_complete"
     conn.cursor().execute(
-        "UPDATE dbo.ListingSearchState SET LastDetailRefreshAt=SYSDATETIME(), UpdatedAt=SYSDATETIME() WHERE SearchID=? AND ListingID=?",
+        """
+        UPDATE dbo.ListingSearchState
+        SET LastDetailRefreshAt=SYSDATETIME(),
+            SetupDetailStatus=?,
+            SetupDetailCompletedAt=SYSDATETIME(),
+            SetupDetailAttemptCount=0,
+            SetupDetailNextRetryAt=NULL,
+            SetupDetailLastError=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
         int(search_id),
         int(listing_id),
     )
+
+
+def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | None = None, external_id: str | None = None, error: str | None = None, retry_after=None, max_attempts: int | None = None) -> dict:
+    ensure_listing_search_state_detail_refresh_column(conn)
+    max_attempts = int(max_attempts or getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5))
+    safe_error = config.mask_sensitive_text(error or "setup detail technical failure")
+    cur = conn.cursor()
+    if listing_id is None and external_id is not None:
+        row = _one(cur, "SELECT listingID FROM dbo.Listing WHERE ExternalID=?", str(external_id))
+        listing_id = int(row[0]) if row else None
+    if listing_id is None:
+        return {"updated": False, "reason": "listing_not_found"}
+    cur.execute(
+        """
+        SELECT COALESCE(SetupDetailAttemptCount, 0)
+        FROM dbo.ListingSearchState
+        WHERE SearchID=? AND ListingID=?
+        """,
+        int(search_id),
+        int(listing_id),
+    )
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) + 1 if row else 1
+    status = "detail_failed_permanent" if attempts >= max_attempts else "detail_retry_wait"
+    next_retry = None if status == "detail_failed_permanent" else retry_after
+    cur.execute(
+        """
+        UPDATE dbo.ListingSearchState
+        SET SetupDetailStatus=?,
+            SetupDetailAttemptCount=?,
+            SetupDetailLastAttemptAt=SYSDATETIME(),
+            SetupDetailNextRetryAt=?,
+            SetupDetailLastError=?,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
+        attempts,
+        next_retry,
+        safe_error,
+        int(search_id),
+        int(listing_id),
+    )
+    return {"updated": True, "listing_id": int(listing_id), "status": status, "attempts": attempts, "next_retry_at": next_retry}
 
 
 def force_listing_search_state_detail_refresh_due(conn, search_id: int, hours: int | None = 3, set_null: bool = False) -> dict:
@@ -2092,7 +2171,9 @@ def get_active_listings_for_detail_refresh(
     sid = _detail_refresh_search_id(conn, search_url, subscription=subscription)
     targeted_external_id = clean_text(listing_external_id, 50)
     safe_limit = 1 if targeted_external_id else max(1, int(limit or 1))
-    effective_stale_hours = None if targeted_external_id else (None if stale_hours is None or int(stale_hours) <= 0 else int(stale_hours))
+    setup_started_at = (subscription or {}).get("DetailBaselineStartedAt")
+    setup_mode = bool(not targeted_external_id and setup_started_at is not None and stale_hours is not None and int(stale_hours) <= 0)
+    effective_stale_hours = None if targeted_external_id or setup_mode else (None if stale_hours is None or int(stale_hours) <= 0 else int(stale_hours))
     cur = conn.cursor()
     sql = """
     SELECT TOP (?)
@@ -2109,7 +2190,10 @@ def get_active_listings_for_detail_refresh(
         p.Parkingslot AS parking,
         COALESCE(lss.Status, l.CurrentStatus) AS current_status,
         COALESCE(lss.ListingLifecycleStatus, lss.Status, l.CurrentStatus, 'active') AS ListingLifecycleStatus,
-        lss.LastDetailRefreshAt AS last_detail_refresh_at
+        lss.LastDetailRefreshAt AS last_detail_refresh_at,
+        lss.SetupDetailStatus AS setup_detail_status,
+        lss.SetupDetailAttemptCount AS setup_detail_attempt_count,
+        lss.SetupDetailNextRetryAt AS setup_detail_next_retry_at
     FROM dbo.ListingSearchState lss
     JOIN dbo.Listing l ON l.listingID = lss.ListingID
     LEFT JOIN dbo.Property p ON p.PropertyID = l.PropertyID
@@ -2119,15 +2203,26 @@ def get_active_listings_for_detail_refresh(
       AND NULLIF(LTRIM(RTRIM(COALESCE(l.ListingURL, ''))), '') IS NOT NULL
       AND (? IS NULL OR CAST(l.ExternalID AS NVARCHAR(50)) = ?)
       AND (
+            ? = 0
+            OR (
+                COALESCE(lss.SetupDetailStatus, '') NOT IN ('detail_complete','detail_partial_complete','detail_failed_permanent')
+                AND (lss.SetupDetailNextRetryAt IS NULL OR lss.SetupDetailNextRetryAt <= SYSDATETIME())
+                AND (lss.LastDetailRefreshAt IS NULL OR lss.LastDetailRefreshAt < ?)
+            )
+      )
+      AND (
             ? IS NULL
             OR lss.LastDetailRefreshAt IS NULL
             OR DATEADD(hour, ?, lss.LastDetailRefreshAt) <= SYSDATETIME()
       )
-    ORDER BY CASE WHEN lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
+    ORDER BY CASE WHEN ? = 1 AND lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
+             CASE WHEN ? = 1 THEN l.listingID ELSE 0 END ASC,
+             CASE WHEN ? = 0 AND lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
              lss.LastDetailRefreshAt ASC,
              l.listingID ASC
     """
-    cur.execute(sql, safe_limit, sid, targeted_external_id, targeted_external_id, effective_stale_hours, effective_stale_hours)
+    setup_flag = 1 if setup_mode else 0
+    cur.execute(sql, safe_limit, sid, targeted_external_id, targeted_external_id, setup_flag, setup_started_at, effective_stale_hours, effective_stale_hours, setup_flag, setup_flag, setup_flag)
     cols = [c[0] for c in cur.description]
     return [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
 
@@ -2263,7 +2358,11 @@ def ingest_detail_refresh_rows_conn(
             apply_listing_lifecycle_signal(conn, sid, lid, "sold", persisted_row.get("StatusReason") or "sold_evidence", persisted_row.get("StatusEvidence"), run_id=run_id, create_event=True)
         else:
             apply_listing_lifecycle_signal(conn, sid, lid, "active", None, None, run_id=run_id, create_event=False)
-        mark_listing_search_state_detail_refreshed(conn, sid, lid)
+        setup_detail_status = None
+        if context == "initial_detail_baseline":
+            quality = str(persisted_row.get("detail_extraction_quality") or persisted_row.get("detail_quality") or "").lower()
+            setup_detail_status = "detail_partial_complete" if quality in {"partial", "sparse", "partial_complete"} else "detail_complete"
+        mark_listing_search_state_detail_refreshed(conn, sid, lid, setup_detail_status=setup_detail_status)
         create_audit_events = should_create_listing_events_for_context(context, suppress_notifications)
         if create_audit_events and old_state and old_state.get("listing_id") and item["events_detected"]:
             created = 0
@@ -4928,7 +5027,15 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
     cur.execute("""
         SELECT
             COUNT(1) AS TotalCount,
-            SUM(CASE WHEN ? IS NOT NULL AND latest.LastSnapshotDate >= ? THEN 1 ELSE 0 END) AS CompletedCount
+            SUM(CASE
+                    WHEN COALESCE(lss.SetupDetailStatus, '') IN ('detail_complete','detail_partial_complete','detail_failed_permanent') THEN 1
+                    WHEN ? IS NOT NULL AND lss.LastDetailRefreshAt >= ? THEN 1
+                    WHEN ? IS NOT NULL AND latest.LastSnapshotDate >= ? THEN 1
+                    ELSE 0
+                END) AS CompletedCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_partial_complete' THEN 1 ELSE 0 END) AS PartialCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_failed_permanent' THEN 1 ELSE 0 END) AS PermanentFailedCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_retry_wait' THEN 1 ELSE 0 END) AS RetryWaitCount
         FROM dbo.ListingSearchState lss
         JOIN dbo.Listing l ON l.listingID=lss.ListingID
         OUTER APPLY (SELECT MAX(ls.SnapshotDate) LastSnapshotDate FROM dbo.ListingSnapshot ls WHERE ls.ListingID=l.listingID AND ls.SearchID=lss.SearchID) latest
@@ -4936,10 +5043,13 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
           AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active'
           AND (l.CurrentStatus IS NULL OR LOWER(l.CurrentStatus) IN ('active','unknown'))
           AND NULLIF(LTRIM(RTRIM(COALESCE(l.ListingURL, ''))), '') IS NOT NULL
-        """, started_at, started_at, search_id)
+        """, started_at, started_at, started_at, started_at, search_id)
     row = cur.fetchone()
     total = int(row[0] or 0) if row else 0
     completed = int(row[1] or 0) if row else 0
+    partial = int(row[2] or 0) if row and len(row) > 2 else 0
+    permanent_failed = int(row[3] or 0) if row and len(row) > 3 else 0
+    retry_wait = int(row[4] or 0) if row and len(row) > 4 else 0
     baseline_total = to_int(subscription.get("BaselineListingsCollected")) or 0
     total = max(total, baseline_total)
     completed = min(completed, total)
@@ -4947,13 +5057,40 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
         "detail_baseline_total_count": total,
         "detail_baseline_completed_count": completed,
         "detail_baseline_remaining_count": max(0, total - completed),
+        "detail_baseline_partial_count": partial,
+        "detail_baseline_permanent_failed_count": permanent_failed,
+        "detail_baseline_retry_wait_count": retry_wait,
         "notification_ready_at": subscription.get("NotificationReadyAt"),
     }
 
 
+
+def count_succeeded_setup_detail_jobs(conn, search_id: int) -> int:
+    try:
+        row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
+        if not row or row[0] is None:
+            return 0
+    except Exception:
+        return 0
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(1)
+        FROM dbo.Job
+        WHERE SearchID=? AND JobType='setup_detail_baseline' AND Status='succeeded'
+        """,
+        int(search_id),
+    )
+    row = cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
 def count_remaining_setup_detail_targets(conn, search_id: int, subscription: dict | None = None) -> int:
     if subscription is None:
-        subscription = {"SearchID": int(search_id)}
+        try:
+            subs = get_active_user_area_subscriptions_for_search(conn, int(search_id))
+            subscription = subs[0] if subs else {"SearchID": int(search_id)}
+        except Exception:
+            subscription = {"SearchID": int(search_id)}
     else:
         subscription = {**subscription, "SearchID": int(search_id)}
     return int(get_detail_baseline_progress(conn, subscription).get("detail_baseline_remaining_count") or 0)

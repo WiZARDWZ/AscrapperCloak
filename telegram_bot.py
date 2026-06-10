@@ -169,14 +169,41 @@ def _queue_status_snapshot(next_due_limit: int = 5) -> dict[str, Any]:
     active = job_queue.get_active_jobs()
     failed_by_lifecycle = job_queue.get_failed_job_summary_by_lifecycle(limit=5, include_inactive=True)
     notification_diagnostics = {}
+    setup_progress = []
     conn = _connect()
     try:
         notification_diagnostics = db_layer.get_notification_outbox_diagnostics(conn)
+        setup_jobs = [job for job in active if str(job.get("JobType") or "") in {"baseline_setup_area", "setup_detail_baseline", "setup_price_baseline"}]
+        for job in setup_jobs[:3]:
+            search_id = job.get("SearchID")
+            if search_id is None:
+                continue
+            state = db_layer.get_area_monitoring_state(conn, int(search_id)) or {}
+            sub = None
+            subs = db_layer.get_active_user_area_subscriptions_for_search(conn, int(search_id))
+            if subs:
+                sub = subs[0]
+            progress = db_layer.get_detail_baseline_progress(conn, sub) if sub else {}
+            total = int(progress.get("detail_baseline_total_count") or state.get("active_listing_count") or 0)
+            remaining = int(progress.get("detail_baseline_remaining_count") or 0)
+            done = int(progress.get("detail_baseline_completed_count") or max(0, total - remaining))
+            setup_progress.append({
+                "setup_search_id": int(search_id),
+                "setup_phase": job.get("JobType"),
+                "setup_job_id": job.get("JobID"),
+                "setup_target_total": total,
+                "setup_detail_done": done,
+                "setup_detail_remaining": remaining,
+                "setup_detail_percent": round((done / total * 100.0), 2) if total else 0,
+                "setup_price_status": state.get("module2_status"),
+                "setup_last_error_short": config.mask_sensitive_text(str(state.get("last_error") or ""))[:160],
+            })
     finally:
         conn.close()
     return {
         "summary": job_queue.get_queue_summary(),
         "notification_outbox": notification_diagnostics,
+        "setup_progress": setup_progress,
         "running_jobs": [row for row in active if str(row.get("Status") or "").lower() == "running"],
         "retry_wait_jobs": [row for row in active if str(row.get("Status") or "").lower() == "retry_wait"],
         "next_due_jobs": job_queue.get_next_due_jobs(limit=next_due_limit),
@@ -328,7 +355,7 @@ async def heartbeat_loop() -> None:
             try:
                 snapshot = await asyncio.to_thread(_queue_status_snapshot, 5)
                 logger.info(
-                    "heartbeat: queue=%s notifications=%s sending=%s oldest_sending=%s running=%s retry_wait=%s next_due=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
+                    "heartbeat: queue=%s notifications=%s sending=%s oldest_sending=%s running=%s retry_wait=%s next_due=%s active_setup_searches=%s setup_progress=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
                     _queue_counts_text(snapshot["summary"]),
                     snapshot.get("notification_outbox", {}).get("queued_by_event_type", {}),
                     snapshot.get("notification_outbox", {}).get("sending_count", 0),
@@ -336,6 +363,8 @@ async def heartbeat_loop() -> None:
                     len(snapshot["running_jobs"]),
                     len(snapshot["retry_wait_jobs"]),
                     len(snapshot["next_due_jobs"]),
+                    len(snapshot.get("setup_progress", [])),
+                    snapshot.get("setup_progress", []),
                     _failed_jobs_text(snapshot["active_failed_jobs"]),
                     len(snapshot["inactive_failed_jobs"]),
                     _format_summary(RUNTIME_STATE.last_scheduler_summary),
@@ -949,7 +978,7 @@ def build_application(token: str) -> Application:
 
 
 def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=getattr(logging, getattr(config, "SCRAPER_LOG_LEVEL", "INFO"), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     for logger_name in ("httpx", "httpcore", "telegram.request", "telegram.vendor.ptb_urllib3"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 
