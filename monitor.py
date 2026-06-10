@@ -551,14 +551,14 @@ def baseline_setup_area(
     on_log: Optional[Callable[[str], None]] = None,
     perf_mode: str = "normal",
 ) -> Dict[str, Any]:
-    """Prepare one area without notifying users about existing listings."""
+    """Start one area setup by running Module1 only, then queue bounded setup phases."""
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     init_db(config.DB_PATH)
     normalized_url = ensure_sort_list_date(search_url)
     conn = connect(config.DB_PATH)
     try:
         area_id = get_or_create_area(conn, normalized_url)
-        upsert_area_monitoring_state(conn, area_id, setup_status="preparing", module1_status="running", last_error=None, set_started=True)
+        upsert_area_monitoring_state(conn, area_id, setup_status="preparing", module1_status="running", module3_status="pending", module2_status="pending", last_error=None, set_started=True)
         conn.commit()
     finally:
         conn.close()
@@ -578,18 +578,37 @@ def baseline_setup_area(
         if module1_state.get("status") == "no_results" or module1_state.get("stop_reason") == "no_results":
             conn = connect(config.DB_PATH)
             try:
-                upsert_area_monitoring_state(conn, area_id, setup_status="completed", module1_status="completed", active_listing_count=0, last_error=None)
+                upsert_area_monitoring_state(
+                    conn,
+                    area_id,
+                    setup_status="ready",
+                    module1_status="completed",
+                    module3_status="completed",
+                    module2_status="completed",
+                    active_listing_count=0,
+                    inferred_price_count=0,
+                    unknown_price_count=0,
+                    last_error=None,
+                    set_ready=True,
+                )
+                activate_area_subscriptions(conn, area_id)
                 conn.commit()
             finally:
                 conn.close()
             return {
-                "status": "success",
+                "status": "ready",
                 "area_id": area_id,
                 "rows_module1": 0,
                 "rows_full": 0,
+                "active_listing_count": 0,
+                "inferred_price_count": 0,
+                "unknown_price_count": 0,
                 "events_count": 0,
                 "stop_reason": "no_results",
                 "page_state": "no_results",
+                "empty_market": True,
+                "detail_batches_enqueued": 0,
+                "price_setup_enqueued": False,
             }
         conn = connect(config.DB_PATH)
         try:
@@ -599,205 +618,73 @@ def baseline_setup_area(
         finally:
             conn.close()
         raise RuntimeError(last_error)
-    _, json1 = module1_list_scraper.save_results(rows1, out_dir=config.OUTPUT_DIR)
-    conn = connect(config.DB_PATH)
-    try:
-        upsert_area_monitoring_state(conn, area_id, setup_status="preparing", module1_status="completed", active_listing_count=len(rows1))
-        conn.commit()
-    finally:
-        conn.close()
 
-    low_mode = perf_mode == "low"
-    _, json3 = module3_enrich_details.module3_run(
-        area_search_url=normalized_url,
-        input_file=json1,
-        out_dir=config.OUTPUT_DIR,
-        only_if_missing=False,
-        wait_timeout=config.MODULE3_WAIT_TIMEOUT,
-        sleep_between=config.MODULE3_SLEEP_BETWEEN * (2 if low_mode else 1),
-        empty_retry=config.MODULE3_EMPTY_RETRY,
-        cancel_token=cancel_token,
-        on_progress=on_progress,
-        on_log=on_log,
-    )
-    if getattr(cancel_token, "is_set", lambda: False)():
-        return {"status": "cancelled", "area_id": area_id}
-    if not json3:
-        retryable_module3 = _module3_retryable_last_result()
-        if retryable_module3:
-            conn = connect(config.DB_PATH)
-            try:
-                upsert_area_monitoring_state(
-                    conn,
-                    area_id,
-                    setup_status="retry_wait",
-                    module3_status="retry_wait",
-                    last_error=retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            raise RealEstateBlockedError(
-                retryable_module3.get("reason") or "Module3 retryable browser/navigation interruption",
-                retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
-            )
-        conn = connect(config.DB_PATH)
-        try:
-            upsert_area_monitoring_state(conn, area_id, setup_status="failed", module3_status="failed", last_error="Module3 failed to produce JSON output")
-            conn.commit()
-        finally:
-            conn.close()
-        raise RuntimeError("Module3 failed to produce JSON output")
-    with open(json3, "r", encoding="utf-8") as f:
-        rows_after_module3 = json.load(f)
-    if not _module3_output_is_reliable(rows_after_module3):
-        retryable_module3 = _module3_retryable_last_result() or {"reason": "Module3 output unreliable", "retry_after_seconds": getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)}
-        conn = connect(config.DB_PATH)
-        try:
-            upsert_area_monitoring_state(
-                conn,
-                area_id,
-                setup_status="retry_wait",
-                module3_status="retry_wait",
-                module2_status="pending",
-                last_error=retryable_module3.get("reason") or "Module3 output unreliable",
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        raise RealEstateBlockedError(
-            retryable_module3.get("reason") or "Module3 output unreliable",
-            retry_after_seconds=int(retryable_module3.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
-        )
-    conn = connect(config.DB_PATH)
+    # Persist Module1/listing-shell data only. Detail enrichment and price inference
+    # are intentionally separate setup jobs so large suburbs never run as one
+    # multi-hour baseline_setup_area job.
     try:
-        upsert_area_monitoring_state(conn, area_id, setup_status="preparing", module3_status="completed", active_listing_count=len(rows_after_module3))
-        conn.commit()
-    finally:
-        conn.close()
-
-    module2_target_ids = {
-        str(row.get("listing_id") or row.get("external_id") or row.get("ExternalID") or "").strip()
-        for row in rows_after_module3
-        if str(row.get("listing_id") or row.get("external_id") or row.get("ExternalID") or "").strip()
-    }
-    full_rows = rows_after_module3
-    module2_attempted = True
-    if module2_target_ids:
-        log_line = (
-            "Baseline Module2: "
-            f"active_listings={len(rows_after_module3)} "
-            f"module2_target_count={len(module2_target_ids)} "
-            "batching_disabled=True call_count=1"
-        )
-        print(log_line)
-        if on_log:
-            on_log(log_line)
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
-            json.dump(rows_after_module3, f, ensure_ascii=False)
-            module2_input = f.name
-        try:
-            _, json2 = module2_infer_prices.module2_run(
-                base_list_url=normalized_url,
-                input_file=module2_input,
-                out_dir=config.OUTPUT_DIR,
-                window_width=config.MODULE2_WINDOW_WIDTH,
-                step=config.MODULE2_STEP,
-                max_high=config.MODULE2_MAX_HIGH,
-                max_pages_per_window=config.MODULE2_MAX_PAGES_PER_WINDOW,
-                only_overwrite_na=True,
-                smart_start=True,
-                sweep_mode="setup_full_sweep",
-                target_mode="all",
-                target_listing_ids=module2_target_ids,
-                preserve_existing_price_display=True,
-                cancel_token=cancel_token,
-                on_log=on_log,
-                on_progress=on_progress,
-            )
-        finally:
-            try:
-                os.remove(module2_input)
-            except Exception:
-                pass
-        if getattr(cancel_token, "is_set", lambda: False)():
-            return {"status": "cancelled", "area_id": area_id}
-        if not json2:
-            retryable_module2 = _module2_retryable_last_result()
-            conn = connect(config.DB_PATH)
-            try:
-                if retryable_module2:
-                    upsert_area_monitoring_state(
-                        conn,
-                        area_id,
-                        setup_status="retry_wait",
-                        module2_status="retry_wait",
-                        last_error=retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
-                    )
-                else:
-                    upsert_area_monitoring_state(conn, area_id, setup_status="failed", module2_status="failed", last_error="Module2 failed to produce JSON output")
-                conn.commit()
-            finally:
-                conn.close()
-            if retryable_module2:
-                raise RealEstateBlockedError(
-                    retryable_module2.get("stopped_reason") or retryable_module2.get("browser_recovery_action") or "Module2 retryable browser/navigation interruption",
-                    retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
-                )
-            raise RuntimeError("Module2 failed to produce JSON output")
-        with open(json2, "r", encoding="utf-8") as f:
-            rows_after_module2 = json.load(f)
-        full_rows = _merge_rows_by_listing_id(rows_after_module3, rows_after_module2)
-
-    try:
-        run_id = ingest_full_rows(config.DB_PATH, normalized_url, full_rows, full_scan=True, emit_events=False)
-        price_counts = _record_price_states_for_rows(config.DB_PATH, area_id, full_rows, attempted_module2=module2_attempted)
+        run_id = ingest_full_rows(config.DB_PATH, normalized_url, rows1, full_scan=True, emit_events=False)
     except Exception as exc:
         conn = connect(config.DB_PATH)
         try:
             upsert_area_monitoring_state(
                 conn,
                 area_id,
-                setup_status="failed_ingest",
+                setup_status="failed",
                 module1_status="completed",
-                module3_status="completed",
-                module2_status="completed" if module2_attempted else "skipped",
-                active_listing_count=len(full_rows),
-                last_error=config.mask_sensitive_text(exc),
+                module3_status="pending",
+                module2_status="pending",
+                active_listing_count=len(rows1),
+                last_error=f"failed_ingest: {config.mask_sensitive_text(exc)}",
             )
             conn.commit()
         finally:
             conn.close()
         raise
+
+    batch_size = max(1, int(getattr(config, "BASELINE_DETAIL_BATCH_SIZE", 50)))
+    planned_batches = (len(rows1) + batch_size - 1) // batch_size
     conn = connect(config.DB_PATH)
     try:
+        db_layer.mark_search_baseline_completed(
+            conn,
+            area_id,
+            listings_collected=len(rows1),
+            new_count=0,
+            pages_checked=None,
+            total_pages_detected=None,
+            stop_reason="module1_setup_batched",
+        )
         upsert_area_monitoring_state(
             conn,
             area_id,
-            setup_status="ready",
+            setup_status="preparing",
             module1_status="completed",
-            module3_status="completed",
-            module2_status="completed",
-            active_listing_count=len(full_rows),
-            inferred_price_count=price_counts["inferred"],
-            unknown_price_count=price_counts["unknown"],
-            last_error=None,
-            set_ready=True,
+            module3_status="pending",
+            module2_status="pending",
+            active_listing_count=len(rows1),
+            inferred_price_count=0,
+            unknown_price_count=0,
+            last_error=f"details 0/{len(rows1)}",
         )
-        activate_area_subscriptions(conn, area_id)
+        detail_job = db_layer.enqueue_setup_detail_baseline_job(conn, area_id, dedupe_suffix="initial")
         conn.commit()
     finally:
         conn.close()
+    if on_log:
+        on_log(f"Baseline setup batched: area_id={area_id} rows_module1={len(rows1)} detail_batch_size={batch_size} detail_batches_planned={planned_batches}")
     return {
-        "status": "ready",
+        "status": "setup_batched",
         "area_id": area_id,
         "run_id": run_id,
         "rows_module1": len(rows1),
-        "rows_full": len(full_rows),
-        "module2_targets": len(module2_target_ids),
-        "module2_target_count": len(module2_target_ids),
-        "inferred_price_count": price_counts["inferred"],
-        "unknown_price_count": price_counts["unknown"],
+        "active_listing_count": len(rows1),
+        "detail_total": len(rows1),
+        "detail_batch_size": batch_size,
+        "detail_batches_planned": planned_batches,
+        "detail_batches_enqueued": 1 if detail_job and detail_job.get("created", True) else 0,
+        "detail_job": detail_job,
+        "price_setup_enqueued": False,
     }
 
 

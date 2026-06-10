@@ -5,6 +5,7 @@ import logging
 import socket
 import sys
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -122,13 +123,19 @@ def _safe_register_chat(update: Update) -> None:
 
 def _summarize_scheduler_result(result: dict[str, Any] | None) -> dict[str, Any]:
     result = result or {}
+    stale = result.get("stale_recovery") or {}
     return {
         "status": "completed",
         "created": len(result.get("created") or []),
         "skipped_duplicates": len(result.get("skipped_duplicates") or []),
+        "blocked_by_active_duplicate": len(result.get("skipped_duplicates") or []),
         "ready_searches": len(result.get("ready_search_ids_considered") or []),
         "not_ready_searches": len(result.get("not_ready_search_ids_considered") or []),
         "not_due": len(result.get("not_due") or []),
+        "stale_running_recovered": stale.get("recovered_count", 0),
+        "stale_running_failed": stale.get("failed_count", 0),
+        "stale_job_ids": stale.get("stale_job_ids") or [],
+        "recovered_job_types": stale.get("recovered_job_types") or [],
         "errors": len(result.get("errors") or []),
     }
 
@@ -161,8 +168,42 @@ def _format_summary(summary: dict[str, Any]) -> str:
 def _queue_status_snapshot(next_due_limit: int = 5) -> dict[str, Any]:
     active = job_queue.get_active_jobs()
     failed_by_lifecycle = job_queue.get_failed_job_summary_by_lifecycle(limit=5, include_inactive=True)
+    notification_diagnostics = {}
+    setup_progress = []
+    conn = _connect()
+    try:
+        notification_diagnostics = db_layer.get_notification_outbox_diagnostics(conn)
+        setup_jobs = [job for job in active if str(job.get("JobType") or "") in {"baseline_setup_area", "setup_detail_baseline", "setup_price_baseline"}]
+        for job in setup_jobs[:3]:
+            search_id = job.get("SearchID")
+            if search_id is None:
+                continue
+            state = db_layer.get_area_monitoring_state(conn, int(search_id)) or {}
+            sub = None
+            subs = db_layer.get_active_user_area_subscriptions_for_search(conn, int(search_id))
+            if subs:
+                sub = subs[0]
+            progress = db_layer.get_detail_baseline_progress(conn, sub) if sub else {}
+            total = int(progress.get("detail_baseline_total_count") or state.get("active_listing_count") or 0)
+            remaining = int(progress.get("detail_baseline_remaining_count") or 0)
+            done = int(progress.get("detail_baseline_completed_count") or max(0, total - remaining))
+            setup_progress.append({
+                "setup_search_id": int(search_id),
+                "setup_phase": job.get("JobType"),
+                "setup_job_id": job.get("JobID"),
+                "setup_target_total": total,
+                "setup_detail_done": done,
+                "setup_detail_remaining": remaining,
+                "setup_detail_percent": round((done / total * 100.0), 2) if total else 0,
+                "setup_price_status": state.get("module2_status"),
+                "setup_last_error_short": config.mask_sensitive_text(str(state.get("last_error") or ""))[:160],
+            })
+    finally:
+        conn.close()
     return {
         "summary": job_queue.get_queue_summary(),
+        "notification_outbox": notification_diagnostics,
+        "setup_progress": setup_progress,
         "running_jobs": [row for row in active if str(row.get("Status") or "").lower() == "running"],
         "retry_wait_jobs": [row for row in active if str(row.get("Status") or "").lower() == "retry_wait"],
         "next_due_jobs": job_queue.get_next_due_jobs(limit=next_due_limit),
@@ -244,8 +285,23 @@ def ensure_runtime_schema() -> None:
     try:
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
+        notification_sanitizer = db_layer.sanitize_notification_outbox(conn)
+        conn.commit()
+        recovery = job_queue.recover_stale_running_jobs(conn=conn)
+        logger.info("startup notification outbox sanitizer: %s", _format_summary(notification_sanitizer))
+        logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:
         conn.close()
+
+
+def _summarize_stale_recovery(recovery: dict[str, Any] | None) -> dict[str, Any]:
+    recovery = recovery or {}
+    return {
+        "stale_running_recovered": recovery.get("recovered_count", 0),
+        "stale_running_failed": recovery.get("failed_count", 0),
+        "stale_job_ids": recovery.get("stale_job_ids") or [],
+        "recovered_job_types": recovery.get("recovered_job_types") or [],
+    }
 
 
 async def scheduler_loop() -> None:
@@ -299,11 +355,16 @@ async def heartbeat_loop() -> None:
             try:
                 snapshot = await asyncio.to_thread(_queue_status_snapshot, 5)
                 logger.info(
-                    "heartbeat: queue=%s running=%s retry_wait=%s next_due=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
+                    "heartbeat: queue=%s notifications=%s sending=%s oldest_sending=%s running=%s retry_wait=%s next_due=%s active_setup_searches=%s setup_progress=%s active_failed_jobs=%s inactive_failed_jobs=%s last_scheduler=(%s) last_worker=(%s)",
                     _queue_counts_text(snapshot["summary"]),
+                    snapshot.get("notification_outbox", {}).get("queued_by_event_type", {}),
+                    snapshot.get("notification_outbox", {}).get("sending_count", 0),
+                    snapshot.get("notification_outbox", {}).get("oldest_sending_at"),
                     len(snapshot["running_jobs"]),
                     len(snapshot["retry_wait_jobs"]),
                     len(snapshot["next_due_jobs"]),
+                    len(snapshot.get("setup_progress", [])),
+                    snapshot.get("setup_progress", []),
                     _failed_jobs_text(snapshot["active_failed_jobs"]),
                     len(snapshot["inactive_failed_jobs"]),
                     _format_summary(RUNTIME_STATE.last_scheduler_summary),
@@ -404,8 +465,21 @@ def _remove_area_keyboard(areas: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def _setup_failed_for_retry(subscription: dict) -> bool:
+    area_status = str(subscription.get("AreaSetupStatus") or "").lower()
+    baseline = str(subscription.get("BaselineStatus") or "pending").lower()
+    detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
+    price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
+    return area_status == "failed" or baseline == "failed" or detail == "failed" or price == "failed"
+
+
 def _my_suburbs_keyboard(areas: list[dict]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"Remove {area.get('AreaLabel') or area.get('SearchURL')}", callback_data=f"remove_select:{area['UserAreaID']}")] for area in areas]
+    rows = []
+    for area in areas:
+        label = area.get("AreaLabel") or area.get("SearchURL")
+        if _setup_failed_for_retry(area):
+            rows.append([InlineKeyboardButton(f"🔁 Retry setup — {label}", callback_data=f"retry_setup:{area['UserAreaID']}")])
+        rows.append([InlineKeyboardButton(f"Remove {label}", callback_data=f"remove_select:{area['UserAreaID']}")])
     rows.append([InlineKeyboardButton(BUTTON_BACK, callback_data="menu:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -414,19 +488,66 @@ def _remove_confirm_keyboard(user_area_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, remove", callback_data=f"remove_confirm:{int(user_area_id)}"), InlineKeyboardButton("❌ Cancel", callback_data="remove_confirm:cancel")]])
 
 
+def _safe_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ready_active_listing_count(subscription: dict) -> tuple[int | None, bool]:
+    stored = _safe_int(subscription.get("AreaActiveListingCount"))
+    live = _safe_int(subscription.get("LiveActiveListingCount"))
+    baseline = _safe_int(subscription.get("BaselineListingsCollected"))
+    for count in (stored, live, baseline):
+        if count is not None and count > 0:
+            return count, True
+    if stored == 0 and live == 0:
+        return 0, True
+    if stored == 0 and live is None and baseline == 0:
+        return 0, True
+    if live == 0 and stored is None and baseline == 0:
+        return 0, True
+    return None, False
+
+
 def _status_label(subscription: dict) -> str:
     baseline = str(subscription.get("BaselineStatus") or "pending").lower()
     detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
     price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
-    if baseline == "failed" or detail == "failed" or price == "failed":
-        return "Failed"
-    if detail == "retry_wait":
-        return "Retrying"
-    if baseline == "completed" and detail == "completed" and price != "completed":
-        return "Preparing prices"
-    if subscription.get("NotificationReadyAt") and detail == "completed" and price == "completed":
+    area_status = str(subscription.get("AreaSetupStatus") or "").lower()
+    module1 = str(subscription.get("AreaModule1Status") or "").lower()
+    module3 = str(subscription.get("AreaModule3Status") or "").lower()
+    module2 = str(subscription.get("AreaModule2Status") or "").lower()
+    module_statuses = {module1, module3, module2}
+    if subscription.get("NotificationReadyAt") and (area_status == "ready" or (detail == "completed" and price == "completed")):
+        count, count_is_known = _ready_active_listing_count(subscription)
+        if count is not None and count > 0:
+            return f"Ready — {count} listings monitored"
+        if count_is_known and count == 0:
+            return "Ready — no active listings"
         return "Ready"
-    return "Preparing"
+    if _setup_failed_for_retry(subscription):
+        return "Failed — tap Retry setup"
+    if module3 == "retry_wait" or detail == "retry_wait":
+        return "Preparing — retrying details"
+    if module2 == "retry_wait" or price == "retry_wait":
+        return "Preparing — retrying price setup"
+    progress_text = str(subscription.get("AreaLastError") or "")
+    match = re.search(r"details\s+(\d+)\s*/\s*(\d+)", progress_text, flags=re.I)
+    if module3 == "running" and match:
+        return f"Preparing — details {match.group(1)}/{match.group(2)}"
+    if module2 == "running" or price == "running":
+        return "Preparing — running price setup"
+    if module1 == "running":
+        return "Preparing — scanning listings"
+    if area_status == "preparing" or "running" in module_statuses or baseline == "running" or detail == "running" or price == "running":
+        return "Preparing — setup in progress"
+    if baseline == "completed" and detail == "completed" and price != "completed":
+        return "Preparing — price setup queued"
+    return "Preparing — setup queued"
 
 
 def _session(telegram_user_id: int) -> dict:
@@ -632,7 +753,7 @@ async def handle_remove_callback(update: Update, context: ContextTypes.DEFAULT_T
     finally:
         conn.close()
     logger.info(
-        "remove area requested: telegram_user_id=%s user_area_id=%s resolved_search_id=%s resolved_area_id=%s remaining_active_subscriptions=%s action=%s cancelled_jobs=%s",
+        "remove area requested: telegram_user_id=%s user_area_id=%s resolved_search_id=%s resolved_area_id=%s remaining_active_subscriptions=%s action=%s cancelled_jobs=%s cancelled_notifications=%s",
         telegram_user_id,
         user_area_id,
         lifecycle.get("resolved_search_id"),
@@ -640,8 +761,38 @@ async def handle_remove_callback(update: Update, context: ContextTypes.DEFAULT_T
         lifecycle.get("remaining_active_subscriptions"),
         lifecycle.get("action"),
         lifecycle.get("cancelled_jobs"),
+        lifecycle.get("cancelled_notifications"),
     )
     await query.edit_message_text(f"Stopped monitoring {area.get('AreaLabel') if area else 'that suburb'}." if lifecycle.get("removed") else "That suburb is already inactive.")
+    await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
+
+
+async def handle_retry_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    telegram_user_id = register_chat(update)
+    try:
+        user_area_id = int(query.data.split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        await query.edit_message_text("That retry request is invalid. Please open My suburbs and try again.")
+        return
+    conn = _connect()
+    try:
+        areas = db_layer.list_user_area_subscriptions(conn, telegram_user_id)
+        area = next((item for item in areas if int(item["UserAreaID"]) == user_area_id), None)
+        if not area:
+            await query.edit_message_text("That suburb is no longer active for your account.")
+            return
+        result = db_layer.retry_setup_area(conn, user_area_id=user_area_id)
+    finally:
+        conn.close()
+    label = area.get("AreaLabel") or result.get("area_label") or "that suburb"
+    if result.get("reason") == "active_subscription_not_found":
+        await query.edit_message_text(f"{label} is no longer active for your account.")
+    elif result.get("created"):
+        await query.edit_message_text(f"🔁 Retrying setup for {label}. I’ll notify you when it is ready.")
+    else:
+        await query.edit_message_text(f"🔁 Setup retry is already queued or running for {label}. I’ll notify you when it is ready.")
     await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
 
 
@@ -762,6 +913,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Queue loop: {'running' if RUNTIME_STATE.scheduler_loop_running else 'stopped'}\n"
             f"Worker loop: {'running' if RUNTIME_STATE.worker_loop_running else 'stopped'}\n"
             f"Queue: {_queue_counts_text(snapshot['summary'])}\n"
+            f"Notifications queued: {snapshot.get('notification_outbox', {}).get('queued_by_event_type', {})}\n"
+            f"Notifications sending: {snapshot.get('notification_outbox', {}).get('sending_count', 0)}\n"
             f"Running jobs: {len(snapshot['running_jobs'])}\n"
             f"Retry-wait jobs: {len(snapshot['retry_wait_jobs'])}\n"
             f"Next due jobs: {len(snapshot['next_due_jobs'])}\n"
@@ -790,6 +943,8 @@ async def queue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             "Queue\n"
             f"Counts: {_queue_counts_text(snapshot['summary'])}\n"
+            f"Notifications queued: {snapshot.get('notification_outbox', {}).get('queued_by_event_type', {})}\n"
+            f"Notifications sending: {snapshot.get('notification_outbox', {}).get('sending_count', 0)}\n"
             f"Running jobs: {len(snapshot['running_jobs'])}\n"
             f"Retry-wait jobs: {len(snapshot['retry_wait_jobs'])}\n"
             "Next due jobs:\n"
@@ -815,6 +970,7 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CallbackQueryHandler(handle_area_callback, pattern="^(area_candidate:|area_confirm:).+"))
     app.add_handler(CallbackQueryHandler(handle_remove_callback, pattern="^(remove_select:|remove_confirm:).+"))
+    app.add_handler(CallbackQueryHandler(handle_retry_setup_callback, pattern="^retry_setup:"))
     app.add_handler(CallbackQueryHandler(handle_export_area_selection, pattern="^export_area:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -822,7 +978,7 @@ def build_application(token: str) -> Application:
 
 
 def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=getattr(logging, getattr(config, "SCRAPER_LOG_LEVEL", "INFO"), logging.INFO), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     for logger_name in ("httpx", "httpcore", "telegram.request", "telegram.vendor.ptb_urllib3"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
 

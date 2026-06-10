@@ -146,6 +146,24 @@ def refresh_active_listings(
             "error": item.get("error"),
         })
 
+    if context == "initial_detail_baseline" and failed_rows and not dry_run:
+        conn = db_layer.connect(config.DB_PATH)
+        try:
+            search_id = int((subscription or {}).get("SearchID") or db_layer._detail_refresh_search_id(conn, search_url, subscription=subscription))
+            for row in failed_rows:
+                item = _failed_item(row)
+                db_layer.mark_listing_setup_detail_failed(
+                    conn,
+                    search_id,
+                    listing_id=item.get("db_listing_id"),
+                    external_id=item.get("external_id"),
+                    error=item.get("error"),
+                    max_attempts=getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     if dry_run:
         conn = db_layer.connect(config.DB_PATH)
         try:

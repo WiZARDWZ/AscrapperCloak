@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from datetime import datetime, timedelta
@@ -12,6 +13,8 @@ import pyodbc
 import config
 import listing_change_detector
 from area_parser import parse_area_to_sqm
+
+logger = logging.getLogger(__name__)
 
 MISSING_TOKENS = {"", "n/a", "na", "-", "—", "null", "none"}
 NUMERIC_MISSING_EXTRA = {"unknown"}
@@ -321,6 +324,77 @@ def clean_text(value: Any, max_len: Optional[int] = None, none_if_missing: bool 
         out = out[:max_len]
     return out
 
+
+def _strip_unsafe_control_chars(value: str) -> str:
+    # SQL Server string columns should never receive embedded NULs or low
+    # control characters from scraped DOM text. Preserve normal whitespace here;
+    # callers decide whether to collapse it for labels.
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", value)
+
+
+def clean_limited_text(value: Any, max_len: int, *, none_if_missing: bool = True, field_name: str | None = None, normalize_whitespace: bool = True) -> Optional[str]:
+    if value is None:
+        return None if none_if_missing else ""
+    out = _strip_unsafe_control_chars(str(value)).strip()
+    if normalize_whitespace:
+        out = re.sub(r"\s+", " ", out).strip()
+    if none_if_missing and is_missing(out):
+        return None
+    if max_len and len(out) > max_len:
+        logger.debug("Truncating scraped text field %s from %s to %s characters", field_name or "unknown", len(out), max_len)
+        out = out[:max_len].rstrip()
+    return out
+
+
+_AUCTION_LABEL_RE = re.compile(r"\bauction\b", re.I)
+_FULL_CARD_HINT_RE = re.compile(
+    r"\b(?:bed|beds|bath|baths|car|cars|parking|inspection|inspect|open\s+home|agent|agency|sqm|m²|studio)\b|\d+\s*/\s*\d+|\d+\s+[A-Za-z].*(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|gardens|gdn|crescent|cres)\b",
+    re.I,
+)
+
+
+def _short_label_lines(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw = _strip_unsafe_control_chars(str(value)).replace("\r", "\n")
+    return [re.sub(r"\s+", " ", line).strip() for line in raw.split("\n") if re.sub(r"\s+", " ", line).strip()]
+
+
+def sanitize_auction_time_label(value: Any, max_len: int = 100) -> Optional[str]:
+    """Return a short auction label or None; never persist full listing-card text."""
+    lines = _short_label_lines(value)
+    if not lines:
+        return None
+    source = str(value)
+    candidate = next((line for line in lines if _AUCTION_LABEL_RE.search(line)), lines[0] if len(lines) == 1 else None)
+    if not candidate:
+        logger.debug("Dropping multi-line auction label without auction marker")
+        return None
+    multi_line = len(lines) > 1
+    if not _AUCTION_LABEL_RE.search(candidate):
+        return None
+    if len(candidate) > max_len * 2:
+        logger.debug("Dropping overlong auction label candidate (%s chars)", len(candidate))
+        return None
+    if multi_line and _FULL_CARD_HINT_RE.search(candidate) and len(candidate) > 60:
+        logger.debug("Dropping auction label candidate that resembles full card text")
+        return None
+    sanitized = clean_limited_text(candidate, max_len, field_name="AuctionTimeLabel")
+    if sanitized and sanitized != re.sub(r"\s+", " ", _strip_unsafe_control_chars(source)).strip():
+        logger.debug("Sanitized AuctionTimeLabel from scraped card text")
+    return sanitized
+
+
+def sanitize_snapshot_label(value: Any, max_len: int, field_name: str) -> Optional[str]:
+    lines = _short_label_lines(value)
+    if not lines:
+        return None
+    if len(lines) > 1:
+        preferred = next((line for line in lines if re.search(r"\b(?:inspection|inspect|open|auction)\b", line, re.I)), lines[0])
+    else:
+        preferred = lines[0]
+    return clean_limited_text(preferred, max_len, field_name=field_name)
+
 def to_int(value: Any) -> Optional[int]:
     if is_missing(value, numeric_or_date=True):
         return None
@@ -590,8 +664,8 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
         ext = extract_external_listing_id(row)
     except ValueError as exc:
         raise ValueError("bad_listing_id") from exc
-    detail_price_display = clean_text(row.get("detail_price_display"), 300)
-    row_price_display = clean_text(row.get("AdPriceDisplay") or row.get("ad_price_display") or row.get("price_display") or row.get("CurrentPriceDisplay") or row.get("price"), 300)
+    detail_price_display = clean_limited_text(row.get("detail_price_display"), 300, field_name="PriceDisplay")
+    row_price_display = clean_limited_text(row.get("AdPriceDisplay") or row.get("ad_price_display") or row.get("price_display") or row.get("CurrentPriceDisplay") or row.get("price"), 300, field_name="PriceDisplay")
 
     detail_low, detail_high = parse_price_range(detail_price_display) if detail_price_display else (None, None)
     row_low, row_high = parse_price_range(row_price_display) if row_price_display else (None, None)
@@ -614,22 +688,23 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
     price_value = low if low is not None and high is not None and low == high else None
     parking_raw = row.get("parking")
     parking = 0 if isinstance(parking_raw, str) and parking_raw.strip().lower() in {"no parking", "no garage"} else to_tinyint(parking_raw)
-    land_size_display = clean_text(_first_row_value(row, "LandSizeDisplay", "land_size_display"), 100)
-    building_size_display = clean_text(_first_row_value(row, "BuildingSizeDisplay", "building_size_display"), 100)
-    floor_area_display = clean_text(_first_row_value(row, "FloorAreaDisplay", "floor_area_display"), 100)
+    land_size_display = clean_limited_text(_first_row_value(row, "LandSizeDisplay", "land_size_display"), 100, field_name="LandSizeDisplay")
+    building_size_display = clean_limited_text(_first_row_value(row, "BuildingSizeDisplay", "building_size_display"), 100, field_name="BuildingSizeDisplay")
+    floor_area_display = clean_limited_text(_first_row_value(row, "FloorAreaDisplay", "floor_area_display"), 100, field_name="FloorAreaDisplay")
+    auction_label_source = _first_row_value(row, "auction_label", "AuctionTimeLabel", "auction_time_label", "auction_time")
     agents_in = row.get("agents") or []
     agents = []
     for a in agents_in:
         if isinstance(a, str):
             a = {"name": a}
-        name = clean_text(a.get("name"), 200)
+        name = clean_limited_text(a.get("name"), 200, field_name="AgentName")
         if not name:
             continue
-        agents.append({"name": name, "phone": clean_text(a.get("phone"), 80), "profile_url": clean_text(a.get("profile_url"), 600), "external_id": clean_text(a.get("external_id"), 120)})
+        agents.append({"name": name, "phone": clean_limited_text(a.get("phone"), 80, field_name="AgentPhoneNumber"), "profile_url": clean_limited_text(a.get("profile_url"), 600, field_name="AgentProfileURL"), "external_id": clean_limited_text(a.get("external_id"), 120, field_name="AgentExternalID")})
     return {
         "external_id": ext,
-        "address": clean_text(row.get("address"), 500),
-        "property_type": clean_text(row.get("property_type"), 100) or "unknown",
+        "address": clean_limited_text(row.get("address"), 500, field_name="Address"),
+        "property_type": clean_limited_text(row.get("property_type"), 100, field_name="PropertyType") or "unknown",
         "bedrooms": to_tinyint(row.get("bedrooms")),
         "bathrooms": to_tinyint(row.get("bathrooms")),
         "parking": parking,
@@ -641,22 +716,22 @@ def normalize_listing_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "building_size_sqm": _area_decimal(row, "BuildingSizeSqm", "BuildingSizeDisplay"),
         "floor_area_display": floor_area_display,
         "floor_area_sqm": _area_decimal(row, "FloorAreaSqm", "FloorAreaDisplay"),
-        "agency_name": clean_text(row.get("agency_name") or row.get("agency"), 300),
-        "agency_external_code": clean_text(row.get("agency_code"), 120),
-        "agency_profile_url": clean_text(row.get("agency_profile_url"), 600),
-        "agency_phone": clean_text(row.get("agency_phone"), 80),
-        "agency_address": clean_text(row.get("agency_address"), 500),
+        "agency_name": clean_limited_text(row.get("agency_name") or row.get("agency"), 300, field_name="AgencyName"),
+        "agency_external_code": clean_limited_text(row.get("agency_code"), 120, field_name="AgencyExternalCode"),
+        "agency_profile_url": clean_limited_text(row.get("agency_profile_url"), 600, field_name="AgencyProfileURL"),
+        "agency_phone": clean_limited_text(row.get("agency_phone"), 80, field_name="AgencyPhone"),
+        "agency_address": clean_limited_text(row.get("agency_address"), 500, field_name="AgencyAddress"),
         "agents": agents,
         "price_display": price_display,
         "price_value": price_value,
         "price_low": low,
         "price_high": high,
         "price_method": pm,
-        "description": clean_text(row.get("description"), 4000),
-        "inspection_short_label": clean_text(row.get("inspection_short_label"), 200),
-        "inspection_long_label": clean_text(row.get("inspection_long_label"), 500),
-        "auction_label": clean_text(row.get("auction_label"), 200),
-        "url": clean_text(row.get("url"), 1000),
+        "description": clean_limited_text(row.get("description"), 4000, field_name="Description", normalize_whitespace=False),
+        "inspection_short_label": sanitize_snapshot_label(row.get("inspection_short_label"), 200, "InspectionShort"),
+        "inspection_long_label": sanitize_snapshot_label(row.get("inspection_long_label"), 500, "InspectionLong"),
+        "auction_label": sanitize_auction_time_label(auction_label_source),
+        "url": clean_limited_text(row.get("url"), 1000, field_name="ListingURL"),
     }
 
 def _upsert_search(conn, url):
@@ -1649,6 +1724,19 @@ def ensure_listing_search_state_detail_refresh_column(conn) -> None:
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NULL
         ALTER TABLE dbo.ListingSearchState ADD LastDetailRefreshAt DATETIME2 NULL
         """, description="add dbo.ListingSearchState.LastDetailRefreshAt", required=False)
+    for column_name, definition in {
+        "SetupDetailStatus": "NVARCHAR(40) NULL",
+        "SetupDetailAttemptCount": "INT NOT NULL CONSTRAINT DF_ListingSearchState_SetupDetailAttemptCount DEFAULT (0)",
+        "SetupDetailLastAttemptAt": "DATETIME2 NULL",
+        "SetupDetailNextRetryAt": "DATETIME2 NULL",
+        "SetupDetailLastError": "NVARCHAR(1000) NULL",
+        "SetupDetailCompletedAt": "DATETIME2 NULL",
+    }.items():
+        _execute_ddl_safely(conn, f"""
+            IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+            AND COL_LENGTH('dbo.ListingSearchState', '{column_name}') IS NULL
+            ALTER TABLE dbo.ListingSearchState ADD {column_name} {definition}
+            """, description=f"add dbo.ListingSearchState.{column_name}", required=False)
     _execute_ddl_safely(conn, """
         IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NOT NULL
@@ -1656,6 +1744,13 @@ def ensure_listing_search_state_detail_refresh_column(conn) -> None:
         CREATE INDEX IX_ListingSearchState_DetailRefreshDue
         ON dbo.ListingSearchState(SearchID, Status, LastDetailRefreshAt, ListingID)
         """, description="create IX_ListingSearchState_DetailRefreshDue", required=False)
+    _execute_ddl_safely(conn, """
+        IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SetupDetailStatus') IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ListingSearchState_SetupDetailDue' AND object_id=OBJECT_ID('dbo.ListingSearchState'))
+        CREATE INDEX IX_ListingSearchState_SetupDetailDue
+        ON dbo.ListingSearchState(SearchID, SetupDetailStatus, SetupDetailNextRetryAt, LastDetailRefreshAt, ListingID)
+        """, description="create IX_ListingSearchState_SetupDetailDue", required=False)
 
 
 def ensure_listing_lifecycle_columns(conn) -> None:
@@ -1937,13 +2032,72 @@ def apply_listing_lifecycle_signal(
     return transition
 
 
-def mark_listing_search_state_detail_refreshed(conn, search_id: int, listing_id: int) -> None:
+SETUP_DETAIL_DONE_STATUSES = {"detail_complete", "detail_partial_complete", "detail_failed_permanent"}
+
+
+def mark_listing_search_state_detail_refreshed(conn, search_id: int, listing_id: int, setup_detail_status: str | None = None) -> None:
     ensure_listing_search_state_detail_refresh_column(conn)
+    status = setup_detail_status if setup_detail_status in {"detail_complete", "detail_partial_complete"} else "detail_complete"
     conn.cursor().execute(
-        "UPDATE dbo.ListingSearchState SET LastDetailRefreshAt=SYSDATETIME(), UpdatedAt=SYSDATETIME() WHERE SearchID=? AND ListingID=?",
+        """
+        UPDATE dbo.ListingSearchState
+        SET LastDetailRefreshAt=SYSDATETIME(),
+            SetupDetailStatus=?,
+            SetupDetailCompletedAt=SYSDATETIME(),
+            SetupDetailAttemptCount=0,
+            SetupDetailNextRetryAt=NULL,
+            SetupDetailLastError=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
         int(search_id),
         int(listing_id),
     )
+
+
+def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | None = None, external_id: str | None = None, error: str | None = None, retry_after=None, max_attempts: int | None = None) -> dict:
+    ensure_listing_search_state_detail_refresh_column(conn)
+    max_attempts = int(max_attempts or getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5))
+    safe_error = config.mask_sensitive_text(error or "setup detail technical failure")
+    cur = conn.cursor()
+    if listing_id is None and external_id is not None:
+        row = _one(cur, "SELECT listingID FROM dbo.Listing WHERE ExternalID=?", str(external_id))
+        listing_id = int(row[0]) if row else None
+    if listing_id is None:
+        return {"updated": False, "reason": "listing_not_found"}
+    cur.execute(
+        """
+        SELECT COALESCE(SetupDetailAttemptCount, 0)
+        FROM dbo.ListingSearchState
+        WHERE SearchID=? AND ListingID=?
+        """,
+        int(search_id),
+        int(listing_id),
+    )
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) + 1 if row else 1
+    status = "detail_failed_permanent" if attempts >= max_attempts else "detail_retry_wait"
+    next_retry = None if status == "detail_failed_permanent" else retry_after
+    cur.execute(
+        """
+        UPDATE dbo.ListingSearchState
+        SET SetupDetailStatus=?,
+            SetupDetailAttemptCount=?,
+            SetupDetailLastAttemptAt=SYSDATETIME(),
+            SetupDetailNextRetryAt=?,
+            SetupDetailLastError=?,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
+        attempts,
+        next_retry,
+        safe_error,
+        int(search_id),
+        int(listing_id),
+    )
+    return {"updated": True, "listing_id": int(listing_id), "status": status, "attempts": attempts, "next_retry_at": next_retry}
 
 
 def force_listing_search_state_detail_refresh_due(conn, search_id: int, hours: int | None = 3, set_null: bool = False) -> dict:
@@ -2017,7 +2171,9 @@ def get_active_listings_for_detail_refresh(
     sid = _detail_refresh_search_id(conn, search_url, subscription=subscription)
     targeted_external_id = clean_text(listing_external_id, 50)
     safe_limit = 1 if targeted_external_id else max(1, int(limit or 1))
-    effective_stale_hours = None if targeted_external_id else (None if stale_hours is None or int(stale_hours) <= 0 else int(stale_hours))
+    setup_started_at = (subscription or {}).get("DetailBaselineStartedAt")
+    setup_mode = bool(not targeted_external_id and setup_started_at is not None and stale_hours is not None and int(stale_hours) <= 0)
+    effective_stale_hours = None if targeted_external_id or setup_mode else (None if stale_hours is None or int(stale_hours) <= 0 else int(stale_hours))
     cur = conn.cursor()
     sql = """
     SELECT TOP (?)
@@ -2034,7 +2190,10 @@ def get_active_listings_for_detail_refresh(
         p.Parkingslot AS parking,
         COALESCE(lss.Status, l.CurrentStatus) AS current_status,
         COALESCE(lss.ListingLifecycleStatus, lss.Status, l.CurrentStatus, 'active') AS ListingLifecycleStatus,
-        lss.LastDetailRefreshAt AS last_detail_refresh_at
+        lss.LastDetailRefreshAt AS last_detail_refresh_at,
+        lss.SetupDetailStatus AS setup_detail_status,
+        lss.SetupDetailAttemptCount AS setup_detail_attempt_count,
+        lss.SetupDetailNextRetryAt AS setup_detail_next_retry_at
     FROM dbo.ListingSearchState lss
     JOIN dbo.Listing l ON l.listingID = lss.ListingID
     LEFT JOIN dbo.Property p ON p.PropertyID = l.PropertyID
@@ -2044,15 +2203,26 @@ def get_active_listings_for_detail_refresh(
       AND NULLIF(LTRIM(RTRIM(COALESCE(l.ListingURL, ''))), '') IS NOT NULL
       AND (? IS NULL OR CAST(l.ExternalID AS NVARCHAR(50)) = ?)
       AND (
+            ? = 0
+            OR (
+                COALESCE(lss.SetupDetailStatus, '') NOT IN ('detail_complete','detail_partial_complete','detail_failed_permanent')
+                AND (lss.SetupDetailNextRetryAt IS NULL OR lss.SetupDetailNextRetryAt <= SYSDATETIME())
+                AND (lss.LastDetailRefreshAt IS NULL OR lss.LastDetailRefreshAt < ?)
+            )
+      )
+      AND (
             ? IS NULL
             OR lss.LastDetailRefreshAt IS NULL
             OR DATEADD(hour, ?, lss.LastDetailRefreshAt) <= SYSDATETIME()
       )
-    ORDER BY CASE WHEN lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
+    ORDER BY CASE WHEN ? = 1 AND lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
+             CASE WHEN ? = 1 THEN l.listingID ELSE 0 END ASC,
+             CASE WHEN ? = 0 AND lss.LastDetailRefreshAt IS NULL THEN 0 ELSE 1 END ASC,
              lss.LastDetailRefreshAt ASC,
              l.listingID ASC
     """
-    cur.execute(sql, safe_limit, sid, targeted_external_id, targeted_external_id, effective_stale_hours, effective_stale_hours)
+    setup_flag = 1 if setup_mode else 0
+    cur.execute(sql, safe_limit, sid, targeted_external_id, targeted_external_id, setup_flag, setup_started_at, effective_stale_hours, effective_stale_hours, setup_flag, setup_flag, setup_flag)
     cols = [c[0] for c in cur.description]
     return [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
 
@@ -2188,7 +2358,11 @@ def ingest_detail_refresh_rows_conn(
             apply_listing_lifecycle_signal(conn, sid, lid, "sold", persisted_row.get("StatusReason") or "sold_evidence", persisted_row.get("StatusEvidence"), run_id=run_id, create_event=True)
         else:
             apply_listing_lifecycle_signal(conn, sid, lid, "active", None, None, run_id=run_id, create_event=False)
-        mark_listing_search_state_detail_refreshed(conn, sid, lid)
+        setup_detail_status = None
+        if context == "initial_detail_baseline":
+            quality = str(persisted_row.get("detail_extraction_quality") or persisted_row.get("detail_quality") or "").lower()
+            setup_detail_status = "detail_partial_complete" if quality in {"partial", "sparse", "partial_complete"} else "detail_complete"
+        mark_listing_search_state_detail_refreshed(conn, sid, lid, setup_detail_status=setup_detail_status)
         create_audit_events = should_create_listing_events_for_context(context, suppress_notifications)
         if create_audit_events and old_state and old_state.get("listing_id") and item["events_detected"]:
             created = 0
@@ -2756,10 +2930,210 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
     return [str(row[0]) for row in cur.fetchall() if row and row[0] is not None]
 
 
+
+
+
+SETUP_PIPELINE_JOB_TYPES = {"baseline_setup_area", "setup_detail_baseline", "setup_price_baseline"}
+SETUP_PIPELINE_ACTIVE_STATUSES = {"queued", "running", "retry_wait"}
+
+
+def get_active_setup_pipeline_jobs(conn, search_id: int) -> list[dict]:
+    """Return active setup-pipeline jobs that should block fresh baseline repair."""
+    try:
+        row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
+        if not row or row[0] is None:
+            return []
+    except Exception:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT JobID, JobType, SearchID, UserAreaID, Status, RunAfter, AttemptCount, MaxAttempts, DedupeKey, CreatedAt, UpdatedAt
+        FROM dbo.Job
+        WHERE SearchID=?
+          AND JobType IN ('baseline_setup_area','setup_detail_baseline','setup_price_baseline')
+          AND Status IN ('queued','running','retry_wait')
+        ORDER BY Priority ASC, RunAfter ASC, CreatedAt ASC, JobID ASC
+        """,
+        int(search_id),
+    )
+    try:
+        return _rows_to_dicts(cur)
+    except Exception:
+        return []
+
+
+def has_active_setup_pipeline_job(conn, search_id: int) -> bool:
+    return bool(get_active_setup_pipeline_jobs(conn, int(search_id)))
+
+def cancel_setup_phase_jobs_for_search(conn, search_id: int, reason: str = "setup retry reset cancels queued setup phase jobs") -> int:
+    """Cancel queued/retry setup detail and full-price phase jobs without cancelling the orchestrator."""
+    safe_reason = config.mask_sensitive_text(reason or "setup phase reset")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        IF OBJECT_ID('dbo.Job') IS NOT NULL
+        UPDATE dbo.Job
+        SET Status='cancelled',
+            FinishedAt=COALESCE(FinishedAt, SYSDATETIME()),
+            UpdatedAt=SYSDATETIME(),
+            LastError=?
+        WHERE SearchID=?
+          AND JobType IN ('setup_detail_baseline','setup_price_baseline')
+          AND Status IN ('pending','paused','queued','retry_wait','scheduled')
+        """,
+        safe_reason,
+        int(search_id),
+    )
+    try:
+        return int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+    except Exception:
+        return 0
+
+def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | None = None) -> dict:
+    """Reset a failed/preparing setup to a supported preparing state and enqueue baseline once."""
+    ensure_telegram_bot_tables(conn)
+    cur = conn.cursor()
+    if user_area_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE UserAreaID=? AND IsActive=1
+            """,
+            int(user_area_id),
+        )
+    elif search_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE SearchID=? AND IsActive=1
+            ORDER BY UserAreaID ASC
+            """,
+            int(search_id),
+        )
+    else:
+        raise ValueError("user_area_id or search_id is required")
+    row = cur.fetchone()
+    if not row:
+        conn.commit()
+        return {"created": False, "reason": "active_subscription_not_found", "user_area_id": user_area_id, "search_id": search_id}
+
+    resolved_user_area_id = int(row[0])
+    resolved_telegram_user_id = int(row[1])
+    resolved_search_id = int(row[2])
+    search_url = str(row[3])
+    area_label = str(row[4] or search_url)
+    upsert_area_monitoring_state(
+        conn,
+        resolved_search_id,
+        setup_status="preparing",
+        module1_status="pending",
+        module3_status="pending",
+        module2_status="pending",
+        active_listing_count=0,
+        inferred_price_count=0,
+        unknown_price_count=0,
+        last_error=None,
+        set_started=True,
+    )
+    cur.execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET SubscriptionStatus='preparing',
+            NotifyEnabled=0,
+            BaselineStatus='pending',
+            BaselineStartedAt=NULL,
+            BaselineCompletedAt=NULL,
+            BaselineLastError=NULL,
+            DetailBaselineStatus='pending',
+            DetailBaselineStartedAt=NULL,
+            DetailBaselineCompletedAt=NULL,
+            DetailBaselineAttemptCount=0,
+            DetailBaselineLastAttemptAt=NULL,
+            DetailBaselineNextRetryAt=NULL,
+            DetailBaselineLastError=NULL,
+            PriceBaselineStatus='pending',
+            PriceBaselineStartedAt=NULL,
+            PriceBaselineCompletedAt=NULL,
+            PriceBaselineLastError=NULL,
+            NotificationReadyAt=NULL,
+            BaselineSummarySentAt=NULL,
+            DetailBaselineStartedSummarySentAt=NULL,
+            ReadySummarySentAt=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        resolved_search_id,
+    )
+    upsert_user_area_subscription_state(conn, resolved_telegram_user_id, resolved_search_id, status="preparing", notify_enabled=False)
+    cancelled_setup_phase_jobs = cancel_setup_phase_jobs_for_search(conn, resolved_search_id, reason="setup retry reset cancels queued setup phase jobs")
+    conn.commit()
+    baseline_job = enqueue_baseline_setup_job(conn, resolved_search_id, search_url)
+    conn.commit()
+    return {
+        "created": bool(baseline_job and baseline_job.get("created")),
+        "reason": "setup_retry_enqueued" if bool(baseline_job and baseline_job.get("created")) else "baseline_job_already_active",
+        "user_area_id": resolved_user_area_id,
+        "search_id": resolved_search_id,
+        "area_label": area_label,
+        "baseline_job": baseline_job,
+        "cancelled_setup_phase_jobs": cancelled_setup_phase_jobs,
+    }
+
+
+
+def enqueue_setup_detail_baseline_job(conn, search_id: int, user_area_id: int | None = None, run_after=None, dedupe_suffix: str = "initial") -> dict | None:
+    """Enqueue one bounded Module3 setup-detail batch for a search."""
+    import job_queue
+
+    return job_queue.enqueue_job_once(
+        job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE,
+        search_id=int(search_id),
+        user_area_id=int(user_area_id) if user_area_id is not None else None,
+        priority=job_queue.PRIORITY_SETUP,
+        run_after=run_after or datetime.now(),
+        payload={"search_id": int(search_id), "phase": "module3_detail_baseline", "dedupe_suffix": str(dedupe_suffix or "initial")},
+        dedupe_key=f"{job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE}:search_id={int(search_id)}:{dedupe_suffix or 'initial'}",
+        max_attempts=5,
+    )
+
+
+def enqueue_setup_price_baseline_job(conn, search_id: int, user_area_id: int | None = None, run_after=None) -> dict | None:
+    """Enqueue exactly one full Module2 setup-price job for a search."""
+    import job_queue
+
+    return job_queue.enqueue_job_once(
+        job_queue.JOB_TYPE_SETUP_PRICE_BASELINE,
+        search_id=int(search_id),
+        user_area_id=int(user_area_id) if user_area_id is not None else None,
+        priority=job_queue.PRIORITY_SETUP,
+        run_after=run_after or datetime.now(),
+        payload={"search_id": int(search_id), "phase": "module2_full_setup", "module2_batching": False},
+        dedupe_key=f"{job_queue.JOB_TYPE_SETUP_PRICE_BASELINE}:search_id={int(search_id)}:full",
+        max_attempts=3,
+    )
+
+
+def is_area_setup_ready(conn, search_id: int) -> bool:
+    """Central setup readiness guard used before activating subscriptions."""
+    state = get_area_monitoring_state(conn, int(search_id)) or {}
+    setup_status = str(state.get("setup_status") or "").lower()
+    if setup_status in {"inactive", "failed"}:
+        return False
+    module1 = str(state.get("module1_status") or "").lower()
+    module3 = str(state.get("module3_status") or "").lower()
+    module2 = str(state.get("module2_status") or "").lower()
+    return module1 == "completed" and module3 in {"completed", "skipped"} and module2 in {"completed", "completed_with_unknowns", "skipped"}
+
 def enqueue_baseline_setup_job(conn, area_id: int, search_url: str) -> dict | None:
     """Enqueue one active baseline_setup_area job per area."""
     ensure_monitoring_state_tables(conn)
     state = get_area_monitoring_state(conn, int(area_id))
+    active_setup_jobs = get_active_setup_pipeline_jobs(conn, int(area_id))
+    if active_setup_jobs:
+        return {"created": False, "duplicate": True, "reason": "active_setup_pipeline_job", "search_id": int(area_id), "active_job_types": sorted({str(job.get("JobType")) for job in active_setup_jobs}), "active_job_ids": [job.get("JobID") for job in active_setup_jobs]}
     if state and str(state.get("setup_status") or "").lower() == "ready":
         return {"created": False, "skipped": True, "reason": "area_ready", "search_id": int(area_id)}
     current_status = str(state.get("setup_status") or "not_started").lower() if state else "not_started"
@@ -3381,7 +3755,7 @@ def get_queued_notifications(conn, limit: int = 20, channel: str = "telegram") -
                NotificationKey, EventType, MessageText, Status, AttemptCount, LastError,
                CreatedAt, QueuedAt, SentAt, SkippedAt
         FROM dbo.NotificationOutbox
-        WHERE Status='queued' AND Channel=?
+        WHERE Status='queued' AND Channel=? AND COALESCE(QueuedAt, CreatedAt) <= SYSDATETIME()
         ORDER BY NotificationID ASC
         """,
         max(1, int(limit or 1)),
@@ -3393,9 +3767,10 @@ def get_queued_notifications(conn, limit: int = 20, channel: str = "telegram") -
 def mark_notification_sending(conn, notification_id):
     cur = conn.cursor()
     cur.execute(
-        "UPDATE dbo.NotificationOutbox SET Status='sending', LastError=NULL WHERE NotificationID=?",
+        "UPDATE dbo.NotificationOutbox SET Status='sending', AttemptCount=AttemptCount+1, QueuedAt=SYSDATETIME(), LastError=NULL WHERE NotificationID=? AND Status='queued'",
         notification_id,
     )
+    return bool(getattr(cur, "rowcount", 1) != 0)
 
 
 def mark_notification_sent(conn, notification_id, sent_at=None):
@@ -3437,6 +3812,286 @@ def mark_notification_skipped(conn, notification_id, reason: str):
         str(reason or ""),
         notification_id,
     )
+
+
+def mark_notification_cancelled(conn, notification_id, reason: str):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='cancelled', SkippedAt=COALESCE(SkippedAt, SYSDATETIME()), LastError=?
+        WHERE NotificationID=? AND Status IN ('queued','sending','failed')
+        """,
+        str(reason or ""),
+        notification_id,
+    )
+
+
+def mark_notification_send_error(conn, notification_id, error: str, max_attempts: int | None = None, backoff_seconds: int | None = None) -> dict:
+    max_attempts = int(max_attempts or getattr(config, "NOTIFICATION_MAX_ATTEMPTS", 5))
+    backoff_seconds = int(backoff_seconds or getattr(config, "NOTIFICATION_RETRY_BACKOFF_SECONDS", 300))
+    cur = conn.cursor()
+    cur.execute("SELECT AttemptCount FROM dbo.NotificationOutbox WHERE NotificationID=?", notification_id)
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) if row else 0
+    masked = str(error or "")
+    if attempts >= max_attempts:
+        cur.execute(
+            """
+            UPDATE dbo.NotificationOutbox
+            SET Status='failed', LastError=?, QueuedAt=SYSDATETIME()
+            WHERE NotificationID=?
+            """,
+            masked,
+            notification_id,
+        )
+        return {"status": "failed", "attempts": attempts, "backoff_seconds": 0}
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='queued', LastError=?, QueuedAt=DATEADD(second, ?, SYSDATETIME())
+        WHERE NotificationID=?
+        """,
+        masked,
+        max(1, backoff_seconds),
+        notification_id,
+    )
+    return {"status": "queued", "attempts": attempts, "backoff_seconds": max(1, backoff_seconds)}
+
+
+def validate_notification_for_send(conn, notification_id: int) -> dict:
+    """Return send-time notification validity and a clear cancellation reason when unsafe."""
+    ensure_notification_tables(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT TOP 1
+            no.NotificationID,
+            no.Status,
+            no.EventID,
+            no.SearchID AS OutboxSearchID,
+            no.ListingID AS OutboxListingID,
+            no.UserID,
+            no.ChatID,
+            no.EventType AS OutboxEventType,
+            e.EventID AS ExistingEventID,
+            e.SearchID AS EventSearchID,
+            e.ListingID AS EventListingID,
+            e.EventType AS EventType,
+            e.ShouldNotify,
+            e.Reason,
+            e.EventPayloadJson,
+            e.CreatedAt AS EventCreatedAt,
+            uas.UserAreaID,
+            uas.IsActive AS SubscriptionIsActive,
+            uas.NotifyEnabled AS UserAreaNotifyEnabled,
+            uas.SubscriptionStatus AS UserAreaSubscriptionStatus,
+            uas.NotificationReadyAt,
+            tu.IsActive AS TelegramUserIsActive,
+            tu.ChatID AS CurrentChatID,
+            COALESCE(substate.status, uas.SubscriptionStatus) AS EffectiveSubscriptionStatus,
+            COALESCE(substate.notify_enabled, uas.NotifyEnabled) AS EffectiveNotifyEnabled,
+            ams.setup_status AS AreaSetupStatus,
+            lss.ListingID AS SearchStateListingID
+        FROM dbo.NotificationOutbox no
+        LEFT JOIN dbo.ListingEvent e ON e.EventID = no.EventID
+        LEFT JOIN dbo.UserAreaSubscription uas
+          ON uas.SearchID = COALESCE(no.SearchID, e.SearchID)
+         AND (no.UserID IS NULL OR uas.TelegramUserID = no.UserID)
+        LEFT JOIN dbo.TelegramUser tu
+          ON tu.TelegramUserID = uas.TelegramUserID
+         AND (no.ChatID IS NULL OR tu.ChatID = no.ChatID)
+        LEFT JOIN dbo.user_area_subscription_state substate
+          ON substate.user_id = uas.TelegramUserID AND substate.area_id = uas.SearchID
+        LEFT JOIN dbo.area_monitoring_state ams ON ams.area_id = COALESCE(no.SearchID, e.SearchID)
+        LEFT JOIN dbo.ListingSearchState lss
+          ON lss.SearchID = COALESCE(no.SearchID, e.SearchID)
+         AND lss.ListingID = COALESCE(no.ListingID, e.ListingID)
+        WHERE no.NotificationID=?
+        ORDER BY CASE WHEN no.ChatID IS NOT NULL AND tu.ChatID = no.ChatID THEN 0 ELSE 1 END, uas.UserAreaID ASC
+        """,
+        int(notification_id),
+    )
+    rows = _rows_to_dicts(cur)
+    row = rows[0] if rows else None
+    if not row:
+        return {"valid": False, "reason": "notification_missing", "notification_id": notification_id}
+    status = str(row.get("Status") or "").lower()
+    if status != "queued":
+        return {"valid": False, "reason": f"notification_status_{status or 'unknown'}", "notification": row}
+    if row.get("ExistingEventID") is None:
+        return {"valid": False, "reason": "event_missing", "notification": row}
+    should_notify = row.get("ShouldNotify")
+    if should_notify is None or int(should_notify or 0) == 0:
+        return {"valid": False, "reason": "event_should_notify_false", "notification": row}
+    event_type = str(row.get("EventType") or row.get("OutboxEventType") or "").lower()
+    reason_text = str(row.get("Reason") or "").lower()
+    if event_type in {"sold", "status_changed", "listing_sold"} and any(flag in reason_text for flag in ("weak_sold", "false_sold", "suppressed_sold", "suppressed")):
+        return {"valid": False, "reason": "sold_event_suppressed_or_weak", "notification": row}
+    if row.get("UserAreaID") is None or int(row.get("SubscriptionIsActive") or 0) != 1:
+        return {"valid": False, "reason": "subscription_inactive_or_missing", "notification": row}
+    if int(row.get("TelegramUserIsActive") or 0) != 1:
+        return {"valid": False, "reason": "telegram_user_inactive", "notification": row}
+    if int(row.get("EffectiveNotifyEnabled") or 0) != 1:
+        return {"valid": False, "reason": "notify_disabled", "notification": row}
+    if str(row.get("EffectiveSubscriptionStatus") or "").lower() != "active":
+        return {"valid": False, "reason": "subscription_not_active", "notification": row}
+    if str(row.get("AreaSetupStatus") or "").lower() != "ready":
+        return {"valid": False, "reason": "area_not_ready", "notification": row}
+    ready_at = row.get("NotificationReadyAt")
+    if ready_at is None:
+        return {"valid": False, "reason": "notification_ready_at_missing", "notification": row}
+    event_created = row.get("EventCreatedAt")
+    if event_created is not None and ready_at is not None and event_created < ready_at:
+        return {"valid": False, "reason": "event_before_notification_ready", "notification": row}
+    search_id = row.get("OutboxSearchID") or row.get("EventSearchID")
+    listing_id = row.get("OutboxListingID") or row.get("EventListingID")
+    if search_id is not None and listing_id is not None and row.get("SearchStateListingID") is None:
+        return {"valid": False, "reason": "listing_not_in_search_context", "notification": row}
+    return {"valid": True, "reason": "ok", "notification": row}
+
+
+def cancel_notification_if_unsafe(conn, notification_id: int, reason_prefix: str = "send_time_revalidation") -> dict:
+    validation = validate_notification_for_send(conn, int(notification_id))
+    if validation.get("valid"):
+        return validation
+    reason = f"{reason_prefix}: {validation.get('reason') or 'unsafe'}"
+    if validation.get("reason") != "notification_missing":
+        mark_notification_cancelled(conn, int(notification_id), reason)
+    validation["cancelled"] = validation.get("reason") != "notification_missing"
+    validation["cancel_reason"] = reason
+    return validation
+
+
+def recover_stale_sending_notifications(conn, stale_minutes: int | None = None, max_attempts: int | None = None) -> dict:
+    ensure_notification_tables(conn)
+    stale_minutes = int(stale_minutes or getattr(config, "NOTIFICATION_STALE_SENDING_MINUTES", 30))
+    max_attempts = int(max_attempts or getattr(config, "NOTIFICATION_MAX_ATTEMPTS", 5))
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT NotificationID, AttemptCount
+        FROM dbo.NotificationOutbox
+        WHERE Status='sending'
+          AND COALESCE(QueuedAt, CreatedAt) < DATEADD(minute, ?, SYSDATETIME())
+        ORDER BY NotificationID ASC
+        """,
+        -abs(stale_minutes),
+    )
+    rows = cur.fetchall()
+    recovered_ids: list[int] = []
+    failed_ids: list[int] = []
+    for row in rows:
+        notification_id = int(row[0])
+        attempts = int(row[1] or 0)
+        if attempts >= max_attempts:
+            cur.execute(
+                """
+                UPDATE dbo.NotificationOutbox
+                SET Status='failed', LastError=?, QueuedAt=SYSDATETIME()
+                WHERE NotificationID=? AND Status='sending'
+                """,
+                f"failed after stale sending timeout and max attempts reached ({attempts}/{max_attempts})",
+                notification_id,
+            )
+            failed_ids.append(notification_id)
+        else:
+            cur.execute(
+                """
+                UPDATE dbo.NotificationOutbox
+                SET Status='queued', LastError=?, QueuedAt=SYSDATETIME()
+                WHERE NotificationID=? AND Status='sending'
+                """,
+                f"recovered stale sending notification after {stale_minutes} minute timeout (attempts={attempts}/{max_attempts})",
+                notification_id,
+            )
+            recovered_ids.append(notification_id)
+    return {
+        "stale_sending_recovered": len(recovered_ids),
+        "stale_sending_failed": len(failed_ids),
+        "recovered_notification_ids": recovered_ids,
+        "failed_notification_ids": failed_ids,
+    }
+
+
+def sanitize_notification_outbox(conn, limit: int = 500) -> dict:
+    ensure_notification_tables(conn)
+    recovery = recover_stale_sending_notifications(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT TOP (?) NotificationID
+        FROM dbo.NotificationOutbox
+        WHERE Status='queued'
+        ORDER BY NotificationID ASC
+        """,
+        max(1, int(limit or 1)),
+    )
+    rows = cur.fetchall()
+    cancelled_ids: list[int] = []
+    reasons: dict[str, int] = {}
+    for row in rows:
+        notification_id = int(row[0])
+        validation = cancel_notification_if_unsafe(conn, notification_id, reason_prefix="startup_outbox_sanitizer")
+        if validation.get("cancelled"):
+            cancelled_ids.append(notification_id)
+            reason = str(validation.get("reason") or "unsafe")
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return {
+        **recovery,
+        "notifications_skipped_by_revalidation": len(cancelled_ids),
+        "cancelled_notification_ids": cancelled_ids,
+        "cancelled_reasons": reasons,
+    }
+
+
+def cancel_notifications_for_subscription(conn, telegram_user_id: int, search_id: int | None = None, user_area_id: int | None = None, reason: str = "subscription_removed") -> int:
+    ensure_notification_tables(conn)
+    resolved_search_id = search_id
+    if resolved_search_id is None and user_area_id is not None:
+        cur_lookup = conn.cursor()
+        cur_lookup.execute("SELECT SearchID FROM dbo.UserAreaSubscription WHERE TelegramUserID=? AND UserAreaID=?", int(telegram_user_id), int(user_area_id))
+        row = cur_lookup.fetchone()
+        if row:
+            resolved_search_id = int(row[0])
+    if resolved_search_id is None:
+        return 0
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='cancelled', SkippedAt=COALESCE(SkippedAt, SYSDATETIME()), LastError=?
+        WHERE SearchID=?
+          AND (UserID=? OR ChatID IN (SELECT ChatID FROM dbo.TelegramUser WHERE TelegramUserID=?))
+          AND Status IN ('queued','sending','failed')
+        """,
+        str(reason or "subscription_removed"),
+        int(resolved_search_id),
+        int(telegram_user_id),
+        int(telegram_user_id),
+    )
+    return int(getattr(cur, "rowcount", 0) or 0)
+
+
+def get_notification_outbox_diagnostics(conn) -> dict:
+    ensure_notification_tables(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT Status, EventType, COUNT(*) AS CountValue, MIN(COALESCE(QueuedAt, CreatedAt)) AS OldestAt
+        FROM dbo.NotificationOutbox
+        WHERE Status IN ('queued','sending','failed')
+        GROUP BY Status, EventType
+        """
+    )
+    rows = _rows_to_dicts(cur)
+    queued_by_event_type = {str(row.get("EventType") or "unknown"): int(row.get("CountValue") or 0) for row in rows if str(row.get("Status") or "").lower() == "queued"}
+    sending_rows = [row for row in rows if str(row.get("Status") or "").lower() == "sending"]
+    return {
+        "queued_by_event_type": queued_by_event_type,
+        "sending_count": sum(int(row.get("CountValue") or 0) for row in sending_rows),
+        "oldest_sending_at": min((row.get("OldestAt") for row in sending_rows if row.get("OldestAt") is not None), default=None),
+    }
 
 # Phase 5 Telegram bot and user-area subscription helpers
 _TELEGRAM_BOT_TABLES_ENSURED = False
@@ -3937,7 +4592,8 @@ def list_user_area_subscriptions(conn, telegram_user_id: int, active_only: bool 
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -3964,7 +4620,8 @@ def get_user_area_subscription(conn, user_area_id: int) -> dict | None:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4010,8 +4667,16 @@ def remove_user_area_subscription_lifecycle(conn, telegram_user_id: int, user_ar
         WHERE TelegramUserID=? AND UserAreaID=? AND IsActive=1
         """, int(telegram_user_id), int(user_area_id))
     changed = cur.rowcount > 0
+    cancelled_notifications = 0
     if changed:
         upsert_user_area_subscription_state(conn, int(telegram_user_id), resolved_search_id, status="removed", notify_enabled=False)
+        cancelled_notifications = cancel_notifications_for_subscription(
+            conn,
+            int(telegram_user_id),
+            search_id=resolved_search_id,
+            user_area_id=int(user_area_id),
+            reason="subscription_removed_before_send",
+        )
         lifecycle = deactivate_area_if_unused(conn, search_id=resolved_search_id)
     else:
         remaining = count_active_subscriptions_for_area(conn, search_id=resolved_search_id)
@@ -4032,6 +4697,7 @@ def remove_user_area_subscription_lifecycle(conn, telegram_user_id: int, user_ar
         "remaining_active_subscriptions": lifecycle.get("remaining_active_subscriptions"),
         "action": lifecycle.get("action"),
         "cancelled_jobs": lifecycle.get("cancelled_jobs", 0),
+        "cancelled_notifications": cancelled_notifications if changed else 0,
     }
 
 
@@ -4053,7 +4719,8 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4072,6 +4739,37 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
 def mark_subscription_baseline_started(conn, user_area_id: int) -> None:
     conn.cursor().execute("UPDATE dbo.UserAreaSubscription SET BaselineStatus='running', BaselineStartedAt=COALESCE(BaselineStartedAt, SYSDATETIME()), BaselineCompletedAt=NULL, BaselineLastError=NULL, UpdatedAt=SYSDATETIME() WHERE SearchID=(SELECT SearchID FROM dbo.UserAreaSubscription WHERE UserAreaID=?) AND IsActive=1", int(user_area_id)); conn.commit()
 
+
+
+def mark_search_baseline_completed(conn, search_id: int, listings_collected: int | None = None, new_count: int | None = None, pages_checked: int | None = None, total_pages_detected: int | None = None, stop_reason: str | None = None) -> None:
+    if not hasattr(conn, "cursor"):
+        return
+    ensure_telegram_bot_tables(conn)
+    conn.cursor().execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET BaselineStatus='completed',
+            BaselineCompletedAt=COALESCE(BaselineCompletedAt, SYSDATETIME()),
+            LastLightCheckAt=SYSDATETIME(),
+            BaselineListingsCollected=?,
+            BaselineNewCount=?,
+            BaselinePagesChecked=?,
+            BaselineTotalPagesDetected=?,
+            BaselineStopReason=?,
+            BaselineLastError=NULL,
+            DetailBaselineStatus=CASE WHEN DetailBaselineStatus IN ('completed','running','retry_wait') THEN DetailBaselineStatus ELSE 'pending' END,
+            PriceBaselineStatus=CASE WHEN PriceBaselineStatus='completed' THEN PriceBaselineStatus ELSE 'pending' END,
+            NotificationReadyAt=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        listings_collected,
+        new_count,
+        pages_checked,
+        total_pages_detected,
+        stop_reason,
+        int(search_id),
+    )
 
 def mark_subscription_baseline_completed(conn, user_area_id: int, listings_collected: int | None = None, new_count: int | None = None, pages_checked: int | None = None, total_pages_detected: int | None = None, stop_reason: str | None = None) -> None:
     conn.cursor().execute("""
@@ -4329,7 +5027,15 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
     cur.execute("""
         SELECT
             COUNT(1) AS TotalCount,
-            SUM(CASE WHEN ? IS NOT NULL AND latest.LastSnapshotDate >= ? THEN 1 ELSE 0 END) AS CompletedCount
+            SUM(CASE
+                    WHEN COALESCE(lss.SetupDetailStatus, '') IN ('detail_complete','detail_partial_complete','detail_failed_permanent') THEN 1
+                    WHEN ? IS NOT NULL AND lss.LastDetailRefreshAt >= ? THEN 1
+                    WHEN ? IS NOT NULL AND latest.LastSnapshotDate >= ? THEN 1
+                    ELSE 0
+                END) AS CompletedCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_partial_complete' THEN 1 ELSE 0 END) AS PartialCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_failed_permanent' THEN 1 ELSE 0 END) AS PermanentFailedCount,
+            SUM(CASE WHEN COALESCE(lss.SetupDetailStatus, '')='detail_retry_wait' THEN 1 ELSE 0 END) AS RetryWaitCount
         FROM dbo.ListingSearchState lss
         JOIN dbo.Listing l ON l.listingID=lss.ListingID
         OUTER APPLY (SELECT MAX(ls.SnapshotDate) LastSnapshotDate FROM dbo.ListingSnapshot ls WHERE ls.ListingID=l.listingID AND ls.SearchID=lss.SearchID) latest
@@ -4337,16 +5043,57 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
           AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active'
           AND (l.CurrentStatus IS NULL OR LOWER(l.CurrentStatus) IN ('active','unknown'))
           AND NULLIF(LTRIM(RTRIM(COALESCE(l.ListingURL, ''))), '') IS NOT NULL
-        """, started_at, started_at, search_id)
+        """, started_at, started_at, started_at, started_at, search_id)
     row = cur.fetchone()
     total = int(row[0] or 0) if row else 0
     completed = int(row[1] or 0) if row else 0
+    partial = int(row[2] or 0) if row and len(row) > 2 else 0
+    permanent_failed = int(row[3] or 0) if row and len(row) > 3 else 0
+    retry_wait = int(row[4] or 0) if row and len(row) > 4 else 0
+    baseline_total = to_int(subscription.get("BaselineListingsCollected")) or 0
+    total = max(total, baseline_total)
+    completed = min(completed, total)
     return {
         "detail_baseline_total_count": total,
         "detail_baseline_completed_count": completed,
         "detail_baseline_remaining_count": max(0, total - completed),
+        "detail_baseline_partial_count": partial,
+        "detail_baseline_permanent_failed_count": permanent_failed,
+        "detail_baseline_retry_wait_count": retry_wait,
         "notification_ready_at": subscription.get("NotificationReadyAt"),
     }
+
+
+
+def count_succeeded_setup_detail_jobs(conn, search_id: int) -> int:
+    try:
+        row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
+        if not row or row[0] is None:
+            return 0
+    except Exception:
+        return 0
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(1)
+        FROM dbo.Job
+        WHERE SearchID=? AND JobType='setup_detail_baseline' AND Status='succeeded'
+        """,
+        int(search_id),
+    )
+    row = cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+def count_remaining_setup_detail_targets(conn, search_id: int, subscription: dict | None = None) -> int:
+    if subscription is None:
+        try:
+            subs = get_active_user_area_subscriptions_for_search(conn, int(search_id))
+            subscription = subs[0] if subs else {"SearchID": int(search_id)}
+        except Exception:
+            subscription = {"SearchID": int(search_id)}
+    else:
+        subscription = {**subscription, "SearchID": int(search_id)}
+    return int(get_detail_baseline_progress(conn, subscription).get("detail_baseline_remaining_count") or 0)
 
 
 def ensure_listing_search_state_price_inference_columns(conn) -> None:
@@ -4664,7 +5411,8 @@ def get_active_user_area_subscriptions_for_search(conn, search_id: int) -> list[
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.active_listing_count AS AreaActiveListingCount, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
+               (SELECT COUNT(1) FROM dbo.ListingSearchState lss WHERE lss.SearchID=uas.SearchID AND LOWER(COALESCE(lss.ListingLifecycleStatus, lss.Status, 'active'))='active') AS LiveActiveListingCount,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
