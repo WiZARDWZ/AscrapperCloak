@@ -2756,6 +2756,98 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
     return [str(row[0]) for row in cur.fetchall() if row and row[0] is not None]
 
 
+
+def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | None = None) -> dict:
+    """Reset a failed/preparing setup to a supported preparing state and enqueue baseline once."""
+    ensure_telegram_bot_tables(conn)
+    cur = conn.cursor()
+    if user_area_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE UserAreaID=? AND IsActive=1
+            """,
+            int(user_area_id),
+        )
+    elif search_id is not None:
+        cur.execute(
+            """
+            SELECT TOP 1 UserAreaID, TelegramUserID, SearchID, SearchURL, AreaLabel
+            FROM dbo.UserAreaSubscription WITH (UPDLOCK, HOLDLOCK)
+            WHERE SearchID=? AND IsActive=1
+            ORDER BY UserAreaID ASC
+            """,
+            int(search_id),
+        )
+    else:
+        raise ValueError("user_area_id or search_id is required")
+    row = cur.fetchone()
+    if not row:
+        conn.commit()
+        return {"created": False, "reason": "active_subscription_not_found", "user_area_id": user_area_id, "search_id": search_id}
+
+    resolved_user_area_id = int(row[0])
+    resolved_telegram_user_id = int(row[1])
+    resolved_search_id = int(row[2])
+    search_url = str(row[3])
+    area_label = str(row[4] or search_url)
+    upsert_area_monitoring_state(
+        conn,
+        resolved_search_id,
+        setup_status="preparing",
+        module1_status="pending",
+        module3_status="pending",
+        module2_status="pending",
+        active_listing_count=0,
+        inferred_price_count=0,
+        unknown_price_count=0,
+        last_error=None,
+        set_started=True,
+    )
+    cur.execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET SubscriptionStatus='preparing',
+            NotifyEnabled=0,
+            BaselineStatus='pending',
+            BaselineStartedAt=NULL,
+            BaselineCompletedAt=NULL,
+            BaselineLastError=NULL,
+            DetailBaselineStatus='pending',
+            DetailBaselineStartedAt=NULL,
+            DetailBaselineCompletedAt=NULL,
+            DetailBaselineAttemptCount=0,
+            DetailBaselineLastAttemptAt=NULL,
+            DetailBaselineNextRetryAt=NULL,
+            DetailBaselineLastError=NULL,
+            PriceBaselineStatus='pending',
+            PriceBaselineStartedAt=NULL,
+            PriceBaselineCompletedAt=NULL,
+            PriceBaselineLastError=NULL,
+            NotificationReadyAt=NULL,
+            BaselineSummarySentAt=NULL,
+            DetailBaselineStartedSummarySentAt=NULL,
+            ReadySummarySentAt=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        resolved_search_id,
+    )
+    upsert_user_area_subscription_state(conn, resolved_telegram_user_id, resolved_search_id, status="preparing", notify_enabled=False)
+    conn.commit()
+    baseline_job = enqueue_baseline_setup_job(conn, resolved_search_id, search_url)
+    conn.commit()
+    return {
+        "created": bool(baseline_job and baseline_job.get("created")),
+        "reason": "setup_retry_enqueued" if bool(baseline_job and baseline_job.get("created")) else "baseline_job_already_active",
+        "user_area_id": resolved_user_area_id,
+        "search_id": resolved_search_id,
+        "area_label": area_label,
+        "baseline_job": baseline_job,
+    }
+
+
 def enqueue_baseline_setup_job(conn, area_id: int, search_url: str) -> dict | None:
     """Enqueue one active baseline_setup_area job per area."""
     ensure_monitoring_state_tables(conn)
@@ -3381,7 +3473,7 @@ def get_queued_notifications(conn, limit: int = 20, channel: str = "telegram") -
                NotificationKey, EventType, MessageText, Status, AttemptCount, LastError,
                CreatedAt, QueuedAt, SentAt, SkippedAt
         FROM dbo.NotificationOutbox
-        WHERE Status='queued' AND Channel=?
+        WHERE Status='queued' AND Channel=? AND COALESCE(QueuedAt, CreatedAt) <= SYSDATETIME()
         ORDER BY NotificationID ASC
         """,
         max(1, int(limit or 1)),
@@ -3393,9 +3485,10 @@ def get_queued_notifications(conn, limit: int = 20, channel: str = "telegram") -
 def mark_notification_sending(conn, notification_id):
     cur = conn.cursor()
     cur.execute(
-        "UPDATE dbo.NotificationOutbox SET Status='sending', LastError=NULL WHERE NotificationID=?",
+        "UPDATE dbo.NotificationOutbox SET Status='sending', AttemptCount=AttemptCount+1, QueuedAt=SYSDATETIME(), LastError=NULL WHERE NotificationID=? AND Status='queued'",
         notification_id,
     )
+    return bool(getattr(cur, "rowcount", 1) != 0)
 
 
 def mark_notification_sent(conn, notification_id, sent_at=None):
@@ -3437,6 +3530,286 @@ def mark_notification_skipped(conn, notification_id, reason: str):
         str(reason or ""),
         notification_id,
     )
+
+
+def mark_notification_cancelled(conn, notification_id, reason: str):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='cancelled', SkippedAt=COALESCE(SkippedAt, SYSDATETIME()), LastError=?
+        WHERE NotificationID=? AND Status IN ('queued','sending','failed')
+        """,
+        str(reason or ""),
+        notification_id,
+    )
+
+
+def mark_notification_send_error(conn, notification_id, error: str, max_attempts: int | None = None, backoff_seconds: int | None = None) -> dict:
+    max_attempts = int(max_attempts or getattr(config, "NOTIFICATION_MAX_ATTEMPTS", 5))
+    backoff_seconds = int(backoff_seconds or getattr(config, "NOTIFICATION_RETRY_BACKOFF_SECONDS", 300))
+    cur = conn.cursor()
+    cur.execute("SELECT AttemptCount FROM dbo.NotificationOutbox WHERE NotificationID=?", notification_id)
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) if row else 0
+    masked = str(error or "")
+    if attempts >= max_attempts:
+        cur.execute(
+            """
+            UPDATE dbo.NotificationOutbox
+            SET Status='failed', LastError=?, QueuedAt=SYSDATETIME()
+            WHERE NotificationID=?
+            """,
+            masked,
+            notification_id,
+        )
+        return {"status": "failed", "attempts": attempts, "backoff_seconds": 0}
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='queued', LastError=?, QueuedAt=DATEADD(second, ?, SYSDATETIME())
+        WHERE NotificationID=?
+        """,
+        masked,
+        max(1, backoff_seconds),
+        notification_id,
+    )
+    return {"status": "queued", "attempts": attempts, "backoff_seconds": max(1, backoff_seconds)}
+
+
+def validate_notification_for_send(conn, notification_id: int) -> dict:
+    """Return send-time notification validity and a clear cancellation reason when unsafe."""
+    ensure_notification_tables(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT TOP 1
+            no.NotificationID,
+            no.Status,
+            no.EventID,
+            no.SearchID AS OutboxSearchID,
+            no.ListingID AS OutboxListingID,
+            no.UserID,
+            no.ChatID,
+            no.EventType AS OutboxEventType,
+            e.EventID AS ExistingEventID,
+            e.SearchID AS EventSearchID,
+            e.ListingID AS EventListingID,
+            e.EventType AS EventType,
+            e.ShouldNotify,
+            e.Reason,
+            e.EventPayloadJson,
+            e.CreatedAt AS EventCreatedAt,
+            uas.UserAreaID,
+            uas.IsActive AS SubscriptionIsActive,
+            uas.NotifyEnabled AS UserAreaNotifyEnabled,
+            uas.SubscriptionStatus AS UserAreaSubscriptionStatus,
+            uas.NotificationReadyAt,
+            tu.IsActive AS TelegramUserIsActive,
+            tu.ChatID AS CurrentChatID,
+            COALESCE(substate.status, uas.SubscriptionStatus) AS EffectiveSubscriptionStatus,
+            COALESCE(substate.notify_enabled, uas.NotifyEnabled) AS EffectiveNotifyEnabled,
+            ams.setup_status AS AreaSetupStatus,
+            lss.ListingID AS SearchStateListingID
+        FROM dbo.NotificationOutbox no
+        LEFT JOIN dbo.ListingEvent e ON e.EventID = no.EventID
+        LEFT JOIN dbo.UserAreaSubscription uas
+          ON uas.SearchID = COALESCE(no.SearchID, e.SearchID)
+         AND (no.UserID IS NULL OR uas.TelegramUserID = no.UserID)
+        LEFT JOIN dbo.TelegramUser tu
+          ON tu.TelegramUserID = uas.TelegramUserID
+         AND (no.ChatID IS NULL OR tu.ChatID = no.ChatID)
+        LEFT JOIN dbo.user_area_subscription_state substate
+          ON substate.user_id = uas.TelegramUserID AND substate.area_id = uas.SearchID
+        LEFT JOIN dbo.area_monitoring_state ams ON ams.area_id = COALESCE(no.SearchID, e.SearchID)
+        LEFT JOIN dbo.ListingSearchState lss
+          ON lss.SearchID = COALESCE(no.SearchID, e.SearchID)
+         AND lss.ListingID = COALESCE(no.ListingID, e.ListingID)
+        WHERE no.NotificationID=?
+        ORDER BY CASE WHEN no.ChatID IS NOT NULL AND tu.ChatID = no.ChatID THEN 0 ELSE 1 END, uas.UserAreaID ASC
+        """,
+        int(notification_id),
+    )
+    rows = _rows_to_dicts(cur)
+    row = rows[0] if rows else None
+    if not row:
+        return {"valid": False, "reason": "notification_missing", "notification_id": notification_id}
+    status = str(row.get("Status") or "").lower()
+    if status != "queued":
+        return {"valid": False, "reason": f"notification_status_{status or 'unknown'}", "notification": row}
+    if row.get("ExistingEventID") is None:
+        return {"valid": False, "reason": "event_missing", "notification": row}
+    should_notify = row.get("ShouldNotify")
+    if should_notify is None or int(should_notify or 0) == 0:
+        return {"valid": False, "reason": "event_should_notify_false", "notification": row}
+    event_type = str(row.get("EventType") or row.get("OutboxEventType") or "").lower()
+    reason_text = str(row.get("Reason") or "").lower()
+    if event_type in {"sold", "status_changed", "listing_sold"} and any(flag in reason_text for flag in ("weak_sold", "false_sold", "suppressed_sold", "suppressed")):
+        return {"valid": False, "reason": "sold_event_suppressed_or_weak", "notification": row}
+    if row.get("UserAreaID") is None or int(row.get("SubscriptionIsActive") or 0) != 1:
+        return {"valid": False, "reason": "subscription_inactive_or_missing", "notification": row}
+    if int(row.get("TelegramUserIsActive") or 0) != 1:
+        return {"valid": False, "reason": "telegram_user_inactive", "notification": row}
+    if int(row.get("EffectiveNotifyEnabled") or 0) != 1:
+        return {"valid": False, "reason": "notify_disabled", "notification": row}
+    if str(row.get("EffectiveSubscriptionStatus") or "").lower() != "active":
+        return {"valid": False, "reason": "subscription_not_active", "notification": row}
+    if str(row.get("AreaSetupStatus") or "").lower() != "ready":
+        return {"valid": False, "reason": "area_not_ready", "notification": row}
+    ready_at = row.get("NotificationReadyAt")
+    if ready_at is None:
+        return {"valid": False, "reason": "notification_ready_at_missing", "notification": row}
+    event_created = row.get("EventCreatedAt")
+    if event_created is not None and ready_at is not None and event_created < ready_at:
+        return {"valid": False, "reason": "event_before_notification_ready", "notification": row}
+    search_id = row.get("OutboxSearchID") or row.get("EventSearchID")
+    listing_id = row.get("OutboxListingID") or row.get("EventListingID")
+    if search_id is not None and listing_id is not None and row.get("SearchStateListingID") is None:
+        return {"valid": False, "reason": "listing_not_in_search_context", "notification": row}
+    return {"valid": True, "reason": "ok", "notification": row}
+
+
+def cancel_notification_if_unsafe(conn, notification_id: int, reason_prefix: str = "send_time_revalidation") -> dict:
+    validation = validate_notification_for_send(conn, int(notification_id))
+    if validation.get("valid"):
+        return validation
+    reason = f"{reason_prefix}: {validation.get('reason') or 'unsafe'}"
+    if validation.get("reason") != "notification_missing":
+        mark_notification_cancelled(conn, int(notification_id), reason)
+    validation["cancelled"] = validation.get("reason") != "notification_missing"
+    validation["cancel_reason"] = reason
+    return validation
+
+
+def recover_stale_sending_notifications(conn, stale_minutes: int | None = None, max_attempts: int | None = None) -> dict:
+    ensure_notification_tables(conn)
+    stale_minutes = int(stale_minutes or getattr(config, "NOTIFICATION_STALE_SENDING_MINUTES", 30))
+    max_attempts = int(max_attempts or getattr(config, "NOTIFICATION_MAX_ATTEMPTS", 5))
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT NotificationID, AttemptCount
+        FROM dbo.NotificationOutbox
+        WHERE Status='sending'
+          AND COALESCE(QueuedAt, CreatedAt) < DATEADD(minute, ?, SYSDATETIME())
+        ORDER BY NotificationID ASC
+        """,
+        -abs(stale_minutes),
+    )
+    rows = cur.fetchall()
+    recovered_ids: list[int] = []
+    failed_ids: list[int] = []
+    for row in rows:
+        notification_id = int(row[0])
+        attempts = int(row[1] or 0)
+        if attempts >= max_attempts:
+            cur.execute(
+                """
+                UPDATE dbo.NotificationOutbox
+                SET Status='failed', LastError=?, QueuedAt=SYSDATETIME()
+                WHERE NotificationID=? AND Status='sending'
+                """,
+                f"failed after stale sending timeout and max attempts reached ({attempts}/{max_attempts})",
+                notification_id,
+            )
+            failed_ids.append(notification_id)
+        else:
+            cur.execute(
+                """
+                UPDATE dbo.NotificationOutbox
+                SET Status='queued', LastError=?, QueuedAt=SYSDATETIME()
+                WHERE NotificationID=? AND Status='sending'
+                """,
+                f"recovered stale sending notification after {stale_minutes} minute timeout (attempts={attempts}/{max_attempts})",
+                notification_id,
+            )
+            recovered_ids.append(notification_id)
+    return {
+        "stale_sending_recovered": len(recovered_ids),
+        "stale_sending_failed": len(failed_ids),
+        "recovered_notification_ids": recovered_ids,
+        "failed_notification_ids": failed_ids,
+    }
+
+
+def sanitize_notification_outbox(conn, limit: int = 500) -> dict:
+    ensure_notification_tables(conn)
+    recovery = recover_stale_sending_notifications(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT TOP (?) NotificationID
+        FROM dbo.NotificationOutbox
+        WHERE Status='queued'
+        ORDER BY NotificationID ASC
+        """,
+        max(1, int(limit or 1)),
+    )
+    rows = cur.fetchall()
+    cancelled_ids: list[int] = []
+    reasons: dict[str, int] = {}
+    for row in rows:
+        notification_id = int(row[0])
+        validation = cancel_notification_if_unsafe(conn, notification_id, reason_prefix="startup_outbox_sanitizer")
+        if validation.get("cancelled"):
+            cancelled_ids.append(notification_id)
+            reason = str(validation.get("reason") or "unsafe")
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return {
+        **recovery,
+        "notifications_skipped_by_revalidation": len(cancelled_ids),
+        "cancelled_notification_ids": cancelled_ids,
+        "cancelled_reasons": reasons,
+    }
+
+
+def cancel_notifications_for_subscription(conn, telegram_user_id: int, search_id: int | None = None, user_area_id: int | None = None, reason: str = "subscription_removed") -> int:
+    ensure_notification_tables(conn)
+    resolved_search_id = search_id
+    if resolved_search_id is None and user_area_id is not None:
+        cur_lookup = conn.cursor()
+        cur_lookup.execute("SELECT SearchID FROM dbo.UserAreaSubscription WHERE TelegramUserID=? AND UserAreaID=?", int(telegram_user_id), int(user_area_id))
+        row = cur_lookup.fetchone()
+        if row:
+            resolved_search_id = int(row[0])
+    if resolved_search_id is None:
+        return 0
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dbo.NotificationOutbox
+        SET Status='cancelled', SkippedAt=COALESCE(SkippedAt, SYSDATETIME()), LastError=?
+        WHERE SearchID=?
+          AND (UserID=? OR ChatID IN (SELECT ChatID FROM dbo.TelegramUser WHERE TelegramUserID=?))
+          AND Status IN ('queued','sending','failed')
+        """,
+        str(reason or "subscription_removed"),
+        int(resolved_search_id),
+        int(telegram_user_id),
+        int(telegram_user_id),
+    )
+    return int(getattr(cur, "rowcount", 0) or 0)
+
+
+def get_notification_outbox_diagnostics(conn) -> dict:
+    ensure_notification_tables(conn)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT Status, EventType, COUNT(*) AS CountValue, MIN(COALESCE(QueuedAt, CreatedAt)) AS OldestAt
+        FROM dbo.NotificationOutbox
+        WHERE Status IN ('queued','sending','failed')
+        GROUP BY Status, EventType
+        """
+    )
+    rows = _rows_to_dicts(cur)
+    queued_by_event_type = {str(row.get("EventType") or "unknown"): int(row.get("CountValue") or 0) for row in rows if str(row.get("Status") or "").lower() == "queued"}
+    sending_rows = [row for row in rows if str(row.get("Status") or "").lower() == "sending"]
+    return {
+        "queued_by_event_type": queued_by_event_type,
+        "sending_count": sum(int(row.get("CountValue") or 0) for row in sending_rows),
+        "oldest_sending_at": min((row.get("OldestAt") for row in sending_rows if row.get("OldestAt") is not None), default=None),
+    }
 
 # Phase 5 Telegram bot and user-area subscription helpers
 _TELEGRAM_BOT_TABLES_ENSURED = False
@@ -3937,7 +4310,7 @@ def list_user_area_subscriptions(conn, telegram_user_id: int, active_only: bool 
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -3964,7 +4337,7 @@ def get_user_area_subscription(conn, user_area_id: int) -> dict | None:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4010,8 +4383,16 @@ def remove_user_area_subscription_lifecycle(conn, telegram_user_id: int, user_ar
         WHERE TelegramUserID=? AND UserAreaID=? AND IsActive=1
         """, int(telegram_user_id), int(user_area_id))
     changed = cur.rowcount > 0
+    cancelled_notifications = 0
     if changed:
         upsert_user_area_subscription_state(conn, int(telegram_user_id), resolved_search_id, status="removed", notify_enabled=False)
+        cancelled_notifications = cancel_notifications_for_subscription(
+            conn,
+            int(telegram_user_id),
+            search_id=resolved_search_id,
+            user_area_id=int(user_area_id),
+            reason="subscription_removed_before_send",
+        )
         lifecycle = deactivate_area_if_unused(conn, search_id=resolved_search_id)
     else:
         remaining = count_active_subscriptions_for_area(conn, search_id=resolved_search_id)
@@ -4032,6 +4413,7 @@ def remove_user_area_subscription_lifecycle(conn, telegram_user_id: int, user_ar
         "remaining_active_subscriptions": lifecycle.get("remaining_active_subscriptions"),
         "action": lifecycle.get("action"),
         "cancelled_jobs": lifecycle.get("cancelled_jobs", 0),
+        "cancelled_notifications": cancelled_notifications if changed else 0,
     }
 
 
@@ -4053,7 +4435,7 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
@@ -4664,7 +5046,7 @@ def get_active_user_area_subscriptions_for_search(conn, search_id: int) -> list[
                uas.LastLightCheckAt, uas.LastDetailRefreshAt, uas.LastPriceRefreshAt, uas.LastFullListingSweepAt, uas.LastNotificationQueuedAt,
                uas.PriceBaselineStatus, uas.PriceBaselineStartedAt, uas.PriceBaselineCompletedAt, uas.PriceBaselineLastError,
                uas.SubscriptionStatus AS UserAreaSubscriptionStatus, uas.NotifyEnabled AS UserAreaNotifyEnabled, uas.RemovedAt,
-               ams.setup_status AS AreaSetupStatus, ams.ready_at AS AreaReadyAt,
+               ams.setup_status AS AreaSetupStatus, ams.module1_status AS AreaModule1Status, ams.module3_status AS AreaModule3Status, ams.module2_status AS AreaModule2Status, ams.last_error AS AreaLastError, ams.ready_at AS AreaReadyAt,
                substate.status AS SubscriptionStatus, substate.notify_enabled AS SubscriptionNotifyEnabled,
                uas.CreatedAt, uas.UpdatedAt
         FROM dbo.UserAreaSubscription uas
