@@ -1119,3 +1119,145 @@ def test_telegram_ready_label_allows_true_empty_ready_area():
     })
 
     assert label == "Ready — no active listings"
+
+
+def _patch_not_ready_setup_scheduler(monkeypatch, now, subscriptions, area_state=None):
+    class Conn:
+        def cursor(self): return self
+        def close(self): pass
+        def commit(self): pass
+        def execute(self, *a, **k): return self
+        def fetchone(self): return [now]
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: subscriptions)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, area_id: area_state or {"setup_status": "preparing"})
+
+
+def test_scheduler_blocks_baseline_rerun_while_detail_setup_job_active(monkeypatch):
+    now = datetime(2026, 6, 10, 10, 0, 0)
+    sub = {
+        "UserAreaID": 20,
+        "SearchID": 2,
+        "SearchURL": "url",
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "pending",
+        "AreaModule2Status": "pending",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "running",
+        "PriceBaselineStatus": "pending",
+    }
+    job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, search_id=2, user_area_id=20, run_after=now)
+    _patch_not_ready_setup_scheduler(monkeypatch, now, [sub])
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_BASELINE_SETUP_AREA]
+    assert out["setup_phase_active_blocked_count"] == 1
+    assert out["setup_phase_blocked"][0]["active_job_types"] == [job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE]
+
+
+def test_scheduler_repairs_module1_completed_module3_pending_with_detail_job(monkeypatch):
+    now = datetime(2026, 6, 10, 10, 0, 0)
+    sub = {
+        "UserAreaID": 21,
+        "SearchID": 3,
+        "SearchURL": "url",
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "pending",
+        "AreaModule2Status": "pending",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "pending",
+        "PriceBaselineStatus": "pending",
+    }
+    _patch_not_ready_setup_scheduler(monkeypatch, now, [sub])
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    assert out["setup_detail_repair_enqueued_count"] == 1
+    assert [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE]
+    assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_BASELINE_SETUP_AREA]
+    assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_SETUP_PRICE_BASELINE]
+
+
+def test_scheduler_repairs_module3_completed_module2_pending_with_price_job(monkeypatch):
+    now = datetime(2026, 6, 10, 10, 0, 0)
+    sub = {
+        "UserAreaID": 22,
+        "SearchID": 4,
+        "SearchURL": "url",
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "completed",
+        "AreaModule2Status": "pending",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "pending",
+    }
+    _patch_not_ready_setup_scheduler(monkeypatch, now, [sub])
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    assert out["setup_price_repair_enqueued_count"] == 1
+    assert [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_SETUP_PRICE_BASELINE]
+    assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_BASELINE_SETUP_AREA]
+
+
+def test_scheduler_does_not_duplicate_active_price_setup_or_rerun_baseline(monkeypatch):
+    now = datetime(2026, 6, 10, 10, 0, 0)
+    sub = {
+        "UserAreaID": 23,
+        "SearchID": 5,
+        "SearchURL": "url",
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "completed",
+        "AreaModule2Status": "running",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "running",
+    }
+    job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_PRICE_BASELINE, search_id=5, user_area_id=23, run_after=now)
+    _patch_not_ready_setup_scheduler(monkeypatch, now, [sub])
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    assert out["setup_phase_active_blocked_count"] == 1
+    assert not [job for job in out["created"] if job.get("JobType") in {job_queue.JOB_TYPE_BASELINE_SETUP_AREA, job_queue.JOB_TYPE_SETUP_PRICE_BASELINE}]
+
+
+def test_detail_progress_uses_baseline_total_to_prevent_premature_price_enqueue():
+    class Cursor:
+        def execute(self, *a, **k): return self
+        def fetchone(self): return [2, 2]
+    class Conn:
+        def cursor(self): return Cursor()
+
+    progress = db_layer.get_detail_baseline_progress(Conn(), {"SearchID": 9, "DetailBaselineStartedAt": datetime(2026, 6, 10), "BaselineListingsCollected": 928})
+
+    assert progress["detail_baseline_total_count"] == 928
+    assert progress["detail_baseline_completed_count"] == 2
+    assert progress["detail_baseline_remaining_count"] == 926
+
+
+def test_setup_price_guard_requeues_detail_when_module3_not_completed(monkeypatch):
+    calls = []
+    sub = {"UserAreaID": 24, "SearchID": 6, "SearchURL": "url", "PriceBaselineStatus": "pending"}
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, search_id: {"setup_status": "preparing", "module1_status": "completed", "module3_status": "running", "module2_status": "pending"})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitoring_scheduler, "run_price_baseline_for_search", lambda *a, **k: (_ for _ in ()).throw(AssertionError("price must not run before detail completion")))
+
+    out = monitoring_scheduler._run_setup_price_batch({"JobID": 300, "SearchID": 6, "UserAreaID": 24}, send_telegram=False)
+
+    assert out["status"] == "skipped"
+    assert out["reason"] == "detail_baseline_not_completed"
+    assert any(item[0] == "detail_job" for item in calls)

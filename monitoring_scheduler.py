@@ -570,6 +570,61 @@ def _subscription_group_price_completed(subscriptions: list[dict[str, Any]]) -> 
     return any(str(sub.get("PriceBaselineStatus") or "pending").lower() == "completed" for sub in subscriptions)
 
 
+SETUP_PIPELINE_JOB_TYPES = {
+    "baseline_setup_area",
+    "setup_detail_baseline",
+    "setup_price_baseline",
+}
+SETUP_PIPELINE_ACTIVE_STATUSES = {"queued", "running", "retry_wait"}
+
+
+def _active_setup_pipeline_jobs(search_id: int) -> list[dict[str, Any]]:
+    import job_queue
+
+    jobs = []
+    for job in job_queue.get_active_jobs():
+        try:
+            job_search_id = int(job.get("SearchID") or 0)
+        except Exception:
+            job_search_id = 0
+        status = str(job.get("Status") or "").lower()
+        if (
+            job_search_id == int(search_id)
+            and str(job.get("JobType") or "") in SETUP_PIPELINE_JOB_TYPES
+            and status in SETUP_PIPELINE_ACTIVE_STATUSES
+        ):
+            jobs.append(job)
+    return jobs
+
+
+def _setup_phase_from_subscription(subscription: dict[str, Any]) -> dict[str, str]:
+    baseline = str(subscription.get("BaselineStatus") or "pending").lower()
+    detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
+    price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
+    module1 = str(subscription.get("AreaModule1Status") or "").lower()
+    module3 = str(subscription.get("AreaModule3Status") or "").lower()
+    module2 = str(subscription.get("AreaModule2Status") or "").lower()
+    area_status = str(subscription.get("AreaSetupStatus") or "not_started").lower()
+    if not module1 and baseline == "completed":
+        module1 = "completed"
+    if not module3 and detail in {"completed", "running", "retry_wait", "failed"}:
+        module3 = detail
+    if not module2 and price in {"completed", "running", "retry_wait", "failed"}:
+        module2 = price
+    return {
+        "area_status": area_status,
+        "module1_status": module1 or "pending",
+        "module3_status": module3 or "pending",
+        "module2_status": module2 or "pending",
+    }
+
+
+def _append_created_or_duplicate(result: dict[str, Any], job: dict | None) -> None:
+    if not job:
+        return
+    (result["created"] if job.get("created") else result["skipped_duplicates"]).append(job)
+
+
 def _oldest_or_none(values):
     vals = [value for value in values if value is not None]
     return min(vals) if vals else None
@@ -794,6 +849,11 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
         "not_ready_search_ids_considered": [],
         "errors": [],
         "stale_recovery": {"recovered_count": 0, "failed_count": 0, "stale_job_ids": [], "recovered_job_types": [], "failed_job_types": []},
+        "setup_phase_active_blocked_count": 0,
+        "setup_detail_repair_enqueued_count": 0,
+        "setup_price_repair_enqueued_count": 0,
+        "setup_baseline_requeued_count": 0,
+        "setup_phase_blocked": [],
     }
     conn = db_layer.connect(config.DB_PATH)
     try:
@@ -814,20 +874,71 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
         try:
             if not _subscription_group_is_ready(group):
                 result["not_ready_search_ids_considered"].append(search_id)
-                if _terminal_failed_area_blocks_auto_baseline(search_id):
+                phase = _setup_phase_from_subscription(rep)
+                if phase["area_status"] in {"failed", "failed_ingest"} or _terminal_failed_area_blocks_auto_baseline(search_id):
                     result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "reason": "terminal_failed_area_requires_manual_retry"})
                     continue
-                job = job_queue.enqueue_job_once(
-                    job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
-                    search_id=search_id,
-                    user_area_id=int(rep["UserAreaID"]),
-                    priority=job_queue.PRIORITY_SETUP,
-                    run_after=current_time_used,
-                    payload={"area_id": search_id, "search_url": rep["SearchURL"]},
-                    dedupe_key=f"{job_queue.JOB_TYPE_BASELINE_SETUP_AREA}:area_id={search_id}",
-                    max_attempts=3,
-                )
-                (result["created"] if job.get("created") else result["skipped_duplicates"]).append(job)
+                active_setup_jobs = _active_setup_pipeline_jobs(search_id)
+                if active_setup_jobs:
+                    blocked = {
+                        "search_id": search_id,
+                        "reason": "active_setup_pipeline_job",
+                        "active_job_types": sorted({str(job.get("JobType")) for job in active_setup_jobs}),
+                        "active_job_ids": [job.get("JobID") for job in active_setup_jobs],
+                    }
+                    result["setup_phase_active_blocked_count"] += 1
+                    result["setup_phase_blocked"].append(blocked)
+                    result["not_due"].append(blocked)
+                    duplicate_job = {**active_setup_jobs[0], "created": False, "duplicate": True, "reason": "active_setup_pipeline_job"}
+                    result["skipped_duplicates"].append(duplicate_job)
+                    continue
+                if phase["module1_status"] != "completed":
+                    job = job_queue.enqueue_job_once(
+                        job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+                        search_id=search_id,
+                        user_area_id=int(rep["UserAreaID"]),
+                        priority=job_queue.PRIORITY_SETUP,
+                        run_after=current_time_used,
+                        payload={"area_id": search_id, "search_url": rep["SearchURL"]},
+                        dedupe_key=f"{job_queue.JOB_TYPE_BASELINE_SETUP_AREA}:area_id={search_id}",
+                        max_attempts=3,
+                    )
+                    if job.get("created"):
+                        result["setup_baseline_requeued_count"] += 1
+                    _append_created_or_duplicate(result, job)
+                    continue
+                if phase["module3_status"] not in {"completed", "skipped"}:
+                    repair_conn = db_layer.connect(config.DB_PATH)
+                    try:
+                        job = db_layer.enqueue_setup_detail_baseline_job(repair_conn, search_id, user_area_id=int(rep["UserAreaID"]), run_after=current_time_used, dedupe_suffix="scheduler_repair")
+                        repair_conn.commit()
+                    finally:
+                        repair_conn.close()
+                    if job and job.get("created"):
+                        result["setup_detail_repair_enqueued_count"] += 1
+                    _append_created_or_duplicate(result, job)
+                    continue
+                if phase["module2_status"] not in {"completed", "completed_with_unknowns", "skipped"}:
+                    repair_conn = db_layer.connect(config.DB_PATH)
+                    try:
+                        job = db_layer.enqueue_setup_price_baseline_job(repair_conn, search_id, user_area_id=int(rep["UserAreaID"]), run_after=current_time_used)
+                        repair_conn.commit()
+                    finally:
+                        repair_conn.close()
+                    if job and job.get("created"):
+                        result["setup_price_repair_enqueued_count"] += 1
+                    _append_created_or_duplicate(result, job)
+                    continue
+                ready_conn = db_layer.connect(config.DB_PATH)
+                try:
+                    if db_layer.is_area_setup_ready(ready_conn, search_id):
+                        db_layer.upsert_area_monitoring_state(ready_conn, search_id, setup_status="ready", set_ready=True, last_error=None)
+                        db_layer.activate_area_subscriptions(ready_conn, search_id)
+                        ready_conn.commit()
+                    else:
+                        result["not_due"].append({"search_id": search_id, "reason": "setup_not_ready_no_phase_repair"})
+                finally:
+                    ready_conn.close()
                 continue
 
             result["ready_search_ids_considered"].append(search_id)
@@ -1074,7 +1185,7 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
             db_layer.mark_subscription_detail_baseline_failed(conn, user_area_id, str(detail_result.get("errors")))
             db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="failed", module3_status="failed", last_error=str(detail_result.get("errors")))
             status = "detail_baseline_failed"
-        elif progress["detail_baseline_remaining_count"] == 0:
+        elif db_layer.count_remaining_setup_detail_targets(conn, search_id, refreshed_sub) == 0:
             db_layer.mark_subscription_detail_baseline_completed(conn, user_area_id)
             db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="completed", module2_status="pending", last_error=f"details {progress['detail_baseline_completed_count']}/{progress['detail_baseline_total_count']}")
             refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or refreshed_sub
@@ -1422,6 +1533,8 @@ def _run_setup_price_batch(job: dict[str, Any], send_telegram: bool, on_log=None
     try:
         area_state = db_layer.get_area_monitoring_state(conn, search_id) or {}
         if str(area_state.get("module3_status") or "").lower() not in {"completed", "skipped"}:
+            db_layer.enqueue_setup_detail_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=_utcnow() + timedelta(seconds=5), dedupe_suffix="price_guard_repair")
+            conn.commit()
             return {"status": "skipped", "reason": "detail_baseline_not_completed", "search_id": search_id}
         if str(sub.get("PriceBaselineStatus") or "pending").lower() == "pending":
             db_layer.mark_subscription_price_baseline_started(conn, user_area_id)

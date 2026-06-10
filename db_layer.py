@@ -2833,6 +2833,40 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
 
 
 
+
+SETUP_PIPELINE_JOB_TYPES = {"baseline_setup_area", "setup_detail_baseline", "setup_price_baseline"}
+SETUP_PIPELINE_ACTIVE_STATUSES = {"queued", "running", "retry_wait"}
+
+
+def get_active_setup_pipeline_jobs(conn, search_id: int) -> list[dict]:
+    """Return active setup-pipeline jobs that should block fresh baseline repair."""
+    try:
+        row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
+        if not row or row[0] is None:
+            return []
+    except Exception:
+        return []
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT JobID, JobType, SearchID, UserAreaID, Status, RunAfter, AttemptCount, MaxAttempts, DedupeKey, CreatedAt, UpdatedAt
+        FROM dbo.Job
+        WHERE SearchID=?
+          AND JobType IN ('baseline_setup_area','setup_detail_baseline','setup_price_baseline')
+          AND Status IN ('queued','running','retry_wait')
+        ORDER BY Priority ASC, RunAfter ASC, CreatedAt ASC, JobID ASC
+        """,
+        int(search_id),
+    )
+    try:
+        return _rows_to_dicts(cur)
+    except Exception:
+        return []
+
+
+def has_active_setup_pipeline_job(conn, search_id: int) -> bool:
+    return bool(get_active_setup_pipeline_jobs(conn, int(search_id)))
+
 def cancel_setup_phase_jobs_for_search(conn, search_id: int, reason: str = "setup retry reset cancels queued setup phase jobs") -> int:
     """Cancel queued/retry setup detail and full-price phase jobs without cancelling the orchestrator."""
     safe_reason = config.mask_sensitive_text(reason or "setup phase reset")
@@ -2998,6 +3032,9 @@ def enqueue_baseline_setup_job(conn, area_id: int, search_url: str) -> dict | No
     """Enqueue one active baseline_setup_area job per area."""
     ensure_monitoring_state_tables(conn)
     state = get_area_monitoring_state(conn, int(area_id))
+    active_setup_jobs = get_active_setup_pipeline_jobs(conn, int(area_id))
+    if active_setup_jobs:
+        return {"created": False, "duplicate": True, "reason": "active_setup_pipeline_job", "search_id": int(area_id), "active_job_types": sorted({str(job.get("JobType")) for job in active_setup_jobs}), "active_job_ids": [job.get("JobID") for job in active_setup_jobs]}
     if state and str(state.get("setup_status") or "").lower() == "ready":
         return {"created": False, "skipped": True, "reason": "area_ready", "search_id": int(area_id)}
     current_status = str(state.get("setup_status") or "not_started").lower() if state else "not_started"
@@ -4903,12 +4940,23 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
     row = cur.fetchone()
     total = int(row[0] or 0) if row else 0
     completed = int(row[1] or 0) if row else 0
+    baseline_total = to_int(subscription.get("BaselineListingsCollected")) or 0
+    total = max(total, baseline_total)
+    completed = min(completed, total)
     return {
         "detail_baseline_total_count": total,
         "detail_baseline_completed_count": completed,
         "detail_baseline_remaining_count": max(0, total - completed),
         "notification_ready_at": subscription.get("NotificationReadyAt"),
     }
+
+
+def count_remaining_setup_detail_targets(conn, search_id: int, subscription: dict | None = None) -> int:
+    if subscription is None:
+        subscription = {"SearchID": int(search_id)}
+    else:
+        subscription = {**subscription, "SearchID": int(search_id)}
+    return int(get_detail_baseline_progress(conn, subscription).get("detail_baseline_remaining_count") or 0)
 
 
 def ensure_listing_search_state_price_inference_columns(conn) -> None:
