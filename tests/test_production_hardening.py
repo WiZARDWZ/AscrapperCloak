@@ -111,6 +111,7 @@ def test_baseline_scheduler_skips_terminal_failed_area_without_manual_retry(monk
         def execute(self, *a, **k): return self
         def fetchone(self): return [now]
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
     monkeypatch.setattr(monitoring_scheduler.job_queue if hasattr(monitoring_scheduler, 'job_queue') else job_queue, "ensure_job_tables", lambda conn=None: None, raising=False)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: [sub])
@@ -165,6 +166,7 @@ def _patch_ready_scheduler(monkeypatch, now, subscriptions):
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_REFRESH_TIMES", "12:00")
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_INFERENCE_ENABLED", True)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: SchedulerConn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: subscriptions)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_due_price_retry_listing_ids", lambda *a, **k: [])
@@ -392,6 +394,7 @@ def test_startup_schema_recovers_stale_jobs(monkeypatch):
         def close(self): pass
 
     monkeypatch.setattr(telegram_bot, "_connect", lambda: Conn())
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True, "setup_detail_schema_ok": True, "area_monitoring_schema_ok": True})
     monkeypatch.setattr(telegram_bot.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
     monkeypatch.setattr(telegram_bot.db_layer, "sanitize_notification_outbox", lambda conn: {"notifications_skipped_by_revalidation": 0})
     monkeypatch.setattr(telegram_bot.job_queue, "ensure_job_tables", lambda conn=None: None)
@@ -1129,6 +1132,7 @@ def _patch_not_ready_setup_scheduler(monkeypatch, now, subscriptions, area_state
         def execute(self, *a, **k): return self
         def fetchone(self): return [now]
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: subscriptions)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, area_id: area_state or {"setup_status": "preparing"})
@@ -1390,3 +1394,121 @@ def test_setup_detail_stalled_progress_guard_fails_setup(monkeypatch):
 
     assert out["status"] == "detail_baseline_failed"
     assert any(call[0] == "failed" and "setup detail progress stalled" in call[1] for call in calls)
+
+
+def test_setup_detail_schema_migration_adds_required_columns_and_index():
+    conn = MigrationConn()
+    db_layer.ensure_listing_search_state_detail_refresh_column(conn)
+    sql = "\n".join(conn.sql)
+    for column in db_layer.SETUP_DETAIL_REQUIRED_COLUMNS:
+        assert column in sql
+    assert "IX_ListingSearchState_SetupDetailDue" in sql
+    assert "SetupDetailNextRetryAt" in sql
+    assert "LastDetailRefreshAt" in sql
+    assert "ListingID" in sql
+
+
+def test_setup_detail_schema_migration_is_idempotent_sql():
+    conn = MigrationConn()
+    db_layer.ensure_listing_search_state_detail_refresh_column(conn)
+    db_layer.ensure_listing_search_state_detail_refresh_column(conn)
+    sql = "\n".join(conn.sql)
+    assert sql.count("COL_LENGTH('dbo.ListingSearchState', 'SetupDetailStatus') IS NULL") == 2
+    assert "IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL" in sql
+
+
+def test_area_monitoring_state_code_does_not_require_notification_ready_at():
+    import inspect
+
+    combined = "\n".join(
+        [
+            inspect.getsource(db_layer.ensure_monitoring_state_tables),
+            inspect.getsource(db_layer.get_area_monitoring_state),
+            inspect.getsource(db_layer.upsert_area_monitoring_state),
+        ]
+    ).lower()
+    assert "notification_ready_at" not in combined
+
+
+def test_startup_schema_ensure_runs_before_startup_sanitizers(monkeypatch):
+    import telegram_bot
+
+    calls = []
+
+    class Conn:
+        def commit(self): calls.append("commit")
+        def close(self): calls.append("close")
+
+    monkeypatch.setattr(telegram_bot, "_connect", lambda: Conn())
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_runtime_monitoring_schema", lambda conn: calls.append("runtime_schema") or {"schema_ok": True, "setup_detail_schema_ok": True, "area_monitoring_schema_ok": True})
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_telegram_bot_tables", lambda conn: calls.append("telegram_tables"))
+    monkeypatch.setattr(telegram_bot.job_queue, "ensure_job_tables", lambda conn: calls.append("job_tables"))
+    monkeypatch.setattr(telegram_bot.db_layer, "sanitize_notification_outbox", lambda conn: calls.append("sanitize") or {})
+    monkeypatch.setattr(telegram_bot.job_queue, "recover_stale_running_jobs", lambda conn=None: calls.append("stale_recovery") or {})
+
+    telegram_bot.ensure_runtime_schema()
+
+    assert calls[:4] == ["runtime_schema", "telegram_tables", "job_tables", "sanitize"]
+    assert "stale_recovery" in calls
+
+
+class ProgressCursor:
+    def __init__(self):
+        self.description = [("JobID",), ("JobType",), ("Status",), ("CreatedAt",), ("StartedAt",), ("FinishedAt",), ("LastError",)]
+    def execute(self, *args, **kwargs): return self
+    def fetchall(self): return []
+    def fetchone(self): return None
+
+
+class ProgressConn:
+    def cursor(self): return ProgressCursor()
+    def commit(self): pass
+    def close(self): pass
+
+
+def test_print_setup_progress_includes_schema_health_after_migration(monkeypatch):
+    import tools.print_setup_progress as progress_tool
+
+    monkeypatch.setattr(progress_tool.db_layer, "connect", lambda path=None: ProgressConn())
+    monkeypatch.setattr(progress_tool.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
+    monkeypatch.setattr(progress_tool.db_layer, "get_setup_detail_schema_status", lambda conn: {"setup_detail_schema_ok": True, "missing_columns": []})
+    monkeypatch.setattr(progress_tool.db_layer, "get_area_monitoring_schema_status", lambda conn: {"area_monitoring_schema_ok": True, "missing_columns": []})
+    monkeypatch.setattr(progress_tool.db_layer, "get_area_monitoring_state", lambda conn, search_id: {"setup_status": "preparing", "module1_status": "completed", "module3_status": "running", "module2_status": "pending", "active_listing_count": 30})
+    monkeypatch.setattr(progress_tool.db_layer, "get_active_user_area_subscriptions_for_search", lambda conn, search_id: [{"SearchID": search_id, "AreaLabel": "Darlinghurst, NSW 2010", "BaselineListingsCollected": 30}])
+    monkeypatch.setattr(progress_tool.db_layer, "get_detail_baseline_progress", lambda conn, sub: {"detail_baseline_total_count": 30, "detail_baseline_completed_count": 10, "detail_baseline_remaining_count": 20})
+    monkeypatch.setattr(progress_tool.db_layer, "get_active_setup_pipeline_jobs", lambda conn, search_id: [])
+
+    out = progress_tool.setup_progress(2)
+
+    assert out["schema_ok"] is True
+    assert out["setup_detail_schema_ok"] is True
+    assert out["area_monitoring_schema_ok"] is True
+    assert out["detail_done"] == 10
+    assert out["detail_remaining"] == 20
+
+
+def test_scraper_noisy_logs_are_suppressed_at_info(monkeypatch):
+    import module1_list_scraper
+    import module2_infer_prices
+    import module3_enrich_details
+
+    for mod in (module1_list_scraper, module2_infer_prices, module3_enrich_details):
+        monkeypatch.setattr(mod.config, "SCRAPER_LOG_LEVEL", "INFO", raising=False)
+        monkeypatch.setattr(mod.config, "SCRAPER_VERBOSE_PAGE_STATE", False, raising=False)
+    monkeypatch.setattr(module1_list_scraper.config, "SCRAPER_VERBOSE_NETWORK", False, raising=False)
+
+    assert module1_list_scraper._should_emit_default_log("setup_batched search_id=2") is True
+    assert module1_list_scraper._should_emit_default_log("Module1 page_state=blocked html_length=851 body_text_length=0") is False
+    assert module1_list_scraper._should_emit_default_log("Page network summary:") is False
+    assert module2_infer_prices._should_emit_default_log("Module2 page_state=blocked html_length=851 body_text_length=0") is False
+    assert module3_enrich_details._should_emit_default_log("Module3 Detail page_state=blocked html_length=851 body_text_length=0") is False
+
+
+def test_reset_setup_state_tool_does_not_reference_area_notification_ready_column():
+    import inspect
+    import tools.reset_setup_state as reset_tool
+
+    source = inspect.getsource(reset_tool).lower()
+    assert "notification_ready_at" not in source
+    assert "setupdetailstatus" in source
+    assert "setup_detail_baseline" in source

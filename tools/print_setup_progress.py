@@ -13,9 +13,35 @@ def _rows(cur) -> list[dict[str, Any]]:
     return [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
 
 
-def setup_progress(search_id: int) -> dict[str, Any]:
+def _schema_status(conn, *, migrate: bool = True) -> dict[str, Any]:
+    migration_error = None
+    if migrate:
+        try:
+            db_layer.ensure_runtime_monitoring_schema(conn)
+        except Exception as exc:
+            migration_error = config.mask_sensitive_text(exc)
+    setup_detail = db_layer.get_setup_detail_schema_status(conn)
+    area_monitoring = db_layer.get_area_monitoring_schema_status(conn)
+    missing = sorted(set(setup_detail.get("missing_columns") or []) | set(area_monitoring.get("missing_columns") or []))
+    schema_ok = bool(setup_detail.get("setup_detail_schema_ok")) and bool(area_monitoring.get("area_monitoring_schema_ok")) and not migration_error
+    return {
+        "schema_ok": schema_ok,
+        "setup_detail_schema_ok": bool(setup_detail.get("setup_detail_schema_ok")),
+        "area_monitoring_schema_ok": bool(area_monitoring.get("area_monitoring_schema_ok")),
+        "missing_columns": missing,
+        "setup_detail_missing_columns": setup_detail.get("missing_columns") or [],
+        "area_monitoring_missing_columns": area_monitoring.get("missing_columns") or [],
+        "migration_error": migration_error,
+        "suggested_action": None if schema_ok else "Run service startup or db_layer.ensure_runtime_monitoring_schema(conn); verify SQL Server permissions for ALTER TABLE/CREATE INDEX.",
+    }
+
+
+def setup_progress(search_id: int, *, migrate_schema: bool = True) -> dict[str, Any]:
     conn = db_layer.connect(config.DB_PATH)
     try:
+        schema = _schema_status(conn, migrate=migrate_schema)
+        if not schema["schema_ok"]:
+            return {"search_id": search_id, **schema}
         state = db_layer.get_area_monitoring_state(conn, search_id) or {}
         subs = db_layer.get_active_user_area_subscriptions_for_search(conn, search_id)
         sub = subs[0] if subs else {"SearchID": search_id, "BaselineListingsCollected": state.get("active_listing_count")}
@@ -58,6 +84,7 @@ def setup_progress(search_id: int) -> dict[str, Any]:
         active_types = {str(job.get("JobType")) for job in active_jobs}
         return {
             "search_id": search_id,
+            **schema,
             "area_display_name": (subs[0].get("AreaLabel") if subs else None),
             "setup_status": state.get("setup_status"),
             "module1_status": state.get("module1_status"),
@@ -85,8 +112,9 @@ def setup_progress(search_id: int) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print setup pipeline progress for a SearchID")
     parser.add_argument("--search-id", type=int, required=True)
+    parser.add_argument("--no-migrate", action="store_true", help="Only report schema health; do not run idempotent schema ensure first")
     args = parser.parse_args()
-    print(json.dumps(setup_progress(args.search_id), ensure_ascii=False, indent=2, default=str))
+    print(json.dumps(setup_progress(args.search_id, migrate_schema=not args.no_migrate), ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":

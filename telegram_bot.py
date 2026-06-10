@@ -283,11 +283,13 @@ def _failed_jobs_text(jobs: list[dict[str, Any]]) -> str:
 def ensure_runtime_schema() -> None:
     conn = _connect()
     try:
+        runtime_schema = db_layer.ensure_runtime_monitoring_schema(conn)
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
         notification_sanitizer = db_layer.sanitize_notification_outbox(conn)
         conn.commit()
         recovery = job_queue.recover_stale_running_jobs(conn=conn)
+        logger.info("startup runtime schema: %s", _format_summary({"schema_ok": runtime_schema.get("schema_ok"), "setup_detail_schema_ok": runtime_schema.get("setup_detail_schema_ok"), "area_monitoring_schema_ok": runtime_schema.get("area_monitoring_schema_ok")}))
         logger.info("startup notification outbox sanitizer: %s", _format_summary(notification_sanitizer))
         logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:

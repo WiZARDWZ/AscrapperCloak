@@ -109,8 +109,16 @@ class RecoveryPolicy:
         return False
 
 
+def _verbose_page_state_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_PAGE_STATE", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
+def _verbose_network_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_NETWORK", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
 def log_session_health(health: BrowserSessionHealth, *, url_type: str, page_state: str, action: str, log_func=print) -> None:
-    if not log_func:
+    if not log_func or not _verbose_page_state_enabled():
         return
     log_func(
         "session_health module={module} url_type={url_type} requested_url={requested} current_url={current} "
@@ -251,7 +259,7 @@ def same_session_kpsdk_recheck(
                 payload = []
             return state_result, payload
         state_result, payload = _unpack_wait_result(_call_wait_func(wait_func, driver, timeout, min_cards))
-        if log_func:
+        if log_func and _verbose_page_state_enabled():
             log_func(
                 "{module} KPSDK same-session recheck attempt={attempt} state={state} cards_found={cards} "
                 "html_length={html_len} body_text_length={body_len}".format(

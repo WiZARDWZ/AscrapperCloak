@@ -70,6 +70,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
              mock.patch.object(module1_list_scraper.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+             mock.patch.object(module1_list_scraper.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
              mock.patch.object(module1_list_scraper.time, "sleep", return_value=None), \
              mock.patch.object(module1_list_scraper, "save_results", return_value=(None, None)), \
              mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
@@ -107,6 +108,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
              mock.patch.object(module1_list_scraper.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+             mock.patch.object(module1_list_scraper.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
              mock.patch.object(module1_list_scraper.time, "sleep", return_value=None), \
              mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
              mock.patch("builtins.print"):
@@ -142,6 +144,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
              mock.patch.object(module1_list_scraper.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+             mock.patch.object(module1_list_scraper.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
              mock.patch.object(module1_list_scraper.time, "sleep", return_value=None), \
              mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
              mock.patch("builtins.print"):
@@ -213,6 +216,7 @@ class Module1BlockDetectionTests(unittest.TestCase):
              mock.patch.object(module1_list_scraper.config, "BROWSER_KPSDK_SETTLE_SECONDS", 0), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_GRACE_SECONDS", 0.1), \
              mock.patch.object(module1_list_scraper.config, "BROWSER_BLOCK_POLL_SECONDS", 0.05), \
+             mock.patch.object(module1_list_scraper.config, "SCRAPER_VERBOSE_PAGE_STATE", True), \
              mock.patch.object(module1_list_scraper.time, "sleep", return_value=None), \
              mock.patch.object(browser_recovery.time, "sleep", return_value=None), \
              mock.patch("builtins.print"):

@@ -886,6 +886,8 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
     }
     conn = db_layer.connect(config.DB_PATH)
     try:
+        if hasattr(conn, "commit") and hasattr(conn, "cursor"):
+            db_layer.ensure_runtime_monitoring_schema(conn)
         db_layer.ensure_telegram_bot_tables(conn)
         job_queue.ensure_job_tables(conn)
         result["stale_recovery"] = job_queue.recover_stale_running_jobs(conn=conn, now=now)

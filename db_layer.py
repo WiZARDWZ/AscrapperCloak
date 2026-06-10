@@ -24,6 +24,35 @@ INACTIVE_AREA_REASON_NO_SUBSCRIBERS = "no_active_subscriptions"
 LISTING_LIFECYCLE_STATUSES = {"active", "sold", "removed", "not_found"}
 MODULE2_ELIGIBLE_LIFECYCLE_STATUSES = {"active"}
 
+
+SETUP_DETAIL_REQUIRED_COLUMNS = {
+    "SetupDetailStatus",
+    "SetupDetailAttemptCount",
+    "SetupDetailLastAttemptAt",
+    "SetupDetailNextRetryAt",
+    "SetupDetailLastError",
+    "SetupDetailCompletedAt",
+}
+
+AREA_MONITORING_REQUIRED_COLUMNS = {
+    "area_id",
+    "setup_status",
+    "module1_status",
+    "module3_status",
+    "module2_status",
+    "active_listing_count",
+    "inferred_price_count",
+    "unknown_price_count",
+    "setup_started_at",
+    "ready_at",
+    "last_error",
+    "updated_at",
+    "deactivated_at",
+    "deactivated_reason",
+    "reactivated_at",
+    "last_subscription_count",
+}
+
 SCHEMA_REQUIREMENTS = {
     "dbo.State": {"StateID", "Name", "Abbreviation"},
     "dbo.Suburb": {"ID", "StateID", "Name", "PostalCode"},
@@ -1712,18 +1741,70 @@ def validate_required_schema(conn) -> None:
             )
 
 
+def _table_columns(conn, table_name: str, schema_name: str = "dbo") -> set[str]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA=? AND TABLE_NAME=?
+        """,
+        schema_name,
+        table_name,
+    )
+    return {str(row[0]) for row in cur.fetchall()}
+
+
+def get_setup_detail_schema_status(conn) -> dict[str, Any]:
+    try:
+        columns = _table_columns(conn, "ListingSearchState")
+    except Exception as exc:
+        return {
+            "schema_ok": False,
+            "setup_detail_schema_ok": False,
+            "missing_columns": sorted(SETUP_DETAIL_REQUIRED_COLUMNS),
+            "error": config.mask_sensitive_text(exc),
+        }
+    missing = sorted(SETUP_DETAIL_REQUIRED_COLUMNS - columns)
+    return {
+        "schema_ok": not missing,
+        "setup_detail_schema_ok": not missing,
+        "missing_columns": missing,
+        "existing_columns": sorted(columns),
+    }
+
+
+def get_area_monitoring_schema_status(conn) -> dict[str, Any]:
+    try:
+        columns = _table_columns(conn, "area_monitoring_state")
+    except Exception as exc:
+        return {
+            "schema_ok": False,
+            "area_monitoring_schema_ok": False,
+            "missing_columns": sorted(AREA_MONITORING_REQUIRED_COLUMNS),
+            "error": config.mask_sensitive_text(exc),
+        }
+    missing = sorted(AREA_MONITORING_REQUIRED_COLUMNS - columns)
+    return {
+        "schema_ok": not missing,
+        "area_monitoring_schema_ok": not missing,
+        "missing_columns": missing,
+        "existing_columns": sorted(columns),
+    }
+
+
 def ensure_listing_search_state_detail_refresh_column(conn) -> None:
-    """Add per SearchID/listing detail-refresh timestamp used by Phase 2B batches."""
+    """Add per SearchID/listing detail-refresh/setup-detail columns used by setup batches."""
     ensure_listing_lifecycle_columns(conn)
     if not hasattr(conn, "commit"):
-        # Lightweight test doubles may only capture the final SELECT; real pyodbc
-        # connections always expose commit/rollback for the idempotent migration.
+        # Lightweight test doubles may only capture SELECTs; real pyodbc
+        # connections always expose commit/rollback for idempotent migration.
         return
     _execute_ddl_safely(conn, """
         IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NULL
         ALTER TABLE dbo.ListingSearchState ADD LastDetailRefreshAt DATETIME2 NULL
-        """, description="add dbo.ListingSearchState.LastDetailRefreshAt", required=False)
+        """, description="add dbo.ListingSearchState.LastDetailRefreshAt", required=True)
     for column_name, definition in {
         "SetupDetailStatus": "NVARCHAR(40) NULL",
         "SetupDetailAttemptCount": "INT NOT NULL CONSTRAINT DF_ListingSearchState_SetupDetailAttemptCount DEFAULT (0)",
@@ -1736,21 +1817,62 @@ def ensure_listing_search_state_detail_refresh_column(conn) -> None:
             IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
             AND COL_LENGTH('dbo.ListingSearchState', '{column_name}') IS NULL
             ALTER TABLE dbo.ListingSearchState ADD {column_name} {definition}
-            """, description=f"add dbo.ListingSearchState.{column_name}", required=False)
+            """, description=f"add dbo.ListingSearchState.{column_name}", required=True)
+    _execute_ddl_safely(conn, """
+        IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SetupDetailAttemptCount') IS NOT NULL
+        UPDATE dbo.ListingSearchState
+        SET SetupDetailAttemptCount=0
+        WHERE SetupDetailAttemptCount IS NULL
+        """, description="backfill dbo.ListingSearchState.SetupDetailAttemptCount", required=True)
     _execute_ddl_safely(conn, """
         IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
         AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SearchID') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'Status') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'ListingID') IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ListingSearchState_DetailRefreshDue' AND object_id=OBJECT_ID('dbo.ListingSearchState'))
         CREATE INDEX IX_ListingSearchState_DetailRefreshDue
         ON dbo.ListingSearchState(SearchID, Status, LastDetailRefreshAt, ListingID)
-        """, description="create IX_ListingSearchState_DetailRefreshDue", required=False)
+        """, description="create IX_ListingSearchState_DetailRefreshDue", required=True)
     _execute_ddl_safely(conn, """
         IF OBJECT_ID('dbo.ListingSearchState') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SearchID') IS NOT NULL
         AND COL_LENGTH('dbo.ListingSearchState', 'SetupDetailStatus') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'SetupDetailNextRetryAt') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'LastDetailRefreshAt') IS NOT NULL
+        AND COL_LENGTH('dbo.ListingSearchState', 'ListingID') IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_ListingSearchState_SetupDetailDue' AND object_id=OBJECT_ID('dbo.ListingSearchState'))
         CREATE INDEX IX_ListingSearchState_SetupDetailDue
         ON dbo.ListingSearchState(SearchID, SetupDetailStatus, SetupDetailNextRetryAt, LastDetailRefreshAt, ListingID)
-        """, description="create IX_ListingSearchState_SetupDetailDue", required=False)
+        """, description="create IX_ListingSearchState_SetupDetailDue", required=True)
+
+
+def ensure_runtime_monitoring_schema(conn) -> dict[str, Any]:
+    """Run required monitoring/setup migrations before scheduler, worker, heartbeat, or tools use setup tables."""
+    ensure_monitoring_state_tables(conn)
+    ensure_listing_search_state_detail_refresh_column(conn)
+    setup_detail = get_setup_detail_schema_status(conn)
+    area_monitoring = get_area_monitoring_schema_status(conn)
+    missing = {
+        "setup_detail": setup_detail.get("missing_columns") or [],
+        "area_monitoring_state": area_monitoring.get("missing_columns") or [],
+    }
+    schema_ok = not missing["setup_detail"] and not missing["area_monitoring_state"]
+    if not schema_ok:
+        raise RuntimeError(
+            "Runtime monitoring schema is not ready; "
+            f"missing setup_detail={missing['setup_detail']} "
+            f"area_monitoring_state={missing['area_monitoring_state']}"
+        )
+    return {
+        "schema_ok": True,
+        "setup_detail_schema_ok": True,
+        "area_monitoring_schema_ok": True,
+        "missing_columns": [],
+        "setup_detail": setup_detail,
+        "area_monitoring_state": area_monitoring,
+    }
 
 
 def ensure_listing_lifecycle_columns(conn) -> None:
@@ -2054,6 +2176,50 @@ def mark_listing_search_state_detail_refreshed(conn, search_id: int, listing_id:
         int(search_id),
         int(listing_id),
     )
+
+
+def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | None = None, external_id: str | None = None, error: str | None = None, retry_after=None, max_attempts: int | None = None) -> dict:
+    ensure_listing_search_state_detail_refresh_column(conn)
+    max_attempts = int(max_attempts or getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5))
+    safe_error = config.mask_sensitive_text(error or "setup detail technical failure")
+    cur = conn.cursor()
+    if listing_id is None and external_id is not None:
+        row = _one(cur, "SELECT listingID FROM dbo.Listing WHERE ExternalID=?", str(external_id))
+        listing_id = int(row[0]) if row else None
+    if listing_id is None:
+        return {"updated": False, "reason": "listing_not_found"}
+    cur.execute(
+        """
+        SELECT COALESCE(SetupDetailAttemptCount, 0)
+        FROM dbo.ListingSearchState
+        WHERE SearchID=? AND ListingID=?
+        """,
+        int(search_id),
+        int(listing_id),
+    )
+    row = cur.fetchone()
+    attempts = int(row[0] or 0) + 1 if row else 1
+    status = "detail_failed_permanent" if attempts >= max_attempts else "detail_retry_wait"
+    next_retry = None if status == "detail_failed_permanent" else retry_after
+    cur.execute(
+        """
+        UPDATE dbo.ListingSearchState
+        SET SetupDetailStatus=?,
+            SetupDetailAttemptCount=?,
+            SetupDetailLastAttemptAt=SYSDATETIME(),
+            SetupDetailNextRetryAt=?,
+            SetupDetailLastError=?,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND ListingID=?
+        """,
+        status,
+        attempts,
+        next_retry,
+        safe_error,
+        int(search_id),
+        int(listing_id),
+    )
+    return {"updated": True, "listing_id": int(listing_id), "status": status, "attempts": attempts, "next_retry_at": next_retry}
 
 
 def mark_listing_setup_detail_failed(conn, search_id: int, listing_id: int | None = None, external_id: str | None = None, error: str | None = None, retry_after=None, max_attempts: int | None = None) -> dict:
@@ -2515,10 +2681,21 @@ def ensure_monitoring_state_tables(conn) -> None:
         )
         """, description="create dbo.area_monitoring_state", required=False)
     for column_name, column_definition in {
+        "setup_status": "NVARCHAR(32) NOT NULL CONSTRAINT DF_area_monitoring_state_setup_status DEFAULT 'not_started'",
+        "module1_status": "NVARCHAR(32) NULL",
+        "module3_status": "NVARCHAR(32) NULL",
+        "module2_status": "NVARCHAR(32) NULL",
+        "active_listing_count": "INT NOT NULL CONSTRAINT DF_area_monitoring_state_active_listing_count DEFAULT 0",
+        "inferred_price_count": "INT NOT NULL CONSTRAINT DF_area_monitoring_state_inferred_price_count DEFAULT 0",
+        "unknown_price_count": "INT NOT NULL CONSTRAINT DF_area_monitoring_state_unknown_price_count DEFAULT 0",
+        "setup_started_at": "DATETIME2 NULL",
+        "ready_at": "DATETIME2 NULL",
         "deactivated_at": "DATETIME2 NULL",
         "deactivated_reason": "NVARCHAR(255) NULL",
         "reactivated_at": "DATETIME2 NULL",
         "last_subscription_count": "INT NOT NULL CONSTRAINT DF_area_monitoring_state_last_subscription_count DEFAULT 0",
+        "last_error": "NVARCHAR(MAX) NULL",
+        "updated_at": "DATETIME2 NOT NULL CONSTRAINT DF_area_monitoring_state_updated_at DEFAULT SYSDATETIME()",
     }.items():
         _execute_ddl_safely(conn, f"""
             IF OBJECT_ID('dbo.area_monitoring_state') IS NOT NULL

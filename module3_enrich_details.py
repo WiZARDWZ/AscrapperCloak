@@ -21,6 +21,18 @@ from realestate_errors import RealEstateBlockedError
 from realestate_page_state import PageState, classify_detail_page, wait_for_detail_page_state
 from area_parser import extract_area_display, parse_area_to_sqm
 
+def _verbose_page_state_enabled() -> bool:
+    return bool(getattr(config, "SCRAPER_VERBOSE_PAGE_STATE", False) or str(getattr(config, "SCRAPER_LOG_LEVEL", "INFO")).upper() == "DEBUG")
+
+
+def _should_emit_default_log(message: str) -> bool:
+    text = str(message or "")
+    noisy_tokens = ("page_state=", "html_length=", "body_text_length=", "session_health ", "same-page settle", "KPSDK same-session recheck")
+    if any(token in text for token in noisy_tokens) and not _verbose_page_state_enabled():
+        return False
+    return True
+
+
 # -------------------------
 # Driver
 # -------------------------
@@ -337,6 +349,8 @@ def _csv_safe(v: Any) -> Any:
 
 def write_outputs(rows: List[Dict[str, Any]], out_dir="output") -> Tuple[str, str]:
     def log(msg: str) -> None:
+        if not _should_emit_default_log(msg):
+            return
         print(msg)
         if on_log:
             try:
@@ -1225,6 +1239,8 @@ def module3_run(
     os.makedirs(out_dir, exist_ok=True)
 
     def log(msg: str) -> None:
+        if not _should_emit_default_log(msg):
+            return
         print(msg)
         if on_log:
             try:
@@ -1508,6 +1524,8 @@ def enrich_detail_rows(
     sleep_between = float(sleep_between if sleep_between is not None else config.MODULE3_SLEEP_BETWEEN)
 
     def log(msg: str) -> None:
+        if not _should_emit_default_log(msg):
+            return
         if on_log:
             try:
                 on_log(msg)
