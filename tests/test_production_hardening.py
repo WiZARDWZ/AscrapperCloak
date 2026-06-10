@@ -844,3 +844,153 @@ def test_telegram_transient_failure_requeues_with_backoff(monkeypatch):
     assert out["retried"] == 1
     assert out["failed"] == 0
     assert any(call[0] == "retry" for call in calls)
+
+
+def test_large_baseline_orchestration_batches_detail_without_inline_module3_or_module2(monkeypatch):
+    import monitor
+
+    rows = [{"listing_id": str(i), "url": f"https://example.test/{i}", "price": "N/A"} for i in range(924)]
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitor.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: calls.append(("ingest", k)) or 77)
+    monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
+    monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
+
+    out = monitor.baseline_setup_area("https://example.test/search")
+
+    assert out["status"] == "setup_batched"
+    assert out["rows_module1"] == 924
+    assert out["detail_batch_size"] == 50
+    assert out["detail_batches_planned"] == 19
+    assert any(item[0] == "detail_job" for item in calls)
+    ingest_call = next(item for item in calls if item[0] == "ingest")
+    assert ingest_call[1]["emit_events"] is False
+
+
+def test_setup_detail_batch_processes_configured_limit_and_requeues_next(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "DetailBaselineStatus": "running"}
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler.config, "BASELINE_DETAIL_BATCH_SIZE", 50, raising=False)
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda search_url, **kwargs: calls.append(("refresh", kwargs)) or {"processed_count": 50, "refreshed_count": 50, "failed_count": 0, "errors": []})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_started", lambda *a, **k: calls.append(("detail_started",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_batch_succeeded", lambda *a, **k: calls.append(("batch_ok",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_detail_baseline_progress", lambda conn, subscription: {"detail_baseline_total_count": 924, "detail_baseline_completed_count": 50, "detail_baseline_remaining_count": 874})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("next_detail", kwargs)) or {"created": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_price_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("price must not enqueue before details complete")))
+
+    out = monitoring_scheduler._run_setup_detail_batch({"JobID": 100, "SearchID": 42}, send_telegram=False)
+
+    assert out["status"] == "detail_baseline_running"
+    refresh = next(item for item in calls if item[0] == "refresh")
+    assert refresh[1]["limit"] == 50
+    assert refresh[1]["suppress_notifications"] is True
+    assert any(item[0] == "next_detail" for item in calls)
+    assert not any(item[0] == "activate" for item in calls)
+
+
+def test_final_setup_detail_batch_enqueues_one_full_price_job(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "DetailBaselineStatus": "running"}
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda *a, **k: {"processed_count": 24, "refreshed_count": 24, "failed_count": 0, "errors": []})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_completed", lambda *a, **k: calls.append(("detail_completed",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_detail_baseline_progress", lambda conn, subscription: {"detail_baseline_total_count": 924, "detail_baseline_completed_count": 924, "detail_baseline_remaining_count": 0})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_price_baseline_job", lambda conn, search_id, **kwargs: calls.append(("price_job", kwargs)) or {"created": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("detail should not requeue when complete")))
+
+    out = monitoring_scheduler._run_setup_detail_batch({"JobID": 101, "SearchID": 42}, send_telegram=False)
+
+    assert out["status"] == "price_baseline_pending"
+    assert sum(1 for item in calls if item[0] == "price_job") == 1
+    assert any(item[0] == "state" and item[1].get("module3_status") == "completed" for item in calls)
+
+
+def test_setup_price_baseline_runs_full_module2_once_and_marks_ready_with_unknowns(monkeypatch):
+    import monitoring_scheduler
+
+    calls = []
+    sub = {"UserAreaID": 7, "SearchID": 42, "SearchURL": "https://example.test/search", "PriceBaselineStatus": "pending"}
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    def fake_price(search_id, **kwargs):
+        calls.append(("price", kwargs))
+        return {"status": "completed_with_unknowns", "processed_count": 924, "inferred_count": 800, "unknown_count": 124, "module2_runs": [{"sweep_mode": "setup_full_sweep"}]}
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
+    monkeypatch.setattr(monitoring_scheduler, "run_price_baseline_for_search", fake_price)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_area_monitoring_state", lambda conn, search_id: {"setup_status": "preparing", "module1_status": "completed", "module3_status": "completed", "module2_status": "pending"})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_price_baseline_started", lambda *a, **k: calls.append(("price_started",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_price_baseline_completed", lambda *a, **k: calls.append(("price_completed",)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_price_baseline_progress", lambda conn, subscription: {"price_baseline_total_count": 924, "price_baseline_completed_count": 924, "price_baseline_remaining_count": 0})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda conn, search_id, **kwargs: calls.append(("state", kwargs)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "is_area_setup_ready", lambda conn, search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "activate_area_subscriptions", lambda conn, search_id: calls.append(("activate", search_id)))
+    monkeypatch.setattr(monitoring_scheduler, "_send_setup_summary_once", lambda sub, kind: calls.append(("summary", kind)))
+
+    out = monitoring_scheduler._run_setup_price_batch({"JobID": 200, "SearchID": 42}, send_telegram=True)
+
+    assert out["status"] == "ready"
+    price_call = next(item for item in calls if item[0] == "price")
+    assert price_call[1]["limit"] is None
+    assert price_call[1]["setup"] is True
+    assert ("activate", 42) in calls
+    assert ("summary", "ready") in calls
+    assert any(item[0] == "state" and item[1].get("unknown_price_count") == 124 for item in calls)
+
+
+def test_telegram_setup_status_labels_show_detail_and_price_progress():
+    import telegram_bot
+
+    detail = {
+        "AreaSetupStatus": "preparing",
+        "AreaModule1Status": "completed",
+        "AreaModule3Status": "running",
+        "AreaModule2Status": "pending",
+        "AreaLastError": "details 150/924",
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "running",
+        "PriceBaselineStatus": "pending",
+    }
+    price = {**detail, "AreaModule3Status": "completed", "AreaModule2Status": "running", "DetailBaselineStatus": "completed", "PriceBaselineStatus": "running"}
+    ready = {**price, "AreaSetupStatus": "ready", "NotificationReadyAt": "2026-06-10", "BaselineListingsCollected": 924, "PriceBaselineStatus": "completed"}
+
+    assert telegram_bot._status_label(detail) == "Preparing — details 150/924"
+    assert telegram_bot._status_label(price) == "Preparing — running price setup"
+    assert telegram_bot._status_label(ready) == "Ready — 924 listings monitored"

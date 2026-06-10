@@ -5,6 +5,7 @@ import logging
 import socket
 import sys
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -463,21 +464,35 @@ def _status_label(subscription: dict) -> str:
     detail = str(subscription.get("DetailBaselineStatus") or "pending").lower()
     price = str(subscription.get("PriceBaselineStatus") or "pending").lower()
     area_status = str(subscription.get("AreaSetupStatus") or "").lower()
-    module_statuses = {
-        str(subscription.get("AreaModule1Status") or "").lower(),
-        str(subscription.get("AreaModule3Status") or "").lower(),
-        str(subscription.get("AreaModule2Status") or "").lower(),
-    }
+    module1 = str(subscription.get("AreaModule1Status") or "").lower()
+    module3 = str(subscription.get("AreaModule3Status") or "").lower()
+    module2 = str(subscription.get("AreaModule2Status") or "").lower()
+    module_statuses = {module1, module3, module2}
+    active_count = subscription.get("BaselineListingsCollected") or subscription.get("AreaActiveListingCount")
     if subscription.get("NotificationReadyAt") and (area_status == "ready" or (detail == "completed" and price == "completed")):
-        return "Ready"
+        try:
+            count = int(active_count or 0)
+        except Exception:
+            count = 0
+        return "Ready — no active listings" if count == 0 else f"Ready — {count} listings monitored"
     if _setup_failed_for_retry(subscription):
         return "Failed — tap Retry setup"
-    if "retry_wait" in module_statuses or baseline == "retry_wait" or detail == "retry_wait" or price == "retry_wait":
-        return "Preparing — retrying setup"
+    if module3 == "retry_wait" or detail == "retry_wait":
+        return "Preparing — retrying details"
+    if module2 == "retry_wait" or price == "retry_wait":
+        return "Preparing — retrying price setup"
+    progress_text = str(subscription.get("AreaLastError") or "")
+    match = re.search(r"details\s+(\d+)\s*/\s*(\d+)", progress_text, flags=re.I)
+    if module3 == "running" and match:
+        return f"Preparing — details {match.group(1)}/{match.group(2)}"
+    if module2 == "running" or price == "running":
+        return "Preparing — running price setup"
+    if module1 == "running":
+        return "Preparing — scanning listings"
     if area_status == "preparing" or "running" in module_statuses or baseline == "running" or detail == "running" or price == "running":
         return "Preparing — setup in progress"
     if baseline == "completed" and detail == "completed" and price != "completed":
-        return "Preparing — price setup in progress"
+        return "Preparing — price setup queued"
     return "Preparing — setup queued"
 
 

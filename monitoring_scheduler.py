@@ -1020,7 +1020,7 @@ def _queue_notifications_for_search(search_id: int, dry_run: bool = False, limit
         conn.close()
 
 
-def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool) -> dict[str, Any]:
+def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=None) -> dict[str, Any]:
     import job_queue
 
     search_id = int(job["SearchID"])
@@ -1035,6 +1035,8 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool) -> dict[st
         if str(sub.get("DetailBaselineStatus") or "pending").lower() == "pending":
             db_layer.mark_subscription_detail_baseline_started(conn, user_area_id)
             sub = db_layer.get_user_area_subscription(conn, user_area_id) or sub
+        db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="running", module2_status="pending", last_error="details running")
+        conn.commit()
     finally:
         conn.close()
     if send_telegram:
@@ -1043,12 +1045,13 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool) -> dict[st
         return _inactive_job_result(search_id)
     detail_result = refresh_active_listings(
         sub["SearchURL"],
-        limit=int(getattr(config, "SETUP_DETAIL_BATCH_SIZE", 10)),
+        limit=int(getattr(config, "BASELINE_DETAIL_BATCH_SIZE", getattr(config, "SETUP_DETAIL_BATCH_SIZE", 50))),
         stale_hours=0,
         dry_run=False,
         context="initial_detail_baseline",
         suppress_notifications=True,
         subscription=sub,
+        on_log=on_log,
     )
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
@@ -1063,22 +1066,27 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool) -> dict[st
             backoff_seconds = backoffs[min(attempt, len(backoffs) - 1)]
             error = config.mask_sensitive_text(detail_result.get("errors") or "retryable detail baseline batch failure")
             retry_status = db_layer.mark_subscription_detail_baseline_retry_wait(conn, user_area_id, error, now + timedelta(seconds=backoff_seconds), config.DETAIL_BASELINE_MAX_ATTEMPTS)
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="retry_wait", last_error=error)
             status = f"detail_baseline_{retry_status}"
             if retry_status == "retry_wait":
-                job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, search_id=int(job["SearchID"]), user_area_id=user_area_id, priority=job_queue.PRIORITY_SETUP, run_after=now + timedelta(seconds=backoff_seconds))
+                db_layer.enqueue_setup_detail_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=now + timedelta(seconds=backoff_seconds), dedupe_suffix=f"retry_after_job_{job.get('JobID')}")
         elif detail_result.get("errors") and int(detail_result.get("refreshed_count") or 0) == 0:
             db_layer.mark_subscription_detail_baseline_failed(conn, user_area_id, str(detail_result.get("errors")))
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="failed", module3_status="failed", last_error=str(detail_result.get("errors")))
             status = "detail_baseline_failed"
         elif progress["detail_baseline_remaining_count"] == 0:
             db_layer.mark_subscription_detail_baseline_completed(conn, user_area_id)
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="completed", module2_status="pending", last_error=f"details {progress['detail_baseline_completed_count']}/{progress['detail_baseline_total_count']}")
             refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or refreshed_sub
             progress = db_layer.get_detail_baseline_progress(conn, refreshed_sub)
             status = "price_baseline_pending"
-            job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_PRICE_BASELINE, search_id=int(job["SearchID"]), user_area_id=user_area_id, priority=job_queue.PRIORITY_SETUP, run_after=now + timedelta(seconds=5))
+            db_layer.enqueue_setup_price_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=now + timedelta(seconds=5))
         else:
             db_layer.mark_subscription_detail_baseline_batch_succeeded(conn, user_area_id)
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="running", module2_status="pending", last_error=f"details {progress['detail_baseline_completed_count']}/{progress['detail_baseline_total_count']}")
             status = "detail_baseline_running"
-            job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, search_id=int(job["SearchID"]), user_area_id=user_area_id, priority=job_queue.PRIORITY_SETUP, run_after=now + timedelta(seconds=5))
+            db_layer.enqueue_setup_detail_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=now + timedelta(seconds=5), dedupe_suffix=f"after_job_{job.get('JobID')}")
+        conn.commit()
     finally:
         conn.close()
     if send_telegram and status == "ready":
@@ -1185,7 +1193,7 @@ def _default_price_sweep_mode(setup: bool, requested: str | None, history: dict[
     return "smart_refresh" if history.get("has_enough_history") else "setup_full_sweep"
 
 
-def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_run: bool = False, setup: bool = False, listing_external_ids: list[str] | None = None, run_started_at=None, mark_search_complete: bool = True, sweep_mode: str | None = None, enqueue_unknown_retry: bool = True) -> dict[str, Any]:
+def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_run: bool = False, setup: bool = False, listing_external_ids: list[str] | None = None, run_started_at=None, mark_search_complete: bool = True, sweep_mode: str | None = None, enqueue_unknown_retry: bool = True, on_log=None) -> dict[str, Any]:
     search_id = int(search_id)
     if not getattr(config, "PRICE_INFERENCE_ENABLED", True):
         return json_safe({"status": "skipped", "reason": "price_inference_disabled", "search_id": search_id})
@@ -1305,6 +1313,7 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
             target_mode="all" if setup else "missing_only",
             target_listing_ids=current_target_ids if setup else None,
             preserve_existing_price_display=True,
+            on_log=on_log,
         )
         metadata = dict(getattr(module2_run, "last_result", {}) or {})
         metadata.update({"output_csv": out_csv, "output_json": out_json})
@@ -1401,9 +1410,7 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
     return json_safe(result)
 
 
-def _run_setup_price_batch(job: dict[str, Any], send_telegram: bool) -> dict[str, Any]:
-    import job_queue
-
+def _run_setup_price_batch(job: dict[str, Any], send_telegram: bool, on_log=None) -> dict[str, Any]:
     search_id = int(job["SearchID"])
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
@@ -1413,16 +1420,24 @@ def _run_setup_price_batch(job: dict[str, Any], send_telegram: bool) -> dict[str
     user_area_id = int(sub["UserAreaID"])
     conn = db_layer.connect(config.DB_PATH)
     try:
+        area_state = db_layer.get_area_monitoring_state(conn, search_id) or {}
+        if str(area_state.get("module3_status") or "").lower() not in {"completed", "skipped"}:
+            return {"status": "skipped", "reason": "detail_baseline_not_completed", "search_id": search_id}
         if str(sub.get("PriceBaselineStatus") or "pending").lower() == "pending":
             db_layer.mark_subscription_price_baseline_started(conn, user_area_id)
             sub = db_layer.get_user_area_subscription(conn, user_area_id) or sub
+        db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module2_status="running", last_error="running price setup")
+        conn.commit()
     finally:
         conn.close()
+
     price_result = run_price_baseline_for_search(
         search_id,
+        limit=None,
         dry_run=False,
         setup=True,
         mark_search_complete=False,
+        on_log=on_log,
     )
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
@@ -1430,23 +1445,55 @@ def _run_setup_price_batch(job: dict[str, Any], send_telegram: bool) -> dict[str
     try:
         refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or sub
         progress = db_layer.get_price_baseline_progress(conn, refreshed_sub)
-        now = _utcnow()
-        if str(price_result.get("status") or "").startswith("retry_wait"):
-            raise Module2RetryableInterruption(price_result.get("errors") or price_result.get("status"))
-        if price_result.get("status") == "failed":
+        status_text = str(price_result.get("status") or "")
+        if status_text.startswith("retry_wait"):
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module2_status="retry_wait", last_error=config.mask_sensitive_text(price_result.get("errors") or status_text))
+            conn.commit()
+            raise Module2RetryableInterruption(price_result.get("errors") or status_text)
+        if status_text == "failed":
             db_layer.mark_subscription_price_baseline_failed(conn, user_area_id, str(price_result.get("errors")))
+            db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="failed", module2_status="failed", last_error=str(price_result.get("errors")))
+            conn.commit()
             status = "price_baseline_failed"
-        elif progress["price_baseline_remaining_count"] == 0:
-            db_layer.mark_subscription_price_baseline_completed(conn, user_area_id)
-            refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or refreshed_sub
-            refreshed_sub["PriceBaselineUnknownCount"] = price_result.get("unknown_count", 0)
-            refreshed_sub["PriceBaselineInferredCount"] = price_result.get("inferred_count", 0)
-            refreshed_sub["PriceBaselineTotalCount"] = price_result.get("processed_count", progress.get("price_baseline_total_count"))
-            progress = db_layer.get_price_baseline_progress(conn, refreshed_sub)
-            status = "ready"
         else:
-            status = "price_baseline_running"
-            job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_PRICE_BASELINE, search_id=int(job["SearchID"]), user_area_id=user_area_id, priority=job_queue.PRIORITY_SETUP, run_after=now + timedelta(seconds=5))
+            db_layer.mark_subscription_price_baseline_completed(conn, user_area_id)
+            inferred_count = int(price_result.get("inferred_count") or 0)
+            unknown_count = int(price_result.get("unknown_count") or 0)
+            total_count = int(price_result.get("processed_count") or progress.get("price_baseline_total_count") or 0)
+            db_layer.upsert_area_monitoring_state(
+                conn,
+                search_id,
+                setup_status="preparing",
+                module2_status="completed",
+                active_listing_count=total_count or progress.get("price_baseline_total_count"),
+                inferred_price_count=inferred_count,
+                unknown_price_count=unknown_count,
+                last_error=None,
+            )
+            if db_layer.is_area_setup_ready(conn, search_id):
+                db_layer.upsert_area_monitoring_state(
+                    conn,
+                    search_id,
+                    setup_status="ready",
+                    module1_status="completed",
+                    module3_status="completed",
+                    module2_status="completed",
+                    active_listing_count=total_count or progress.get("price_baseline_total_count"),
+                    inferred_price_count=inferred_count,
+                    unknown_price_count=unknown_count,
+                    last_error=None,
+                    set_ready=True,
+                )
+                db_layer.activate_area_subscriptions(conn, search_id)
+                status = "ready"
+            else:
+                status = "price_baseline_completed_not_ready"
+            refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or refreshed_sub
+            refreshed_sub["PriceBaselineUnknownCount"] = unknown_count
+            refreshed_sub["PriceBaselineInferredCount"] = inferred_count
+            refreshed_sub["PriceBaselineTotalCount"] = total_count or progress.get("price_baseline_total_count")
+            progress = db_layer.get_price_baseline_progress(conn, refreshed_sub)
+            conn.commit()
     finally:
         conn.close()
     if send_telegram and status == "ready":
@@ -1784,6 +1831,8 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
     job_id = int(job.get("JobID") or 0)
     heartbeat_job_types = {
         job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+        job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE,
+        job_queue.JOB_TYPE_SETUP_PRICE_BASELINE,
         job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
         job_queue.JOB_TYPE_DETAIL_REFRESH_EXISTING,
         job_queue.JOB_TYPE_MODULE3_REFRESH_AREA,
@@ -1850,9 +1899,9 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
             job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, search_id=search_id, user_area_id=int(sub["UserAreaID"]), priority=job_queue.PRIORITY_SETUP, run_after=_utcnow())
         return {"status": baseline.get("status"), "baseline": baseline}
     if job_type == job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE:
-        return _run_setup_detail_batch(job, send_telegram=send_telegram)
+        return _run_setup_detail_batch(job, send_telegram=send_telegram, on_log=_heartbeat_on_log)
     if job_type == job_queue.JOB_TYPE_SETUP_PRICE_BASELINE:
-        return _run_setup_price_batch(job, send_telegram=send_telegram)
+        return _run_setup_price_batch(job, send_telegram=send_telegram, on_log=_heartbeat_on_log)
     if job_type == job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS:
         sub = _load_search_subscription(search_id, user_area_id)
         if not sub:

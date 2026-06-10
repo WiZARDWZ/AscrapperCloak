@@ -2757,6 +2757,31 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
 
 
 
+
+def cancel_setup_phase_jobs_for_search(conn, search_id: int, reason: str = "setup retry reset cancels queued setup phase jobs") -> int:
+    """Cancel queued/retry setup detail and full-price phase jobs without cancelling the orchestrator."""
+    safe_reason = config.mask_sensitive_text(reason or "setup phase reset")
+    cur = conn.cursor()
+    cur.execute(
+        """
+        IF OBJECT_ID('dbo.Job') IS NOT NULL
+        UPDATE dbo.Job
+        SET Status='cancelled',
+            FinishedAt=COALESCE(FinishedAt, SYSDATETIME()),
+            UpdatedAt=SYSDATETIME(),
+            LastError=?
+        WHERE SearchID=?
+          AND JobType IN ('setup_detail_baseline','setup_price_baseline')
+          AND Status IN ('pending','paused','queued','retry_wait','scheduled')
+        """,
+        safe_reason,
+        int(search_id),
+    )
+    try:
+        return int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
+    except Exception:
+        return 0
+
 def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | None = None) -> dict:
     """Reset a failed/preparing setup to a supported preparing state and enqueue baseline once."""
     ensure_telegram_bot_tables(conn)
@@ -2835,6 +2860,7 @@ def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | Non
         resolved_search_id,
     )
     upsert_user_area_subscription_state(conn, resolved_telegram_user_id, resolved_search_id, status="preparing", notify_enabled=False)
+    cancelled_setup_phase_jobs = cancel_setup_phase_jobs_for_search(conn, resolved_search_id, reason="setup retry reset cancels queued setup phase jobs")
     conn.commit()
     baseline_job = enqueue_baseline_setup_job(conn, resolved_search_id, search_url)
     conn.commit()
@@ -2845,8 +2871,53 @@ def retry_setup_area(conn, user_area_id: int | None = None, search_id: int | Non
         "search_id": resolved_search_id,
         "area_label": area_label,
         "baseline_job": baseline_job,
+        "cancelled_setup_phase_jobs": cancelled_setup_phase_jobs,
     }
 
+
+
+def enqueue_setup_detail_baseline_job(conn, search_id: int, user_area_id: int | None = None, run_after=None, dedupe_suffix: str = "initial") -> dict | None:
+    """Enqueue one bounded Module3 setup-detail batch for a search."""
+    import job_queue
+
+    return job_queue.enqueue_job_once(
+        job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE,
+        search_id=int(search_id),
+        user_area_id=int(user_area_id) if user_area_id is not None else None,
+        priority=job_queue.PRIORITY_SETUP,
+        run_after=run_after or datetime.now(),
+        payload={"search_id": int(search_id), "phase": "module3_detail_baseline", "dedupe_suffix": str(dedupe_suffix or "initial")},
+        dedupe_key=f"{job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE}:search_id={int(search_id)}:{dedupe_suffix or 'initial'}",
+        max_attempts=5,
+    )
+
+
+def enqueue_setup_price_baseline_job(conn, search_id: int, user_area_id: int | None = None, run_after=None) -> dict | None:
+    """Enqueue exactly one full Module2 setup-price job for a search."""
+    import job_queue
+
+    return job_queue.enqueue_job_once(
+        job_queue.JOB_TYPE_SETUP_PRICE_BASELINE,
+        search_id=int(search_id),
+        user_area_id=int(user_area_id) if user_area_id is not None else None,
+        priority=job_queue.PRIORITY_SETUP,
+        run_after=run_after or datetime.now(),
+        payload={"search_id": int(search_id), "phase": "module2_full_setup", "module2_batching": False},
+        dedupe_key=f"{job_queue.JOB_TYPE_SETUP_PRICE_BASELINE}:search_id={int(search_id)}:full",
+        max_attempts=3,
+    )
+
+
+def is_area_setup_ready(conn, search_id: int) -> bool:
+    """Central setup readiness guard used before activating subscriptions."""
+    state = get_area_monitoring_state(conn, int(search_id)) or {}
+    setup_status = str(state.get("setup_status") or "").lower()
+    if setup_status in {"inactive", "failed"}:
+        return False
+    module1 = str(state.get("module1_status") or "").lower()
+    module3 = str(state.get("module3_status") or "").lower()
+    module2 = str(state.get("module2_status") or "").lower()
+    return module1 == "completed" and module3 in {"completed", "skipped"} and module2 in {"completed", "completed_with_unknowns", "skipped"}
 
 def enqueue_baseline_setup_job(conn, area_id: int, search_url: str) -> dict | None:
     """Enqueue one active baseline_setup_area job per area."""
@@ -4454,6 +4525,37 @@ def get_active_user_area_subscriptions(conn) -> list[dict]:
 def mark_subscription_baseline_started(conn, user_area_id: int) -> None:
     conn.cursor().execute("UPDATE dbo.UserAreaSubscription SET BaselineStatus='running', BaselineStartedAt=COALESCE(BaselineStartedAt, SYSDATETIME()), BaselineCompletedAt=NULL, BaselineLastError=NULL, UpdatedAt=SYSDATETIME() WHERE SearchID=(SELECT SearchID FROM dbo.UserAreaSubscription WHERE UserAreaID=?) AND IsActive=1", int(user_area_id)); conn.commit()
 
+
+
+def mark_search_baseline_completed(conn, search_id: int, listings_collected: int | None = None, new_count: int | None = None, pages_checked: int | None = None, total_pages_detected: int | None = None, stop_reason: str | None = None) -> None:
+    if not hasattr(conn, "cursor"):
+        return
+    ensure_telegram_bot_tables(conn)
+    conn.cursor().execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET BaselineStatus='completed',
+            BaselineCompletedAt=COALESCE(BaselineCompletedAt, SYSDATETIME()),
+            LastLightCheckAt=SYSDATETIME(),
+            BaselineListingsCollected=?,
+            BaselineNewCount=?,
+            BaselinePagesChecked=?,
+            BaselineTotalPagesDetected=?,
+            BaselineStopReason=?,
+            BaselineLastError=NULL,
+            DetailBaselineStatus=CASE WHEN DetailBaselineStatus IN ('completed','running','retry_wait') THEN DetailBaselineStatus ELSE 'pending' END,
+            PriceBaselineStatus=CASE WHEN PriceBaselineStatus='completed' THEN PriceBaselineStatus ELSE 'pending' END,
+            NotificationReadyAt=NULL,
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        listings_collected,
+        new_count,
+        pages_checked,
+        total_pages_detected,
+        stop_reason,
+        int(search_id),
+    )
 
 def mark_subscription_baseline_completed(conn, user_area_id: int, listings_collected: int | None = None, new_count: int | None = None, pages_checked: int | None = None, total_pages_detected: int | None = None, stop_reason: str | None = None) -> None:
     conn.cursor().execute("""
