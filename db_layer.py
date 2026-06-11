@@ -5242,7 +5242,7 @@ def get_detail_baseline_progress(conn, subscription: dict) -> dict:
 
 
 
-def count_succeeded_setup_detail_jobs(conn, search_id: int) -> int:
+def count_succeeded_setup_detail_jobs(conn, search_id: int, started_at=None) -> int:
     try:
         row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
         if not row or row[0] is None:
@@ -5250,16 +5250,66 @@ def count_succeeded_setup_detail_jobs(conn, search_id: int) -> int:
     except Exception:
         return 0
     cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT COUNT(1)
-        FROM dbo.Job
-        WHERE SearchID=? AND JobType='setup_detail_baseline' AND Status='succeeded'
-        """,
-        int(search_id),
-    )
+    if started_at is not None:
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM dbo.Job
+            WHERE SearchID=?
+              AND JobType='setup_detail_baseline'
+              AND Status='succeeded'
+              AND COALESCE(FinishedAt, StartedAt, CreatedAt) >= ?
+            """,
+            int(search_id),
+            started_at,
+        )
+    else:
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType='setup_detail_baseline' AND Status='succeeded'
+            """,
+            int(search_id),
+        )
     row = cur.fetchone()
     return int(row[0] or 0) if row else 0
+
+
+def get_latest_setup_detail_job(conn, search_id: int, started_at=None) -> dict | None:
+    try:
+        row = _one(conn.cursor(), "SELECT OBJECT_ID('dbo.Job')")
+        if not row or row[0] is None:
+            return None
+    except Exception:
+        return None
+    cur = conn.cursor()
+    if started_at is not None:
+        cur.execute(
+            """
+            SELECT TOP (1) JobID, JobType, Status, CreatedAt, StartedAt, FinishedAt, LastError, PayloadJson, DedupeKey
+            FROM dbo.Job
+            WHERE SearchID=?
+              AND JobType='setup_detail_baseline'
+              AND COALESCE(FinishedAt, StartedAt, CreatedAt) >= ?
+            ORDER BY JobID DESC
+            """,
+            int(search_id),
+            started_at,
+        )
+    else:
+        cur.execute(
+            """
+            SELECT TOP (1) JobID, JobType, Status, CreatedAt, StartedAt, FinishedAt, LastError, PayloadJson, DedupeKey
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType='setup_detail_baseline'
+            ORDER BY JobID DESC
+            """,
+            int(search_id),
+        )
+    cols = [col[0] for col in cur.description]
+    rows = [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
+    return rows[0] if rows else None
 
 def count_remaining_setup_detail_targets(conn, search_id: int, subscription: dict | None = None) -> int:
     if subscription is None:

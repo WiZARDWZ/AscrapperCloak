@@ -637,6 +637,24 @@ def _setup_detail_next_run_after(now: datetime) -> datetime:
     return now + timedelta(seconds=delay + jitter)
 
 
+def _setup_detail_run_started_at(subscription: dict[str, Any] | None):
+    return (subscription or {}).get("DetailBaselineStartedAt")
+
+
+def _setup_detail_run_id(subscription: dict[str, Any] | None) -> str:
+    started_at = _setup_detail_run_started_at(subscription)
+    if hasattr(started_at, "isoformat"):
+        return started_at.isoformat()
+    return str(started_at or "unspecified")
+
+
+def _count_succeeded_setup_detail_jobs_for_run(conn, search_id: int, started_at=None) -> int:
+    try:
+        return int(db_layer.count_succeeded_setup_detail_jobs(conn, search_id, started_at=started_at))
+    except TypeError:
+        return int(db_layer.count_succeeded_setup_detail_jobs(conn, search_id))
+
+
 def _setup_log(event: str, **fields: Any) -> None:
     parts = [event]
     for key, value in fields.items():
@@ -866,6 +884,58 @@ def _terminal_failed_area_blocks_auto_baseline(search_id: int) -> bool:
     return status in {"failed", "failed_ingest"}
 
 
+def _detail_repair_diagnostics(search_id: int, subscription: dict[str, Any], phase: dict[str, str]) -> dict[str, Any]:
+    conn = db_layer.connect(config.DB_PATH)
+    try:
+        try:
+            refreshed_sub = db_layer.get_user_area_subscription(conn, int(subscription["UserAreaID"])) or subscription
+        except Exception:
+            refreshed_sub = subscription
+        try:
+            progress = db_layer.get_detail_baseline_progress(conn, refreshed_sub)
+        except Exception:
+            fallback_total = int(subscription.get("BaselineListingsCollected") or subscription.get("AreaActiveListingCount") or 0)
+            fallback_remaining = fallback_total if fallback_total > 0 else (1 if phase.get("module3_status") not in {"completed", "skipped"} else 0)
+            progress = {
+                "detail_baseline_total_count": fallback_total,
+                "detail_baseline_completed_count": max(0, fallback_total - fallback_remaining),
+                "detail_baseline_remaining_count": fallback_remaining,
+            }
+        remaining = int(progress.get("detail_baseline_remaining_count") or 0)
+        done = int(progress.get("detail_baseline_completed_count") or 0)
+        try:
+            latest_detail = db_layer.get_latest_setup_detail_job(conn, int(search_id), started_at=_setup_detail_run_started_at(refreshed_sub))
+        except Exception:
+            latest_detail = None
+    finally:
+        conn.close()
+    area_status = str(phase.get("area_status") or "").lower()
+    latest_status = str((latest_detail or {}).get("Status") or "").lower()
+    latest_error = str((latest_detail or {}).get("LastError") or "").strip()
+    failed_but_recoverable = (
+        area_status == "failed"
+        and done > 0
+        and remaining > 0
+        and latest_status == "succeeded"
+        and not latest_error
+    )
+    preparing_or_running = area_status not in {"failed", "failed_ingest", "inactive"}
+    recommended = (
+        phase.get("module1_status") == "completed"
+        and phase.get("module3_status") not in {"completed", "skipped"}
+        and remaining > 0
+        and (preparing_or_running or failed_but_recoverable)
+    )
+    return {
+        "progress": progress,
+        "remaining": remaining,
+        "done": done,
+        "latest_detail_job": latest_detail,
+        "repair_recommended": recommended,
+        "failed_but_recoverable": failed_but_recoverable,
+    }
+
+
 def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
     import job_queue
 
@@ -906,9 +976,6 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
             if not _subscription_group_is_ready(group):
                 result["not_ready_search_ids_considered"].append(search_id)
                 phase = _setup_phase_from_subscription(rep)
-                if phase["area_status"] in {"failed", "failed_ingest"} or _terminal_failed_area_blocks_auto_baseline(search_id):
-                    result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "reason": "terminal_failed_area_requires_manual_retry"})
-                    continue
                 active_setup_jobs = _active_setup_pipeline_jobs(search_id)
                 if active_setup_jobs:
                     blocked = {
@@ -922,6 +989,10 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                     result["not_due"].append(blocked)
                     duplicate_job = {**active_setup_jobs[0], "created": False, "duplicate": True, "reason": "active_setup_pipeline_job"}
                     result["skipped_duplicates"].append(duplicate_job)
+                    continue
+                detail_repair = _detail_repair_diagnostics(search_id, rep, phase)
+                if (phase["area_status"] in {"failed", "failed_ingest"} or _terminal_failed_area_blocks_auto_baseline(search_id)) and not detail_repair["repair_recommended"]:
+                    result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "reason": "terminal_failed_area_requires_manual_retry"})
                     continue
                 if phase["module1_status"] != "completed":
                     job = job_queue.enqueue_job_once(
@@ -938,16 +1009,21 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                         result["setup_baseline_requeued_count"] += 1
                     _append_created_or_duplicate(result, job)
                     continue
-                if phase["module3_status"] not in {"completed", "skipped"}:
+                if detail_repair["repair_recommended"]:
                     repair_conn = db_layer.connect(config.DB_PATH)
                     try:
-                        job = db_layer.enqueue_setup_detail_baseline_job(repair_conn, search_id, user_area_id=int(rep["UserAreaID"]), run_after=current_time_used, dedupe_suffix="scheduler_repair")
+                        db_layer.upsert_area_monitoring_state(repair_conn, search_id, setup_status="preparing", module1_status="completed", module3_status="running", module2_status="pending", last_error=f"details {detail_repair['done']}/{detail_repair['progress'].get('detail_baseline_total_count')}")
+                        job = db_layer.enqueue_setup_detail_baseline_job(repair_conn, search_id, user_area_id=int(rep["UserAreaID"]), run_after=current_time_used, dedupe_suffix=f"scheduler_repair_{int(current_time_used.timestamp()) if hasattr(current_time_used, 'timestamp') else 'now'}")
                         repair_conn.commit()
                     finally:
                         repair_conn.close()
                     if job and job.get("created"):
                         result["setup_detail_repair_enqueued_count"] += 1
+                        _setup_log("setup_detail_repair_requeued", search_id=search_id, remaining=detail_repair["remaining"], reason="missing_next_detail_job")
                     _append_created_or_duplicate(result, job)
+                    continue
+                if phase["module3_status"] not in {"completed", "skipped"}:
+                    result["not_due"].append({"search_id": search_id, "job_type": job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, "reason": "detail_baseline_not_repairable_or_no_remaining_targets", "remaining": detail_repair["remaining"]})
                     continue
                 if phase["module2_status"] not in {"completed", "completed_with_unknowns", "skipped"}:
                     repair_conn = db_layer.connect(config.DB_PATH)
@@ -1180,7 +1256,9 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
             db_layer.mark_subscription_detail_baseline_started(conn, user_area_id)
             sub = db_layer.get_user_area_subscription(conn, user_area_id) or sub
         before_progress = db_layer.get_detail_baseline_progress(conn, sub)
-        completed_batches = db_layer.count_succeeded_setup_detail_jobs(conn, search_id)
+        current_run_started_at = _setup_detail_run_started_at(sub)
+        current_setup_run_id = _setup_detail_run_id(sub)
+        completed_batches = _count_succeeded_setup_detail_jobs_for_run(conn, search_id, current_run_started_at)
         batch_number = completed_batches + 1
         batch_size = int(getattr(config, "BASELINE_DETAIL_BATCH_SIZE", getattr(config, "SETUP_DETAIL_BATCH_SIZE", 50)))
         try:
@@ -1203,6 +1281,7 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
         search_id=search_id,
         job_id=job_id,
         batch_number=batch_number,
+        current_setup_run_id=current_setup_run_id,
         batch_size=batch_size,
         target_total=before_progress.get("detail_baseline_total_count"),
         remaining_before=before_progress.get("detail_baseline_remaining_count"),
@@ -1229,6 +1308,9 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
     try:
         refreshed_sub = db_layer.get_user_area_subscription(conn, user_area_id) or sub
         progress = db_layer.get_detail_baseline_progress(conn, refreshed_sub)
+        current_run_started_at = _setup_detail_run_started_at(refreshed_sub)
+        current_setup_run_id = _setup_detail_run_id(refreshed_sub)
+        completed_batches = _count_succeeded_setup_detail_jobs_for_run(conn, search_id, current_run_started_at)
         now = _utcnow()
         processed = int(detail_result.get("processed_count") or 0)
         succeeded = int(detail_result.get("refreshed_count") or 0)
@@ -1238,6 +1320,8 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
         remaining_after = int(progress.get("detail_baseline_remaining_count") or 0)
         target_total = int(progress.get("detail_baseline_total_count") or before_progress.get("detail_baseline_total_count") or 0)
         detail_done = int(progress.get("detail_baseline_completed_count") or 0)
+        before_done = int(before_progress.get("detail_baseline_completed_count") or 0)
+        progressed_this_batch = processed > 0 and (succeeded > 0 or detail_done > before_done)
         percent = (detail_done / target_total * 100.0) if target_total else 0.0
         if is_retryable_detail_batch_failure(detail_result):
             attempt = int(refreshed_sub.get("DetailBaselineAttemptCount") or 0)
@@ -1264,7 +1348,14 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
             db_layer.enqueue_setup_price_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=now + timedelta(seconds=5))
             _setup_log("setup_detail_completed", search_id=search_id, target_total=target_total, detail_done=detail_done, remaining=0, duration_seconds=time.monotonic() - started_monotonic, next_job_type="setup_price_baseline")
         else:
-            if target_total and (completed_batches + 1) * max(1, batch_size) > target_total * 1.5 and remaining_after > max(batch_size, target_total * 0.25):
+            if progressed_this_batch and remaining_after > 0:
+                db_layer.mark_subscription_detail_baseline_batch_succeeded(conn, user_area_id)
+                db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="preparing", module3_status="running", module2_status="pending", last_error=f"details {progress['detail_baseline_completed_count']}/{progress['detail_baseline_total_count']}")
+                status = "detail_baseline_running"
+                next_run_after = _setup_detail_next_run_after(now)
+                db_layer.enqueue_setup_detail_baseline_job(conn, search_id, user_area_id=user_area_id, run_after=next_run_after, dedupe_suffix=f"after_job_{job.get('JobID')}")
+                _setup_log("setup_detail_batch_requeue", search_id=search_id, previous_job_id=job_id, current_setup_run_id=current_setup_run_id, next_job_type="setup_detail_baseline", run_after=next_run_after, remaining=remaining_after)
+            elif target_total and (completed_batches + 1) * max(1, batch_size) > target_total * 1.5 and remaining_after > max(batch_size, target_total * 0.25):
                 error = f"setup detail progress stalled: completed_batches={completed_batches + 1}, target_total={target_total}, remaining={remaining_after}"
                 db_layer.mark_subscription_detail_baseline_failed(conn, user_area_id, error)
                 db_layer.upsert_area_monitoring_state(conn, search_id, setup_status="failed", module3_status="failed", last_error=error)
@@ -1284,6 +1375,7 @@ def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=Non
         search_id=search_id,
         job_id=job_id,
         batch_number=batch_number,
+        current_setup_run_id=current_setup_run_id,
         selected_count=len(preview_targets),
         processed=processed,
         succeeded=succeeded,

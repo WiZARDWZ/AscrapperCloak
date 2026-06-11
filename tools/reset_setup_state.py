@@ -60,7 +60,7 @@ def _reset_listing_setup_detail_markers(conn, search_id: int) -> int:
         return 0
 
 
-def reset_setup_state(search_id: int, *, reason: str, force: bool = False) -> dict[str, Any]:
+def reset_setup_state(search_id: int, *, reason: str, force: bool = False, resume_detail: bool = False) -> dict[str, Any]:
     conn = db_layer.connect(config.DB_PATH)
     try:
         db_layer.ensure_runtime_monitoring_schema(conn)
@@ -76,6 +76,74 @@ def reset_setup_state(search_id: int, *, reason: str, force: bool = False) -> di
                 "before": before,
             }
         cancelled_jobs = _cancel_setup_jobs(conn, search_id, reason)
+        if resume_detail:
+            subs = db_layer.get_active_user_area_subscriptions_for_search(conn, search_id)
+            sub = subs[0] if subs else None
+            if not sub:
+                return {
+                    "ok": False,
+                    "reason": "no_active_subscription_for_resume_detail",
+                    "search_id": search_id,
+                    "before": before,
+                }
+            progress = db_layer.get_detail_baseline_progress(conn, sub)
+            remaining = int(progress.get("detail_baseline_remaining_count") or 0)
+            if remaining <= 0:
+                return {
+                    "ok": False,
+                    "reason": "detail_baseline_has_no_remaining_targets",
+                    "search_id": search_id,
+                    "before": before,
+                    "progress": progress,
+                }
+            db_layer.upsert_area_monitoring_state(
+                conn,
+                search_id,
+                setup_status="preparing",
+                module1_status="completed",
+                module3_status="running",
+                module2_status="pending",
+                last_error=f"details {progress.get('detail_baseline_completed_count')}/{progress.get('detail_baseline_total_count')}",
+            )
+            cur = conn.cursor()
+            cur.execute(
+                """
+                IF OBJECT_ID('dbo.UserAreaSubscription') IS NOT NULL
+                UPDATE dbo.UserAreaSubscription
+                SET SubscriptionStatus='preparing',
+                    NotifyEnabled=0,
+                    BaselineStatus='completed',
+                    DetailBaselineStatus='running',
+                    DetailBaselineStartedAt=COALESCE(DetailBaselineStartedAt, SYSDATETIME()),
+                    DetailBaselineCompletedAt=NULL,
+                    DetailBaselineAttemptCount=0,
+                    DetailBaselineLastAttemptAt=NULL,
+                    DetailBaselineNextRetryAt=NULL,
+                    DetailBaselineLastError=NULL,
+                    PriceBaselineStatus='pending',
+                    PriceBaselineStartedAt=NULL,
+                    PriceBaselineCompletedAt=NULL,
+                    PriceBaselineLastError=NULL,
+                    NotificationReadyAt=NULL,
+                    UpdatedAt=SYSDATETIME()
+                WHERE SearchID=? AND IsActive=1
+                """,
+                int(search_id),
+            )
+            job = db_layer.enqueue_setup_detail_baseline_job(conn, search_id, user_area_id=int(sub["UserAreaID"]), dedupe_suffix="resume_detail")
+            conn.commit()
+            after = setup_progress(search_id)
+            return {
+                "ok": True,
+                "mode": "resume_detail",
+                "search_id": search_id,
+                "cancelled_setup_jobs": cancelled_jobs,
+                "preserved_detail_markers": True,
+                "detail_progress": progress,
+                "detail_job": job,
+                "before": before,
+                "after": after,
+            }
         reset_detail_rows = _reset_listing_setup_detail_markers(conn, search_id)
         db_layer.upsert_area_monitoring_state(
             conn,
@@ -135,8 +203,9 @@ def main() -> None:
     parser.add_argument("--search-id", type=int, required=True)
     parser.add_argument("--reason", required=True)
     parser.add_argument("--force", action="store_true", help="Cancel running setup jobs too; only use after stopping the service")
+    parser.add_argument("--resume-detail", action="store_true", help="Preserve Module1/detail progress and requeue the next setup detail batch")
     args = parser.parse_args()
-    result = reset_setup_state(args.search_id, reason=args.reason, force=args.force)
+    result = reset_setup_state(args.search_id, reason=args.reason, force=args.force, resume_detail=args.resume_detail)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     if not result.get("ok"):
         raise SystemExit(2)

@@ -47,6 +47,12 @@ def setup_progress(search_id: int, *, migrate_schema: bool = True) -> dict[str, 
         sub = subs[0] if subs else {"SearchID": search_id, "BaselineListingsCollected": state.get("active_listing_count")}
         detail = db_layer.get_detail_baseline_progress(conn, sub)
         active_jobs = db_layer.get_active_setup_pipeline_jobs(conn, search_id)
+        current_setup_run_id = None
+        current_run_started_at = sub.get("DetailBaselineStartedAt")
+        if hasattr(current_run_started_at, "isoformat"):
+            current_setup_run_id = current_run_started_at.isoformat()
+        elif current_run_started_at:
+            current_setup_run_id = str(current_run_started_at)
         cur = conn.cursor()
         cur.execute(
             """
@@ -68,6 +74,17 @@ def setup_progress(search_id: int, *, migrate_schema: bool = True) -> dict[str, 
             search_id,
         )
         latest_detail = _rows(cur)
+        latest_current_detail = db_layer.get_latest_setup_detail_job(conn, search_id, started_at=current_run_started_at)
+        current_run_detail_jobs_count = db_layer.count_succeeded_setup_detail_jobs(conn, search_id, started_at=current_run_started_at)
+        cur.execute(
+            """
+            SELECT COUNT(1)
+            FROM dbo.Job
+            WHERE SearchID=? AND JobType='setup_detail_baseline'
+            """,
+            search_id,
+        )
+        historical_detail_jobs_count = int((cur.fetchone() or [0])[0] or 0)
         cur.execute(
             """
             SELECT TOP (10) JobID, JobType, Status, RunAfter, CreatedAt, StartedAt, FinishedAt, LastError
@@ -82,27 +99,55 @@ def setup_progress(search_id: int, *, migrate_schema: bool = True) -> dict[str, 
         remaining = int(detail.get("detail_baseline_remaining_count") or 0)
         done = int(detail.get("detail_baseline_completed_count") or max(0, total - remaining))
         active_types = {str(job.get("JobType")) for job in active_jobs}
+        active_detail_jobs = [job for job in active_jobs if str(job.get("JobType")) == "setup_detail_baseline"]
+        active_baseline_jobs = [job for job in active_jobs if str(job.get("JobType")) == "baseline_setup_area"]
+        active_price_jobs = [job for job in active_jobs if str(job.get("JobType")) == "setup_price_baseline"]
+        module1_completed = str(state.get("module1_status") or "").lower() == "completed"
+        module3_status = str(state.get("module3_status") or "").lower()
+        latest_detail_status = str((latest_detail[0] if latest_detail else {}).get("Status") or "").lower()
+        latest_detail_error = str((latest_detail[0] if latest_detail else {}).get("LastError") or "").strip()
+        expected_next_detail_job = module1_completed and module3_status not in {"completed", "skipped"} and remaining > 0
+        missing_next_detail_job = expected_next_detail_job and not active_detail_jobs and not active_baseline_jobs
+        failed_but_recoverable = (
+            str(state.get("setup_status") or "").lower() == "failed"
+            and done > 0
+            and remaining > 0
+            and latest_detail_status == "succeeded"
+            and not latest_detail_error
+        )
         return {
             "search_id": search_id,
             **schema,
             "area_display_name": (subs[0].get("AreaLabel") if subs else None),
+            "current_setup_run_id": current_setup_run_id,
+            "current_baseline_job_id": (latest_baseline[0].get("JobID") if latest_baseline else None),
             "setup_status": state.get("setup_status"),
             "module1_status": state.get("module1_status"),
             "module3_status": state.get("module3_status"),
             "module2_status": state.get("module2_status"),
+            "area_monitoring_last_error": state.get("last_error"),
+            "module3_last_error": sub.get("DetailBaselineLastError"),
             "baseline_target_total": total,
             "detail_done": done,
             "detail_remaining": remaining,
             "detail_percent": round(done / total * 100.0, 2) if total else 0,
             "latest_baseline_job": latest_baseline[0] if latest_baseline else None,
             "latest_detail_job": latest_detail[0] if latest_detail else None,
+            "latest_current_run_detail_job": latest_current_detail,
+            "latest_detail_job_result_status": (latest_detail[0].get("Status") if latest_detail else None),
             "active_setup_jobs": active_jobs,
-            "active_price_jobs": [job for job in active_jobs if str(job.get("JobType")) == "setup_price_baseline"],
+            "active_price_jobs": active_price_jobs,
             "last_10_setup_jobs": last_jobs,
+            "expected_next_detail_job": expected_next_detail_job,
+            "missing_next_detail_job": missing_next_detail_job,
+            "repair_recommended": missing_next_detail_job and (str(state.get("setup_status") or "").lower() != "failed" or failed_but_recoverable),
+            "current_run_batch_number": current_run_detail_jobs_count + 1,
+            "historical_detail_jobs_count": historical_detail_jobs_count,
+            "current_run_detail_jobs_count": current_run_detail_jobs_count,
             "safety_checks": {
                 "baseline_rerun_active": "baseline_setup_area" in active_types and "setup_detail_baseline" in active_types,
                 "price_premature": "setup_price_baseline" in active_types and remaining > 0,
-                "progress_stalled": total > 0 and remaining > total * 0.9 and len([j for j in last_jobs if j.get("JobType") == "setup_detail_baseline" and j.get("Status") == "succeeded"]) > total,
+                "progress_stalled": total > 0 and remaining > total * 0.9 and current_run_detail_jobs_count > total,
             },
         }
     finally:
