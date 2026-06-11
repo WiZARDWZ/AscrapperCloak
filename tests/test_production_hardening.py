@@ -1381,11 +1381,11 @@ def test_setup_detail_stalled_progress_guard_fails_setup(monkeypatch):
     monkeypatch.setattr(monitoring_scheduler.config, "BASELINE_DETAIL_BATCH_SIZE", 10, raising=False)
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, user_area_id=None: sub)
-    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda *a, **k: {"processed_count": 10, "refreshed_count": 10, "failed_count": 0, "errors": [], "candidates_count": 10})
+    monkeypatch.setattr(monitoring_scheduler, "refresh_active_listings", lambda *a, **k: {"processed_count": 0, "refreshed_count": 0, "failed_count": 0, "errors": [], "candidates_count": 10})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_user_area_subscription", lambda conn, user_area_id: sub)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_detail_baseline_progress", lambda conn, subscription: {"detail_baseline_total_count": 100, "detail_baseline_completed_count": 3, "detail_baseline_remaining_count": 97})
-    monkeypatch.setattr(monitoring_scheduler.db_layer, "count_succeeded_setup_detail_jobs", lambda conn, search_id: 160)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "count_succeeded_setup_detail_jobs", lambda conn, search_id, started_at=None: 160)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_listings_for_detail_refresh", lambda *a, **k: [{"listing_id": str(i)} for i in range(10)])
     monkeypatch.setattr(monitoring_scheduler.db_layer, "upsert_area_monitoring_state", lambda *a, **k: calls.append(("state", k)))
     monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_subscription_detail_baseline_failed", lambda conn, user_area_id, error: calls.append(("failed", error)))
@@ -1483,6 +1483,58 @@ def test_scheduler_repairs_missing_next_detail_job_after_successful_batch(monkey
     assert [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE]
     assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_SETUP_PRICE_BASELINE]
     assert any(call[0] == "state" and call[1].get("setup_status") == "preparing" and call[1].get("module3_status") == "running" for call in calls)
+
+
+def test_heartbeat_failed_jobs_hide_superseded_setup_failures():
+    now = datetime(2026, 6, 10, 10, 0, 0)
+    job_queue.enable_in_memory_store([
+        {
+            "JobID": 1504,
+            "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+            "SearchID": 2,
+            "UserAreaID": 20,
+            "Priority": 0,
+            "Status": "failed",
+            "RunAfter": now,
+            "AttemptCount": 3,
+            "MaxAttempts": 3,
+            "LockedBy": None,
+            "LockedAt": None,
+            "StartedAt": now,
+            "FinishedAt": now,
+            "LastError": "old baseline failure",
+            "PayloadJson": None,
+            "DedupeKey": "old",
+            "CreatedAt": now,
+            "UpdatedAt": now,
+            "AreaActive": True,
+        },
+        {
+            "JobID": 1508,
+            "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
+            "SearchID": 2,
+            "UserAreaID": 20,
+            "Priority": 0,
+            "Status": "succeeded",
+            "RunAfter": now,
+            "AttemptCount": 1,
+            "MaxAttempts": 3,
+            "LockedBy": None,
+            "LockedAt": None,
+            "StartedAt": now,
+            "FinishedAt": now,
+            "LastError": None,
+            "PayloadJson": None,
+            "DedupeKey": "new",
+            "CreatedAt": now,
+            "UpdatedAt": now,
+            "AreaActive": True,
+        },
+    ])
+
+    out = job_queue.get_failed_job_summary_by_lifecycle()
+
+    assert out["active_failed_jobs"] == []
 
 
 def test_setup_detail_batches_gate_price_until_remaining_zero(monkeypatch):

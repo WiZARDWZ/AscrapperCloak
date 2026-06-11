@@ -974,8 +974,26 @@ def get_queue_summary() -> dict[str, Any]:
 
 def get_failed_job_summary(limit: int = 10, active_only: bool | None = None) -> list[dict[str, Any]]:
     ensure_job_tables()
+    setup_job_types = (
+        JOB_TYPE_BASELINE_SETUP_AREA,
+        JOB_TYPE_SETUP_DETAIL_BASELINE,
+        JOB_TYPE_SETUP_PRICE_BASELINE,
+    )
     if _TEST_STORE is not None:
         rows = [dict(r) for r in _TEST_STORE if str(r.get("Status") or "").lower() == "failed"]
+        rows = [
+            row for row in rows
+            if not (
+                row.get("JobType") in setup_job_types
+                and any(
+                    other.get("JobType") == row.get("JobType")
+                    and int(other.get("SearchID") or 0) == int(row.get("SearchID") or 0)
+                    and str(other.get("Status") or "").lower() == "succeeded"
+                    and int(other.get("JobID") or 0) > int(row.get("JobID") or 0)
+                    for other in _TEST_STORE
+                )
+            )
+        ]
         if active_only is not None:
             rows = [
                 row for row in rows
@@ -1031,6 +1049,20 @@ def get_failed_job_summary(limit: int = 10, active_only: bool | None = None) -> 
                     )
               )
             """
+        setup_placeholders = ", ".join("?" for _ in setup_job_types)
+        superseded_setup_filter = f"""
+              AND NOT (
+                    j.JobType IN ({setup_placeholders})
+                    AND EXISTS (
+                        SELECT 1
+                        FROM dbo.Job newer
+                        WHERE newer.SearchID=j.SearchID
+                          AND newer.JobType=j.JobType
+                          AND newer.Status='succeeded'
+                          AND newer.JobID > j.JobID
+                    )
+              )
+            """
         cur.execute(f"""
             SELECT TOP ({int(limit)})
                    j.JobID AS job_id,
@@ -1045,8 +1077,9 @@ def get_failed_job_summary(limit: int = 10, active_only: bool | None = None) -> 
             LEFT JOIN dbo.area_monitoring_state ams ON ams.area_id=j.SearchID
             WHERE j.Status='failed'
             {active_filter}
+            {superseded_setup_filter}
             ORDER BY j.UpdatedAt DESC, j.FinishedAt DESC, j.JobID DESC
-        """)
+        """, *setup_job_types)
         return _rows_to_dicts(cur)
     finally:
         conn.close()

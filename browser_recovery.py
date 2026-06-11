@@ -165,6 +165,8 @@ def is_429_page(driver) -> bool:
     if state.is_usable or state.is_no_results:
         return False
     if state.is_blocked:
+        if not _verbose_page_state_enabled():
+            return True
         preview = ""
         try:
             preview = re.sub(r"\s+", " ", (driver.page_source or ""))[:220]

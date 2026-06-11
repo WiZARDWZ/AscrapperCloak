@@ -254,18 +254,19 @@ def _module3_load_detail_page(driver, url: str, profile_dir_current: str, rotati
             detail_state = classify_detail_page(driver, timeout=True)
         last_state = detail_state
         health.record_page_state(detail_state)
-        log(
-            "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
-            "html_length={html_len} body_text_length={body_len} attempt={attempt}".format(
-                state=detail_state.state,
-                network=detail_state.network_reason,
-                reason=detail_state.reason,
-                url=detail_state.current_url,
-                html_len=detail_state.html_length,
-                body_len=detail_state.body_text_length,
-                attempt=attempt,
+        if _verbose_page_state_enabled():
+            log(
+                "Module3 Detail page_state={state} network_reason={network} block_reason={reason} current_url={url} "
+                "html_length={html_len} body_text_length={body_len} attempt={attempt}".format(
+                    state=detail_state.state,
+                    network=detail_state.network_reason,
+                    reason=detail_state.reason,
+                    url=detail_state.current_url,
+                    html_len=detail_state.html_length,
+                    body_len=detail_state.body_text_length,
+                    attempt=attempt,
+                )
             )
-        )
         detail_state = _module3_same_page_kpsdk_settle(driver, url, detail_state, log=log)
         detail_state, _ = same_session_kpsdk_recheck(
             driver=driver,
