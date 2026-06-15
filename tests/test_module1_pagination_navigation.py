@@ -50,6 +50,11 @@ def state_for(page: int, cards: int = 1):
 
 
 class Module1PaginationNavigationTests(unittest.TestCase):
+    def test_normalized_has_next_respects_detected_total_pages(self):
+        self.assertFalse(module1_list_scraper._normalize_has_next_page(True, 2, 2))
+        self.assertTrue(module1_list_scraper._normalize_has_next_page(True, 2, None))
+        self.assertFalse(module1_list_scraper._normalize_has_next_page(False, 1, 2))
+
     def test_click_next_script_prioritizes_real_pagination_and_excludes_nextroll_privacy_links(self):
         driver = FakeDriver()
         logs = []

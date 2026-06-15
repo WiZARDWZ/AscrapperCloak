@@ -3097,12 +3097,28 @@ def get_due_price_retry_listing_ids(conn, area_id: int, now_value=None, limit: i
     now_value = now_value or datetime.now()
     cur = conn.cursor()
     cur.execute(f"""
-        SELECT TOP ({max(1, int(limit or 1))}) listing_id
-        FROM dbo.listing_price_inference_state
-        WHERE area_id=?
-          AND status IN ('unknown_pending_retry','technical_failed')
-          AND (next_retry_at IS NULL OR next_retry_at <= ?)
-        ORDER BY COALESCE(next_retry_at, '19000101') ASC, updated_at ASC
+        SELECT TOP ({max(1, int(limit or 1))})
+            pis.listing_id,
+            l.CurrentPriceDisplay,
+            lss.InferredPriceLow,
+            lss.InferredPriceHigh,
+            lss.PriceInferenceStatus
+        FROM dbo.listing_price_inference_state pis
+        LEFT JOIN dbo.Listing l ON CAST(l.ExternalID AS NVARCHAR(100))=pis.listing_id
+        LEFT JOIN dbo.ListingSearchState lss ON lss.SearchID=pis.area_id AND lss.ListingID=l.listingID
+        WHERE pis.area_id=?
+          AND pis.status IN ('unknown_pending_retry','technical_failed')
+          AND (pis.next_retry_at IS NULL OR pis.next_retry_at <= ?)
+          AND (
+                l.listingID IS NULL
+                OR NULLIF(LTRIM(RTRIM(COALESCE(l.CurrentPriceDisplay, ''))), '') IS NULL
+                OR LOWER(LTRIM(RTRIM(COALESCE(l.CurrentPriceDisplay, '')))) IN ('n/a','na','unknown','contact agent','price withheld','price on request')
+              )
+          AND NOT (
+                LOWER(COALESCE(lss.PriceInferenceStatus, ''))='completed'
+                AND (lss.InferredPriceLow IS NOT NULL OR lss.InferredPriceHigh IS NOT NULL)
+              )
+        ORDER BY COALESCE(pis.next_retry_at, '19000101') ASC, pis.updated_at ASC
         """, int(area_id), now_value)
     return [str(row[0]) for row in cur.fetchall() if row and row[0] is not None]
 
@@ -5546,6 +5562,7 @@ def update_listing_price_inference(conn, search_id: int, listing_id: int, low: A
             inferred_low=low,
             inferred_high=high,
             method=method,
+            increment_attempts=status != "skipped_direct_price",
         )
     if create_event and status == "completed" and _price_range_materially_changed(old_low, old_high, low, high):
         run_id = create_lightweight_scrape_run(conn, int(search_id), source="module2_price_refresh", run_type="change_detection")

@@ -968,6 +968,10 @@ def detect_next(driver) -> bool:
     return False
 
 
+def _normalize_has_next_page(raw_detect_next: bool, page: int, total_pages: int | None) -> bool:
+    return bool(raw_detect_next) and (total_pages is None or int(page) < int(total_pages))
+
+
 def save_results(rows: list[dict], out_dir="output"):
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1144,7 +1148,8 @@ def scrape_search_page(search_url: str, page: int = 1, timeout: int | None = Non
                 seen_ids.add(lid)
             rows.append(row)
         total_pages = get_total_pages(driver)
-        has_next = detect_next(driver)
+        raw_has_next = detect_next(driver)
+        has_next = _normalize_has_next_page(raw_has_next, page, total_pages)
         current_url = driver.current_url or page_url
         log(
             "Module1 pagination: requested_page={page} requested_url={requested} current_url={current} "
@@ -1440,7 +1445,8 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                 log("Reached last page (by pagination).")
                 break
 
-            has_next = detect_next(driver)
+            raw_has_next = detect_next(driver)
+            has_next = _normalize_has_next_page(raw_has_next, page, total_pages)
             log(f"Next detected: {has_next}")
 
             if not has_next and not total_pages:

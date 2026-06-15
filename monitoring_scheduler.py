@@ -16,6 +16,7 @@ from monitor import baseline_setup_area
 from area_light_checker import light_check_area
 from listing_detail_refresher import is_retryable_detail_batch_failure, refresh_active_listings
 from json_safe import json_safe
+from module2_price_utils import price_needs_inference
 from realestate_errors import RealEstateBlockedError
 try:
     from browser_recovery import is_retryable_navigation_error
@@ -1447,6 +1448,18 @@ def _unknown_price_debug(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _price_inference_row_needs_module2(row: dict[str, Any]) -> bool:
+    price_text = str(row.get("price_display") or row.get("price") or row.get("CurrentPriceDisplay") or "").strip()
+    if price_text and not price_needs_inference(price_text):
+        return False
+    low = row.get("inferred_price_low") or row.get("InferredPriceLow")
+    high = row.get("inferred_price_high") or row.get("InferredPriceHigh")
+    status = str(row.get("price_inference_status") or row.get("PriceInferenceStatus") or "").lower()
+    if status == "completed" and (low is not None or high is not None):
+        return False
+    return True
+
+
 def _price_retry_dedupe_key(search_id: int, listing_external_ids: list[str]) -> str:
     safe_ids = sorted(str(value).strip() for value in listing_external_ids if str(value).strip())
     return f"price_retry_unknowns:search_id={int(search_id)}:listing_ids={','.join(safe_ids)}"
@@ -1516,13 +1529,20 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
         if setup:
             candidates = list(raw_candidates)
             skipped_direct = []
+            skipped_completed = []
         else:
             candidates = []
             skipped_direct = []
+            skipped_completed = []
             for candidate in raw_candidates:
                 low, high = db_layer.parse_price_bounds_from_text(candidate.get("price_display"))
                 if low is not None or high is not None:
                     skipped_direct.append((candidate, low, high))
+                elif (
+                    str(candidate.get("price_inference_status") or "").lower() == "completed"
+                    and (candidate.get("inferred_price_low") is not None or candidate.get("inferred_price_high") is not None)
+                ):
+                    skipped_completed.append(candidate)
                 else:
                     candidates.append(candidate)
             for candidate, low, high in skipped_direct:
@@ -1537,7 +1557,19 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
                     "skipped_direct_price",
                     create_event=False,
                 )
-            if skipped_direct:
+            for candidate in skipped_completed:
+                db_layer.update_listing_price_inference(
+                    conn,
+                    search_id,
+                    int(candidate["db_listing_id"]),
+                    candidate.get("inferred_price_low"),
+                    candidate.get("inferred_price_high"),
+                    candidate.get("inferred_price_method") or "sliding_between_window",
+                    candidate.get("inferred_price_source") or "module2",
+                    "completed",
+                    create_event=False,
+                )
+            if skipped_direct or skipped_completed:
                 conn.commit()
     finally:
         conn.close()
@@ -1558,7 +1590,7 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
         "batch_size_used": batch_size_used,
         "processed_count": 0,
         "inferred_count": 0,
-        "skipped_count": len(skipped_direct),
+        "skipped_count": len(skipped_direct) + len(skipped_completed),
         "unknown_count": 0,
         "unknown_listing_ids": [],
         "unknown_external_ids": [],
@@ -1572,6 +1604,9 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
         "errors": [],
     }
     if dry_run or not candidates:
+        if not candidates:
+            result["status"] = "skipped_no_price_targets" if skipped_direct or skipped_completed else "completed_no_targets"
+            result["reason"] = "no_price_inference_targets"
         if mark_search_complete and not dry_run:
             conn = db_layer.connect(config.DB_PATH)
             try:
@@ -1842,10 +1877,17 @@ def run_detail_refresh_existing_for_search(search_id: int, limit: int | None = N
     notifications = []
     processed_count = int(detail.get("processed_count") or 0)
     active_state_rows = int(detail.get("active_state_rows") or 0)
+    failed_count = int(detail.get("failed_count") or 0)
+    clean_successful_pass = (
+        not is_retryable_detail_batch_failure(detail)
+        and failed_count == 0
+        and not detail.get("errors")
+        and str(detail.get("status") or "").lower() not in {"failed", "retry_wait"}
+    )
     if not dry_run:
         conn = db_layer.connect(config.DB_PATH)
         try:
-            if processed_count > 0 or active_state_rows == 0:
+            if processed_count > 0 or active_state_rows == 0 or clean_successful_pass:
                 db_layer.mark_search_detail_refreshed(conn, search_id)
         finally:
             conn.close()
@@ -2040,7 +2082,8 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
         return _inactive_job_result(search_id)
     conn = db_layer.connect(config.DB_PATH)
     try:
-        remaining = len(db_layer.get_active_listings_for_price_inference(conn, search_id, limit=1, before_time=run_started_at))
+        remaining_rows = db_layer.get_active_listings_for_price_inference(conn, search_id, limit=None, before_time=run_started_at)
+        remaining = sum(1 for row in remaining_rows if _price_inference_row_needs_module2(row))
         if remaining == 0 and not dry_run and price.get("status") != "failed":
             db_layer.mark_search_price_refreshed(conn, search_id)
     finally:
@@ -2063,7 +2106,12 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
                 dedupe_key=f"{job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING}:search_id={search_id}",
                 max_attempts=3,
             )
-    status = "completed" if remaining == 0 else "running"
+    if remaining == 0:
+        status = str(price.get("status") or "completed")
+        if status == "completed":
+            status = "completed_no_targets" if int(price.get("target_count") or 0) == 0 else "completed"
+    else:
+        status = "running"
     return {"status": status, "run_id": run_id, "run_started_at": run_started_at, "scheduled_at": scheduled_at, "remaining_count": remaining, "price_refresh": price, "enqueued_next_batch": enqueued}
 
 
