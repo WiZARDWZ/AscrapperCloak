@@ -540,28 +540,7 @@ def _representative_subscription(subscriptions: list[dict[str, Any]]) -> dict[st
 
 
 def _subscription_group_is_ready(subscriptions: list[dict[str, Any]]) -> bool:
-    def subscription_lifecycle_active(sub: dict[str, Any]) -> bool:
-        area_status = str(sub.get("AreaSetupStatus") or "").lower()
-        if area_status == "inactive":
-            return False
-        status = str(sub.get("SubscriptionStatus") or sub.get("UserAreaSubscriptionStatus") or "active").lower()
-        notify_enabled = int(sub.get("SubscriptionNotifyEnabled") if sub.get("SubscriptionNotifyEnabled") is not None else sub.get("UserAreaNotifyEnabled", 1) if sub.get("UserAreaNotifyEnabled") is not None else 1)
-        return status == "active" and notify_enabled == 1
-
-    if any(
-        str(sub.get("AreaSetupStatus") or "").lower() == "ready"
-        and subscription_lifecycle_active(sub)
-        for sub in subscriptions
-    ):
-        return True
-    return any(
-        subscription_lifecycle_active(sub)
-        and str(sub.get("BaselineStatus") or "").lower() == "completed"
-        and str(sub.get("DetailBaselineStatus") or "").lower() == "completed"
-        and str(sub.get("PriceBaselineStatus") or "pending").lower() == "completed"
-        and bool(sub.get("NotificationReadyAt"))
-        for sub in subscriptions
-    )
+    return any(_subscription_monitoring_readiness(sub)["ready"] for sub in subscriptions)
 
 
 def _subscription_group_baseline_completed(subscriptions: list[dict[str, Any]]) -> bool:
@@ -574,6 +553,75 @@ def _subscription_group_detail_completed(subscriptions: list[dict[str, Any]]) ->
 
 def _subscription_group_price_completed(subscriptions: list[dict[str, Any]]) -> bool:
     return any(str(sub.get("PriceBaselineStatus") or "pending").lower() == "completed" for sub in subscriptions)
+
+
+PRICE_BASELINE_READY_STATUSES = {"completed", "completed_with_unknowns", "skipped"}
+
+
+def _effective_subscription_status(sub: dict[str, Any]) -> str:
+    return str(sub.get("SubscriptionStatus") or sub.get("UserAreaSubscriptionStatus") or "active").lower()
+
+
+def _effective_notify_enabled(sub: dict[str, Any]) -> bool:
+    value = sub.get("SubscriptionNotifyEnabled")
+    if value is None:
+        value = sub.get("UserAreaNotifyEnabled")
+    if value is None:
+        value = 1
+    try:
+        return int(value) == 1
+    except Exception:
+        return str(value).strip().lower() in {"1", "true", "yes", "active"}
+
+
+def _subscription_monitoring_readiness(sub: dict[str, Any]) -> dict[str, Any]:
+    area_status = str(sub.get("AreaSetupStatus") or "").lower()
+    module1 = str(sub.get("AreaModule1Status") or "").lower()
+    module3 = str(sub.get("AreaModule3Status") or "").lower()
+    module2 = str(sub.get("AreaModule2Status") or "").lower()
+    baseline = str(sub.get("BaselineStatus") or "").lower()
+    detail = str(sub.get("DetailBaselineStatus") or "").lower()
+    price = str(sub.get("PriceBaselineStatus") or "pending").lower()
+    is_active_value = sub.get("IsActive", 1)
+    try:
+        legacy_active = int(is_active_value) == 1
+    except Exception:
+        legacy_active = str(is_active_value).strip().lower() not in {"0", "false", "no", "inactive"}
+    subscription_active = _effective_subscription_status(sub) == "active" and legacy_active
+    notify_enabled = _effective_notify_enabled(sub)
+    baseline_ready = baseline == "completed" or module1 == "completed"
+    detail_ready = detail == "completed" or module3 in {"completed", "skipped"}
+    price_ready = price in PRICE_BASELINE_READY_STATUSES or module2 in PRICE_BASELINE_READY_STATUSES
+    area_ready = area_status == "ready" or (baseline_ready and detail_ready and price_ready)
+    notification_ready = bool(sub.get("NotificationReadyAt"))
+    ready = area_ready and baseline_ready and detail_ready and price_ready and subscription_active and notify_enabled and notification_ready
+    reasons = []
+    if not area_ready:
+        reasons.append("area_not_ready")
+    if not baseline_ready:
+        reasons.append("baseline_not_completed")
+    if not detail_ready:
+        reasons.append("detail_baseline_not_completed")
+    if not price_ready:
+        reasons.append("price_baseline_not_completed")
+    if not subscription_active:
+        reasons.append("subscription_not_active")
+    if not notify_enabled:
+        reasons.append("notify_disabled")
+    if not notification_ready:
+        reasons.append("notification_ready_at_missing")
+    return {
+        "ready": ready,
+        "notification_eligible": ready,
+        "area_ready": area_ready,
+        "baseline_ready": baseline_ready,
+        "detail_ready": detail_ready,
+        "price_ready": price_ready,
+        "subscription_active": subscription_active,
+        "notify_enabled": notify_enabled,
+        "notification_ready": notification_ready,
+        "reasons": reasons,
+    }
 
 
 SETUP_PIPELINE_JOB_TYPES = {
@@ -760,7 +808,7 @@ def _job_payload(job: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
-def _active_price_job_exists(search_id: int) -> bool:
+def _active_price_job_exists(search_id: int, exclude_job_id: int | None = None) -> bool:
     import job_queue
 
     price_job_types = {
@@ -768,6 +816,8 @@ def _active_price_job_exists(search_id: int) -> bool:
         job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
     }
     for job in job_queue.get_active_jobs():
+        if exclude_job_id is not None and int(job.get("JobID") or 0) == int(exclude_job_id):
+            continue
         if int(job.get("SearchID") or 0) == int(search_id) and str(job.get("JobType") or "") in price_job_types:
             return True
     return False
@@ -788,16 +838,57 @@ def _scheduled_price_dedupe_key(search_id: int, scheduled_at) -> str:
     return f"{job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA}:search_id={int(search_id)}:scheduled_at={scheduled_text}"
 
 
-def _price_retry_window_dedupe_key(search_id: int, listing_external_ids: list[str], retry_window_at=None) -> str:
-    import job_queue
-
-    safe_ids = sorted(str(value).strip() for value in listing_external_ids if str(value).strip())
+def _price_retry_window_start(retry_window_at=None) -> datetime:
     retry_window_at = retry_window_at or _utcnow()
     interval = max(1, int(getattr(config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)))
     epoch = int(retry_window_at.timestamp()) if hasattr(retry_window_at, "timestamp") else int(_utcnow().timestamp())
     window_epoch = epoch - (epoch % interval)
-    window_text = datetime.fromtimestamp(window_epoch).isoformat()
-    return f"{job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS}:search_id={int(search_id)}:retry_window={window_text}:listing_ids={','.join(safe_ids)}"
+    return datetime.fromtimestamp(window_epoch)
+
+
+def _price_retry_window_dedupe_key(search_id: int, listing_external_ids: list[str] | None = None, retry_window_at=None) -> str:
+    import job_queue
+
+    window_text = _price_retry_window_start(retry_window_at).isoformat()
+    return f"{job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS}:search_id={int(search_id)}:retry_window={window_text}"
+
+
+def _merge_price_retry_job_payload(existing: dict[str, Any], listing_external_ids: list[str], retry_window_at=None, run_after=None) -> dict[str, Any]:
+    import job_queue
+
+    payload = _job_payload(existing)
+    merged = sorted({
+        str(value).strip()
+        for value in [*(payload.get("listing_external_ids") or payload.get("listing_ids") or []), *listing_external_ids]
+        if str(value).strip()
+    })
+    payload["listing_external_ids"] = merged
+    payload["retry_window_at"] = payload.get("retry_window_at") or (_price_retry_window_start(retry_window_at).isoformat())
+    updated = job_queue.update_job_payload(int(existing["JobID"]), payload, run_after=run_after, preserve_earliest_run_after=True)
+    updated["created"] = False
+    updated["duplicate"] = True
+    updated["merged_listing_external_ids"] = merged
+    updated["reason"] = "merged_existing_price_retry_for_window"
+    return updated
+
+
+def _enqueue_notification_dispatch_for_search(search_id: int | None, user_area_id: int | None = None, run_after=None, reason: str | None = None) -> dict[str, Any] | None:
+    import job_queue
+
+    if not search_id:
+        return None
+    if not _search_ready_for_operational_monitoring(int(search_id)):
+        return None
+    return job_queue.enqueue_job_once(
+        job_queue.JOB_TYPE_NOTIFICATION_DISPATCH,
+        search_id=int(search_id),
+        user_area_id=user_area_id,
+        priority=job_queue.PRIORITY_MAINTENANCE,
+        run_after=run_after or _utcnow(),
+        payload={"reason": reason or "monitoring_event_created"},
+        dedupe_key=f"{job_queue.JOB_TYPE_NOTIFICATION_DISPATCH}:search_id={int(search_id)}",
+        max_attempts=3,
+    )
 
 
 def _log_scheduler_due_decision(decision: dict[str, Any]) -> None:
@@ -1098,21 +1189,9 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                 finally:
                     retry_conn.close()
                 if due_unknown_ids:
-                    retry_dedupe = _price_retry_window_dedupe_key(search_id, due_unknown_ids, retry_window_at=current_time_used)
-                    existing_retry = _job_exists_for_dedupe_key(retry_dedupe, include_terminal=True)
-                    if existing_retry:
-                        retry_job = {**existing_retry, "created": False, "duplicate": True, "reason": "existing_price_retry_for_window"}
-                    else:
-                        retry_job = job_queue.enqueue_job_once(
-                            job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
-                            search_id=search_id,
-                            user_area_id=int(rep["UserAreaID"]),
-                            priority=job_queue.PRIORITY_PRICE_RETRY_UNKNOWNS,
-                            run_after=current_time_used,
-                            payload={"listing_external_ids": due_unknown_ids, "retry_window_at": current_time_used.isoformat()},
-                            dedupe_key=retry_dedupe,
-                            max_attempts=3,
-                        )
+                    retry_job = _enqueue_price_retry_unknowns(search_id, due_unknown_ids, run_after=current_time_used)
+                    if retry_job and not retry_job.get("UserAreaID"):
+                        retry_job["UserAreaID"] = int(rep["UserAreaID"])
                     (result["created"] if retry_job.get("created") else result["skipped_duplicates"]).append(retry_job)
                 price_check = _scheduled_due_decision(
                     search_id,
@@ -1237,6 +1316,17 @@ def _queue_notifications_for_search(search_id: int, dry_run: bool = False, limit
         return [db_layer.queue_notifications_for_user_area(conn, int(sub["UserAreaID"]), dry_run=dry_run, limit=limit) for sub in subs]
     finally:
         conn.close()
+
+
+def _queued_notification_count(results: list[dict[str, Any]] | None) -> int:
+    return sum(int(row.get("queued_count") or 0) for row in (results or []) if isinstance(row, dict))
+
+
+def _attach_notification_dispatch(result: dict[str, Any], search_id: int | None, user_area_id: int | None, reason: str) -> dict[str, Any]:
+    dispatch = _enqueue_notification_dispatch_for_search(search_id, user_area_id=user_area_id, reason=reason)
+    if dispatch:
+        result["notification_dispatch_job"] = dispatch
+    return result
 
 
 def _run_setup_detail_batch(job: dict[str, Any], send_telegram: bool, on_log=None) -> dict[str, Any]:
@@ -1462,7 +1552,7 @@ def _price_inference_row_needs_module2(row: dict[str, Any]) -> bool:
 
 def _price_retry_dedupe_key(search_id: int, listing_external_ids: list[str]) -> str:
     safe_ids = sorted(str(value).strip() for value in listing_external_ids if str(value).strip())
-    return f"price_retry_unknowns:search_id={int(search_id)}:listing_ids={','.join(safe_ids)}"
+    return _price_retry_window_dedupe_key(search_id, safe_ids)
 
 
 def _enqueue_price_retry_unknowns(search_id: int, listing_external_ids: list[str], run_after=None, dedupe_suffix: str = "") -> dict[str, Any] | None:
@@ -1475,9 +1565,9 @@ def _enqueue_price_retry_unknowns(search_id: int, listing_external_ids: list[str
     dedupe_key = _price_retry_window_dedupe_key(search_id, safe_ids, retry_window_at=retry_at)
     if dedupe_suffix:
         dedupe_key = f"{dedupe_key}:{dedupe_suffix}"
-    existing = _job_exists_for_dedupe_key(dedupe_key, include_terminal=True)
+    existing = _job_exists_for_dedupe_key(dedupe_key, include_terminal=False)
     if existing:
-        return {**existing, "created": False, "duplicate": True, "reason": "existing_price_retry_for_window"}
+        return _merge_price_retry_job_payload(existing, safe_ids, retry_window_at=retry_at, run_after=retry_at)
     return job_queue.enqueue_job_once(
         job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
         search_id=int(search_id),
@@ -1607,6 +1697,14 @@ def run_price_baseline_for_search(search_id: int, limit: int | None = None, dry_
         if not candidates:
             result["status"] = "skipped_no_price_targets" if skipped_direct or skipped_completed else "completed_no_targets"
             result["reason"] = "no_price_inference_targets"
+        if listing_external_ids and not dry_run and not (skipped_direct or skipped_completed):
+            cleanup_retry_after = _utcnow() + timedelta(seconds=int(getattr(config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)))
+            conn = db_layer.connect(config.DB_PATH)
+            try:
+                result["no_target_cleanup"] = db_layer.cleanup_price_retry_no_target_ids(conn, search_id, listing_external_ids, next_retry_at=cleanup_retry_after)
+                conn.commit()
+            finally:
+                conn.close()
         if mark_search_complete and not dry_run:
             conn = db_layer.connect(config.DB_PATH)
             try:
@@ -2060,7 +2158,7 @@ def run_price_retry_unknowns_for_search(search_id: int, payload: dict[str, Any] 
     return {"status": price.get("status", "completed"), "search_id": search_id, "price_retry": price, "next_retry_job": next_job}
 
 
-def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any] | None = None, dry_run: bool = False) -> dict[str, Any]:
+def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any] | None = None, dry_run: bool = False, current_job_id: int | None = None) -> dict[str, Any]:
     import job_queue
 
     search_id = int(search_id)
@@ -2094,7 +2192,7 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
         raise RuntimeError(config.mask_sensitive_text(price.get("errors")))
     enqueued = None
     if remaining > 0 and not dry_run:
-        if _active_price_job_exists(search_id):
+        if _active_price_job_exists(search_id, exclude_job_id=current_job_id):
             enqueued = {"created": False, "duplicate": True, "reason": "active_price_refresh_exists", "search_id": search_id}
         else:
             enqueued = job_queue.enqueue_job_once(
@@ -2103,7 +2201,7 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
                 priority=job_queue.PRIORITY_PRICE_REFRESH,
                 run_after=_utcnow() + timedelta(seconds=5),
                 payload={"run_id": run_id, "run_started_at": run_started_at.isoformat(), "scheduled_at": scheduled_at.isoformat() if scheduled_at else None, "full_refresh": True},
-                dedupe_key=f"{job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING}:search_id={search_id}",
+                dedupe_key=f"{job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING}:search_id={search_id}:run_id={run_id}:after_job={current_job_id or 'manual'}",
                 max_attempts=3,
             )
     if remaining == 0:
@@ -2111,7 +2209,7 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
         if status == "completed":
             status = "completed_no_targets" if int(price.get("target_count") or 0) == 0 else "completed"
     else:
-        status = "running"
+        status = "running" if enqueued and enqueued.get("created") else "next_batch_not_enqueued"
     return {"status": status, "run_id": run_id, "run_started_at": run_started_at, "scheduled_at": scheduled_at, "remaining_count": remaining, "price_refresh": price, "enqueued_next_batch": enqueued}
 
 
@@ -2278,31 +2376,53 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
             db_layer.mark_search_light_checked(conn, search_id)
         finally:
             conn.close()
-        return {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": []}
+        return _attach_notification_dispatch(
+            {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": []},
+            search_id,
+            user_area_id,
+            "light_check_new_listings",
+        )
     if job_type == job_queue.JOB_TYPE_PROCESS_NEW_LISTING:
         payload = _job_payload(job)
-        return run_process_new_listing_for_search(search_id, payload.get("listing_ids") or [], dry_run=False, send_telegram=send_telegram)
+        result = run_process_new_listing_for_search(search_id, payload.get("listing_ids") or [], dry_run=False, send_telegram=False)
+        return _attach_notification_dispatch(result, search_id, user_area_id, "process_new_listing")
     if job_type in {job_queue.JOB_TYPE_DETAIL_REFRESH_EXISTING, job_queue.JOB_TYPE_MODULE3_REFRESH_AREA}:
-        result = run_detail_refresh_existing_for_search(search_id, limit=int(getattr(config, "DETAIL_REFRESH_BATCH_SIZE", 35)), dry_run=False, send_telegram=send_telegram)
+        result = run_detail_refresh_existing_for_search(search_id, limit=int(getattr(config, "DETAIL_REFRESH_BATCH_SIZE", 35)), dry_run=False, send_telegram=False)
         if job_id:
             job_queue.touch_job_heartbeat(job_id)
-        return result
+        return _attach_notification_dispatch(result, search_id, user_area_id, "detail_refresh_existing")
     if job_type == job_queue.JOB_TYPE_LISTING_STATUS_RECHECK:
-        return run_listing_status_recheck_job(job, send_telegram=send_telegram)
+        result = run_listing_status_recheck_job(job, send_telegram=False)
+        return _attach_notification_dispatch(result, search_id, user_area_id, "listing_status_recheck")
     if job_type in {job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING, job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA}:
-        result = run_price_refresh_existing_for_search(search_id, payload=_job_payload(job), dry_run=False)
+        result = run_price_refresh_existing_for_search(search_id, payload=_job_payload(job), dry_run=False, current_job_id=job_id or None)
         if job_id:
             job_queue.touch_job_heartbeat(job_id)
-        return result
+        return _attach_notification_dispatch(result, search_id, user_area_id, "module2_price_refresh_area")
     if job_type == job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS:
-        return run_price_retry_unknowns_for_search(search_id, payload=_job_payload(job), dry_run=False)
+        result = run_price_retry_unknowns_for_search(search_id, payload=_job_payload(job), dry_run=False)
+        return _attach_notification_dispatch(result, search_id, user_area_id, "price_retry_unknowns")
     if job_type in {job_queue.JOB_TYPE_DAILY_FULL_LISTING_SWEEP, job_queue.JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP}:
-        return run_daily_full_listing_sweep_for_search(search_id, dry_run=False)
+        result = run_daily_full_listing_sweep_for_search(search_id, dry_run=False)
+        return _attach_notification_dispatch(result, search_id, user_area_id, "daily_full_listing_safety_sweep")
     if job_type == job_queue.JOB_TYPE_MANUAL_CHECK_NOW:
         queued = job_queue.enqueue_job_once(job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, search_id=search_id, user_area_id=user_area_id, priority=job_queue.PRIORITY_MANUAL_OR_NEW_DETAIL, run_after=_utcnow())
         return {"status": "enqueued_light_check", "job": queued}
     if job_type == job_queue.JOB_TYPE_NOTIFICATION_DISPATCH:
-        return {"status": "completed", "notifications": _queue_notifications_for_search(search_id, dry_run=False) if search_id else []}
+        notifications = _queue_notifications_for_search(search_id, dry_run=False) if search_id else []
+        telegram_job = None
+        if _queued_notification_count(notifications) > 0:
+            telegram_job = job_queue.enqueue_job_once(
+                job_queue.JOB_TYPE_TELEGRAM_SEND,
+                search_id=search_id,
+                user_area_id=user_area_id,
+                priority=job_queue.PRIORITY_MAINTENANCE,
+                run_after=_utcnow(),
+                payload={"reason": "notification_dispatch"},
+                dedupe_key=f"{job_queue.JOB_TYPE_TELEGRAM_SEND}:search_id={int(search_id or 0)}",
+                max_attempts=3,
+            )
+        return {"status": "completed", "notifications": notifications, "telegram_send_job": telegram_job}
     if job_type == job_queue.JOB_TYPE_TELEGRAM_SEND:
         import telegram_sender
         return {"status": "completed", "sender": telegram_sender.send_queued_notifications_once(limit=config.TELEGRAM_SENDER_MAX_PER_TICK, dry_run=not send_telegram)}

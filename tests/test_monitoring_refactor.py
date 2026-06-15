@@ -1102,12 +1102,36 @@ class MonitoringRefactorTests(unittest.TestCase):
         self.assertTrue(any(row[idx["PriceSource"]] == "inferred_range" for row in data_rows))
 
     def test_scheduler_ready_active_eligibility(self):
-        ready = {"AreaSetupStatus": "ready", "SubscriptionStatus": "active", "SubscriptionNotifyEnabled": 1}
+        ready = {
+            "AreaSetupStatus": "ready",
+            "SubscriptionStatus": "active",
+            "SubscriptionNotifyEnabled": 1,
+            "BaselineStatus": "completed",
+            "DetailBaselineStatus": "completed",
+            "PriceBaselineStatus": "completed",
+            "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        }
         preparing = {"AreaSetupStatus": "preparing", "SubscriptionStatus": "preparing", "SubscriptionNotifyEnabled": 0}
-        paused = {"AreaSetupStatus": "ready", "SubscriptionStatus": "paused", "SubscriptionNotifyEnabled": 0}
+        paused = {**ready, "SubscriptionStatus": "paused", "SubscriptionNotifyEnabled": 0}
         self.assertTrue(monitoring_scheduler._subscription_group_is_ready([ready]))
         self.assertFalse(monitoring_scheduler._subscription_group_is_ready([preparing]))
         self.assertFalse(monitoring_scheduler._subscription_group_is_ready([paused]))
+
+    def test_readiness_helper_requires_same_notification_eligibility(self):
+        ready = {
+            "AreaSetupStatus": "ready",
+            "SubscriptionStatus": "active",
+            "SubscriptionNotifyEnabled": 1,
+            "BaselineStatus": "completed",
+            "DetailBaselineStatus": "completed",
+            "PriceBaselineStatus": "completed_with_unknowns",
+            "NotificationReadyAt": datetime(2026, 6, 10, 9, 0, 0),
+        }
+        without_ready_at = {**ready, "NotificationReadyAt": None}
+        self.assertTrue(monitoring_scheduler._subscription_monitoring_readiness(ready)["ready"])
+        self.assertTrue(monitoring_scheduler._subscription_monitoring_readiness(ready)["notification_eligible"])
+        self.assertFalse(monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["ready"])
+        self.assertIn("notification_ready_at_missing", monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["reasons"])
 
     def test_price_retry_unknowns_skips_when_no_due_rows(self):
         with mock.patch.object(monitoring_scheduler.db_layer, "connect", return_value=DummyConn()), \
@@ -1212,6 +1236,10 @@ class MonitoringRefactorTests(unittest.TestCase):
                 "AreaReadyAt": now - monitoring_scheduler.timedelta(days=1),
                 "SubscriptionStatus": "active",
                 "SubscriptionNotifyEnabled": 1,
+                "BaselineStatus": "completed",
+                "DetailBaselineStatus": "completed",
+                "PriceBaselineStatus": "completed",
+                "NotificationReadyAt": now - monitoring_scheduler.timedelta(days=1),
                 "LastLightCheckAt": now,
                 "LastDetailRefreshAt": now,
                 "LastPriceRefreshAt": None,

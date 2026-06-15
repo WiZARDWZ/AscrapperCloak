@@ -5080,6 +5080,8 @@ def queue_notifications_for_user_area(
         return _empty_user_area_notification_result(user_area_id, "baseline_not_completed", dry_run)
     if str(sub.get("DetailBaselineStatus") or "").lower() != "completed" or not sub.get("NotificationReadyAt"):
         return _empty_user_area_notification_result(user_area_id, "notification_not_ready", dry_run)
+    if str(sub.get("PriceBaselineStatus") or "pending").lower() not in {"completed", "completed_with_unknowns", "skipped"}:
+        return _empty_user_area_notification_result(user_area_id, "price_baseline_not_completed", dry_run)
     chat_id = clean_text(sub.get("ChatID"))
     telegram_user_id = sub.get("TelegramUserID")
     if not chat_id:
@@ -5613,6 +5615,96 @@ def mark_price_inference_technical_failed(conn, search_id: int, listing_id: int,
         reason or "technical_failed",
         create_event=False,
     )
+
+
+def cleanup_price_retry_no_target_ids(conn, search_id: int, listing_external_ids: list[str], next_retry_at=None) -> dict:
+    ensure_listing_search_state_price_inference_columns(conn)
+    ensure_monitoring_state_tables(conn)
+    ids = [str(value).strip() for value in (listing_external_ids or []) if str(value).strip()]
+    result = {
+        "requested_count": len(ids),
+        "skipped_direct_price": [],
+        "completed_existing_inference": [],
+        "postponed_not_due": [],
+        "missing_listing_ids": [],
+    }
+    if not ids:
+        return result
+    next_retry_at = next_retry_at or (datetime.now() + timedelta(seconds=int(getattr(config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600))))
+    cur = conn.cursor()
+    placeholders = ",".join("?" for _ in ids)
+    cur.execute(f"""
+        SELECT CAST(l.ExternalID AS NVARCHAR(100)) AS external_id,
+               l.listingID,
+               l.CurrentPriceDisplay,
+               lss.InferredPriceLow,
+               lss.InferredPriceHigh,
+               lss.InferredPriceMethod,
+               lss.InferredPriceSource,
+               lss.PriceInferenceStatus
+        FROM dbo.Listing l
+        LEFT JOIN dbo.ListingSearchState lss ON lss.SearchID=? AND lss.ListingID=l.listingID
+        WHERE CAST(l.ExternalID AS NVARCHAR(100)) IN ({placeholders})
+    """, int(search_id), *ids)
+    cols = [c[0] for c in cur.description]
+    rows = [{cols[i]: row[i] for i in range(len(cols))} for row in cur.fetchall()]
+    by_external = {str(row.get("external_id") or "").strip(): row for row in rows}
+    for external_id in ids:
+        row = by_external.get(external_id)
+        if not row or row.get("listingID") is None:
+            upsert_price_inference_state(
+                conn,
+                external_id,
+                int(search_id),
+                "unknown_pending_retry",
+                last_error="price_retry_no_active_target",
+                next_retry_at=next_retry_at,
+                increment_attempts=False,
+            )
+            result["missing_listing_ids"].append(external_id)
+            result["postponed_not_due"].append(external_id)
+            continue
+        listing_id = int(row["listingID"])
+        low, high = parse_price_bounds_from_text(row.get("CurrentPriceDisplay"))
+        if low is not None or high is not None:
+            update_listing_price_inference(
+                conn,
+                int(search_id),
+                listing_id,
+                low,
+                high,
+                "direct",
+                "direct",
+                "skipped_direct_price",
+                create_event=False,
+            )
+            result["skipped_direct_price"].append(external_id)
+            continue
+        if row.get("InferredPriceLow") is not None or row.get("InferredPriceHigh") is not None:
+            update_listing_price_inference(
+                conn,
+                int(search_id),
+                listing_id,
+                row.get("InferredPriceLow"),
+                row.get("InferredPriceHigh"),
+                row.get("InferredPriceMethod") or "sliding_between_window",
+                row.get("InferredPriceSource") or "module2",
+                "completed",
+                create_event=False,
+            )
+            result["completed_existing_inference"].append(external_id)
+            continue
+        upsert_price_inference_state(
+            conn,
+            external_id,
+            int(search_id),
+            "unknown_pending_retry",
+            last_error="price_retry_not_due",
+            next_retry_at=next_retry_at,
+            increment_attempts=False,
+        )
+        result["postponed_not_due"].append(external_id)
+    return result
 
 
 def mark_subscription_price_baseline_started(conn, user_area_id: int) -> None:

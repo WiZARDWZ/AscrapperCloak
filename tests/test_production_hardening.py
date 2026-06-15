@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import types
 from datetime import datetime, timedelta
@@ -6,6 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 
 sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **kwargs: None))
+
+import pytest
 
 import db_layer
 import job_queue
@@ -267,6 +270,33 @@ def test_price_retry_unknowns_marks_direct_price_rows_skipped(monkeypatch):
     assert updates == [(99, 700000, 700000, "skipped_direct_price")]
 
 
+def test_price_retry_unknowns_no_targets_cleans_or_postpones_retry_state(monkeypatch):
+    cleanup_calls = []
+
+    class Conn:
+        def close(self): pass
+        def commit(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchID": search_id, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_listings_for_price_inference", lambda *a, **k: [])
+    monkeypatch.setattr(
+        monitoring_scheduler.db_layer,
+        "cleanup_price_retry_no_target_ids",
+        lambda conn, search_id, ids, next_retry_at=None: cleanup_calls.append((search_id, list(ids), next_retry_at)) or {"postponed_not_due": list(ids)},
+    )
+
+    out = monitoring_scheduler.run_price_retry_unknowns_for_search(42, payload={"listing_external_ids": ["204091840"]}, dry_run=False)
+
+    assert out["status"] == "completed_no_targets"
+    assert out["price_retry"]["status"] == "completed_no_targets"
+    assert out["next_retry_job"] is None
+    assert cleanup_calls and cleanup_calls[0][1] == ["204091840"]
+    assert cleanup_calls[0][2] > datetime.now()
+
+
 def test_noop_detail_refresh_marks_cooldown(monkeypatch):
     marked = []
 
@@ -287,6 +317,52 @@ def test_noop_detail_refresh_marks_cooldown(monkeypatch):
     assert marked == [42]
 
 
+def test_light_check_new_listings_enqueues_notification_dispatch(monkeypatch):
+    now = datetime(2026, 6, 14, 11, 50, 0)
+
+    class Conn:
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "ok", "new_listings": [{"listing_id": "204091840"}]})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_light_checked", lambda conn, search_id: None)
+
+    result = monitoring_scheduler.execute_job({
+        "JobID": 1,
+        "JobType": job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS,
+        "SearchID": 42,
+        "UserAreaID": 7,
+    })
+
+    assert result["notification_dispatch_job"]["JobType"] == job_queue.JOB_TYPE_NOTIFICATION_DISPATCH
+    assert result["new_listing_jobs"][0]["JobType"] == job_queue.JOB_TYPE_PROCESS_NEW_LISTING
+
+
+def test_new_listing_dispatch_does_not_depend_on_process_new_listing_success(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    dispatch = monitoring_scheduler._enqueue_notification_dispatch_for_search(42, user_area_id=7, reason="light_check_new_listings")
+    with pytest.raises(RuntimeError):
+        with monkeypatch.context() as m:
+            m.setattr(monitoring_scheduler, "run_process_new_listing_for_search", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("detail failed")))
+            monitoring_scheduler.execute_job({
+                "JobID": 2,
+                "JobType": job_queue.JOB_TYPE_PROCESS_NEW_LISTING,
+                "SearchID": 42,
+                "UserAreaID": 7,
+                "PayloadJson": json.dumps({"listing_ids": ["204091840"]}),
+            })
+    active_dispatch = [
+        row for row in job_queue.get_active_jobs()
+        if row.get("JobType") == job_queue.JOB_TYPE_NOTIFICATION_DISPATCH and int(row.get("SearchID") or 0) == 42
+    ]
+    assert dispatch and active_dispatch
+    assert active_dispatch[0]["JobID"] == dispatch["JobID"]
+
+
 def test_fresh_detail_refresh_cooldown_is_not_rescheduled(monkeypatch):
     now = datetime(2026, 6, 14, 11, 50, 0)
 
@@ -304,6 +380,9 @@ def test_fresh_detail_refresh_cooldown_is_not_rescheduled(monkeypatch):
         "AreaSetupStatus": "ready",
         "SubscriptionStatus": "active",
         "SubscriptionNotifyEnabled": 1,
+        "BaselineStatus": "completed",
+        "DetailBaselineStatus": "completed",
+        "PriceBaselineStatus": "completed",
         "NotificationReadyAt": now,
         "LastLightCheckAt": now,
         "LastDetailRefreshAt": now,
@@ -323,10 +402,11 @@ def test_price_retry_unknowns_dedupes_same_retry_window(monkeypatch):
     now = datetime(2026, 6, 8, 12, 30, 0)
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)
     first = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["a", "b"], run_after=now)
-    job_queue.mark_job_succeeded(first["JobID"], {"status": "completed_with_unknowns"})
-    second = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["b", "a"], run_after=now + timedelta(minutes=10))
+    second = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["b", "c"], run_after=now + timedelta(minutes=10))
     assert second["created"] is False
-    assert second["reason"] == "existing_price_retry_for_window"
+    assert second["reason"] == "merged_existing_price_retry_for_window"
+    payload = json.loads(job_queue.get_jobs_by_dedupe_key(first["DedupeKey"])[0]["PayloadJson"])
+    assert payload["listing_external_ids"] == ["a", "b", "c"]
 
 
 def test_unknown_price_inference_sets_future_next_retry_at():

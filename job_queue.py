@@ -1141,6 +1141,51 @@ def get_jobs_by_dedupe_key(dedupe_key: str, statuses: set[str] | None = None) ->
         conn.close()
 
 
+def update_job_payload(job_id: int, payload: Any, run_after=None, preserve_earliest_run_after: bool = True) -> dict[str, Any]:
+    """Update an active job payload, optionally moving RunAfter earlier only."""
+    ensure_job_tables()
+    payload_json = _payload_to_json(payload)
+    now = _now()
+    if _TEST_STORE is not None:
+        row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        row["PayloadJson"] = payload_json
+        if run_after is not None:
+            current = row.get("RunAfter")
+            if not preserve_earliest_run_after or current is None or run_after < current:
+                row["RunAfter"] = run_after
+        row["UpdatedAt"] = now
+        return dict(row)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if run_after is None:
+            cur.execute("""
+                UPDATE dbo.Job
+                SET PayloadJson=?, UpdatedAt=SYSDATETIME()
+                WHERE JobID=?
+            """, payload_json, int(job_id))
+        elif preserve_earliest_run_after:
+            cur.execute("""
+                UPDATE dbo.Job
+                SET PayloadJson=?,
+                    RunAfter=CASE WHEN RunAfter IS NULL OR ? < RunAfter THEN ? ELSE RunAfter END,
+                    UpdatedAt=SYSDATETIME()
+                WHERE JobID=?
+            """, payload_json, run_after, run_after, int(job_id))
+        else:
+            cur.execute("""
+                UPDATE dbo.Job
+                SET PayloadJson=?, RunAfter=?, UpdatedAt=SYSDATETIME()
+                WHERE JobID=?
+            """, payload_json, run_after, int(job_id))
+        conn.commit()
+        cur.execute("SELECT * FROM dbo.Job WHERE JobID=?", int(job_id))
+        rows = _rows_to_dicts(cur)
+        return rows[0] if rows else {"JobID": int(job_id)}
+    finally:
+        conn.close()
+
+
 def get_active_jobs(dedupe_key: str | None = None) -> list[dict[str, Any]]:
     ensure_job_tables()
     if _TEST_STORE is not None:
