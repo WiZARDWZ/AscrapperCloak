@@ -861,7 +861,9 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
         ensure_listing_snapshot_size_columns(conn)
         ensure_listing_lifecycle_columns(conn)
         cur = conn.cursor(); validate_required_schema(conn); sid = _upsert_search(conn, search_url)
-        suburb_id = int(_one(cur, "SELECT SuburbID FROM dbo.SuburbSearch WHERE SearchID=?", sid)[0])
+        search_row = _one(cur, "SELECT SuburbID, DisplayName FROM dbo.SuburbSearch WHERE SearchID=?", sid)
+        suburb_id = int(search_row[0])
+        search_area_label = clean_text(search_row[1], 255)
         cur.execute("INSERT INTO dbo.ScrapeRun(SearchID,RunType,Status) OUTPUT INSERTED.RunID VALUES (?,?,'running')", sid, "full" if full_scan else "light"); run_id=int(cur.fetchone()[0])
         seen=set()
         for rr in rows:
@@ -918,7 +920,7 @@ def ingest_full_rows(db_path_or_conn, search_url, rows, full_scan=False, emit_ev
             for pos, (agid, agent_data) in enumerate(agents_data, start=1):
                 cur.execute("INSERT INTO dbo.ListingSnapshotAgent(SnapshotID,AgentID,Position,PhoneAtSnapshot,RatingAtSnapshot,ReviewsTextAtSnapshot) VALUES (?,?,?,?,?,?)", snap_id, agid, pos, agent_data.get("phone"), None, None)
                 cur.execute("IF NOT EXISTS (SELECT 1 FROM dbo.ListingAgentAssignment WHERE ListingID=? AND AgentID=? AND SearchID=? AND EndedAt IS NULL) INSERT INTO dbo.ListingAgentAssignment(ListingID,AgentID,SearchID,StartedAt) VALUES (?,?,?,SYSDATETIME())", lid,agid,sid,lid,agid,sid)
-            event_context = listing_change_detector.build_event_payload({"external_id": ext, "address": n["address"], "listing_url": n["url"], "property_type": n["property_type"], "bedrooms": n["bedrooms"], "bathrooms": n["bathrooms"], "car_spaces": n["parking"], "price_display": n["price_display"], "price_low": n["price_low"], "price_high": n["price_high"], "price_method": n["price_method"], "agency_name": n["agency_name"], "agents": n["agents"], "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"]})
+            event_context = listing_change_detector.build_event_payload({"external_id": ext, "area_label": clean_text(rr.get("area_label"), 255) or search_area_label, "address": n["address"], "listing_url": n["url"], "property_type": n["property_type"], "bedrooms": n["bedrooms"], "bathrooms": n["bathrooms"], "car_spaces": n["parking"], "price_display": n["price_display"], "price_low": n["price_low"], "price_high": n["price_high"], "price_method": n["price_method"], "agency_name": n["agency_name"], "agents": n["agents"], "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"]})
             events=[]
             if is_new: events.append(("new_listing",None,event_context))
             if prev and (prev[1],prev[2]) != (n["price_low"],n["price_high"]): events.append(("price_changed",{"price_display":prev[3],"estimated_price_low":str(prev[1] or ""),"estimated_price_high":str(prev[2] or "")},{"price_display":n["price_display"],"estimated_price_low":str(n["price_low"] or ""),"estimated_price_high":str(n["price_high"] or ""),"price_method":n["price_method"]}))
@@ -975,7 +977,9 @@ def ingest_light_check_rows(
         cur = conn.cursor()
         validate_required_schema(conn)
         sid = _upsert_search(conn, search_url)
-        suburb_id = int(_one(cur, "SELECT SuburbID FROM dbo.SuburbSearch WHERE SearchID=?", sid)[0])
+        search_row = _one(cur, "SELECT SuburbID, DisplayName FROM dbo.SuburbSearch WHERE SearchID=?", sid)
+        suburb_id = int(search_row[0])
+        search_area_label = clean_text(search_row[1], 255)
         cur.execute("INSERT INTO dbo.ScrapeRun(SearchID,RunType,Status) OUTPUT INSERTED.RunID VALUES (?,?,'running')", sid, "light")
         run_id = int(cur.fetchone()[0])
         summary["run_id"] = run_id
@@ -1066,7 +1070,7 @@ def ingest_light_check_rows(
                         lid, agid, sid, lid, agid, sid,
                     )
 
-                event_context = listing_change_detector.build_event_payload({"external_id": ext, "address": n["address"], "listing_url": n["url"], "property_type": n["property_type"], "bedrooms": n["bedrooms"], "bathrooms": n["bathrooms"], "car_spaces": n["parking"], "price_display": n["price_display"], "price_low": n["price_low"], "price_high": n["price_high"], "price_method": n["price_method"], "agency_name": n["agency_name"], "agents": n["agents"], "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"]})
+                event_context = listing_change_detector.build_event_payload({"external_id": ext, "area_label": clean_text(rr.get("area_label"), 255) or search_area_label, "address": n["address"], "listing_url": n["url"], "property_type": n["property_type"], "bedrooms": n["bedrooms"], "bathrooms": n["bathrooms"], "car_spaces": n["parking"], "price_display": n["price_display"], "price_low": n["price_low"], "price_high": n["price_high"], "price_method": n["price_method"], "agency_name": n["agency_name"], "agents": n["agents"], "inspection_short": n["inspection_short_label"], "inspection_long": n["inspection_long_label"], "auction_label": n["auction_label"]})
                 ev_hash = _sha(json_dumps_safe({"sid": sid, "lid": lid, "et": "new_listing", "ext": str(ext)}, sort_keys=True))
                 cur.execute(
                     "IF NOT EXISTS (SELECT 1 FROM dbo.ListingEvent WHERE EventHash=?) "

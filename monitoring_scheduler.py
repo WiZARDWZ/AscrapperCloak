@@ -727,9 +727,7 @@ def _oldest_or_none(values):
 
 
 def _effective_search_last_at(subscriptions: list[dict[str, Any]], column_name: str):
-    values = [sub.get(column_name) for sub in subscriptions]
-    if any(value is None for value in values):
-        return None
+    values = [sub.get(column_name) for sub in subscriptions if sub.get(column_name) is not None]
     return min(values) if values else None
 
 
@@ -883,7 +881,7 @@ def _enqueue_notification_dispatch_for_search(search_id: int | None, user_area_i
         job_queue.JOB_TYPE_NOTIFICATION_DISPATCH,
         search_id=int(search_id),
         user_area_id=user_area_id,
-        priority=job_queue.PRIORITY_MAINTENANCE,
+        priority=getattr(job_queue, "PRIORITY_NOTIFICATION_DISPATCH", job_queue.PRIORITY_MAINTENANCE),
         run_after=run_after or _utcnow(),
         payload={"reason": reason or "monitoring_event_created"},
         dedupe_key=f"{job_queue.JOB_TYPE_NOTIFICATION_DISPATCH}:search_id={int(search_id)}",
@@ -2222,7 +2220,7 @@ def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = Fals
         return {"status": "skipped", "reason": "subscription_not_found", "search_id": search_id}
     if dry_run:
         return {"status": "dry_run", "search_id": search_id, "search_url": sub.get("SearchURL")}
-    light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=getattr(config, "INITIAL_BASELINE_MAX_PAGES", None), timeout=config.PIPELINE_TIMEOUT, full_scan=True, dry_run=False)
+    light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=getattr(config, "INITIAL_BASELINE_MAX_PAGES", None), timeout=config.PIPELINE_TIMEOUT, full_scan=True, dry_run=False, enforce_target_area=True)
     if light.get("scan_status") == "blocked_rate_limited":
         return {
             "status": "retry_wait",
@@ -2232,6 +2230,8 @@ def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = Fals
         }
     if light.get("scan_status") == "technical_failure":
         raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
+    if light.get("scan_status") == "skipped_untrusted" or not light.get("trusted_scan", True):
+        return {"status": "skipped_untrusted", "reason": light.get("stop_reason") or "untrusted_full_sweep", "search_id": search_id, "full_sweep": light, "new_listing_jobs": []}
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
     listing_ids = _listing_ids_from_light(light)
@@ -2360,7 +2360,7 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         sub = _load_search_subscription(search_id, user_area_id)
         if not sub:
             return {"status": "skipped", "reason": "subscription_not_found"}
-        light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=config.LIGHT_CHECK_PAGES, timeout=config.PIPELINE_TIMEOUT, dry_run=False)
+        light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=config.LIGHT_CHECK_PAGES, timeout=config.PIPELINE_TIMEOUT, dry_run=False, enforce_target_area=True)
         if light.get("scan_status") == "blocked_rate_limited":
             return {
                 "status": "retry_wait",
@@ -2370,18 +2370,23 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
             }
         if light.get("scan_status") == "technical_failure":
             raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
+        if light.get("scan_status") == "skipped_untrusted" or not light.get("trusted_scan", True):
+            conn = db_layer.connect(config.DB_PATH)
+            try:
+                db_layer.mark_search_light_checked(conn, search_id)
+            finally:
+                conn.close()
+            return {"status": "skipped_untrusted", "reason": light.get("stop_reason") or "untrusted_light_check", "light_check": light, "new_listing_jobs": [], "notifications": []}
         new_listing_jobs = _enqueue_new_listing_processing(search_id, user_area_id, _listing_ids_from_light(light))
         conn = db_layer.connect(config.DB_PATH)
         try:
             db_layer.mark_search_light_checked(conn, search_id)
         finally:
             conn.close()
-        return _attach_notification_dispatch(
-            {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": []},
-            search_id,
-            user_area_id,
-            "light_check_new_listings",
-        )
+        result = {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": []}
+        if int(light.get("new_count") or 0) > 0 and light.get("trusted_scan", True):
+            result = _attach_notification_dispatch(result, search_id, user_area_id, "light_check_new_listings")
+        return result
     if job_type == job_queue.JOB_TYPE_PROCESS_NEW_LISTING:
         payload = _job_payload(job)
         result = run_process_new_listing_for_search(search_id, payload.get("listing_ids") or [], dry_run=False, send_telegram=False)
@@ -2404,7 +2409,10 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         return _attach_notification_dispatch(result, search_id, user_area_id, "price_retry_unknowns")
     if job_type in {job_queue.JOB_TYPE_DAILY_FULL_LISTING_SWEEP, job_queue.JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP}:
         result = run_daily_full_listing_sweep_for_search(search_id, dry_run=False)
-        return _attach_notification_dispatch(result, search_id, user_area_id, "daily_full_listing_safety_sweep")
+        full_sweep = result.get("full_sweep") or {}
+        if result.get("status") == "completed" and full_sweep.get("trusted_scan", True) and int(full_sweep.get("new_count") or 0) > 0:
+            return _attach_notification_dispatch(result, search_id, user_area_id, "daily_full_listing_safety_sweep")
+        return result
     if job_type == job_queue.JOB_TYPE_MANUAL_CHECK_NOW:
         queued = job_queue.enqueue_job_once(job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, search_id=search_id, user_area_id=user_area_id, priority=job_queue.PRIORITY_MANUAL_OR_NEW_DETAIL, run_after=_utcnow())
         return {"status": "enqueued_light_check", "job": queued}
@@ -2416,7 +2424,7 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
                 job_queue.JOB_TYPE_TELEGRAM_SEND,
                 search_id=search_id,
                 user_area_id=user_area_id,
-                priority=job_queue.PRIORITY_MAINTENANCE,
+                priority=getattr(job_queue, "PRIORITY_NOTIFICATION_DISPATCH", job_queue.PRIORITY_MAINTENANCE),
                 run_after=_utcnow(),
                 payload={"reason": "notification_dispatch"},
                 dedupe_key=f"{job_queue.JOB_TYPE_TELEGRAM_SEND}:search_id={int(search_id or 0)}",

@@ -10,8 +10,10 @@ sys.modules.setdefault("pyodbc", types.SimpleNamespace(connect=lambda *args, **k
 
 import pytest
 
+import area_light_checker
 import db_layer
 import job_queue
+import module1_list_scraper
 import monitoring_scheduler
 from realestate_errors import RealEstateBlockedError
 
@@ -361,6 +363,177 @@ def test_new_listing_dispatch_does_not_depend_on_process_new_listing_success(mon
     ]
     assert dispatch and active_dispatch
     assert active_dispatch[0]["JobID"] == dispatch["JobID"]
+
+
+def _patch_light_check_boundaries(monkeypatch, rows, meta=None):
+    ingest_calls = []
+
+    class Conn:
+        def close(self): pass
+
+    page_meta = {
+        "url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date",
+        "current_url": "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date",
+        "cards_found": len(rows),
+        "has_next_page": False,
+        "total_pages_detected": 1,
+        "stop_reason": "listings",
+    }
+    page_meta.update(meta or {})
+    monkeypatch.setattr(area_light_checker, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(area_light_checker, "get_existing_external_ids_for_search", lambda conn, search_url: set())
+    monkeypatch.setattr(module1_list_scraper, "scrape_search_page", lambda **kwargs: (list(rows), dict(page_meta)))
+    monkeypatch.setattr(area_light_checker, "ingest_light_check_rows", lambda *args, **kwargs: ingest_calls.append((args, kwargs)) or {"run_id": 37})
+    return ingest_calls
+
+
+def test_same_postcode_wrong_suburb_light_check_rejected(monkeypatch):
+    rows = [{
+        "listing_id": "151500948",
+        "address": "79 Marshall Street, Cobar, NSW 2835",
+        "url": "https://www.realestate.com.au/property-house-nsw-cobar-151500948",
+        "price": "$350,000",
+    }]
+    ingest_calls = _patch_light_check_boundaries(monkeypatch, rows)
+
+    out = area_light_checker.light_check_area(
+        "db",
+        "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date",
+        enforce_target_area=True,
+    )
+
+    assert out["scan_status"] == "skipped_untrusted"
+    assert out["new_count"] == 0
+    assert out["rows_area_rejected"] == 1
+    assert out["area_rejection_reasons"]["wrong_suburb_same_postcode"] == 1
+    assert ingest_calls == []
+
+
+def test_wrong_state_and_wrong_suburb_rows_are_all_rejected(monkeypatch):
+    rows = [
+        {"listing_id": "1", "address": "1 Test Street, Randwick, NSW 2031", "url": "https://www.realestate.com.au/property-house-nsw-randwick-1"},
+        {"listing_id": "2", "address": "2 Test Street, Burnside, SA 5066", "url": "https://www.realestate.com.au/property-house-sa-burnside-2"},
+        {"listing_id": "3", "address": "3 Test Street, Bundamba, QLD 4304", "url": "https://www.realestate.com.au/property-house-qld-bundamba-3"},
+        {"listing_id": "4", "address": "4 Test Street, Moonee Ponds, VIC 3039", "url": "https://www.realestate.com.au/property-house-vic-moonee-ponds-4"},
+        {"listing_id": "5", "address": "5 Test Street, Darwin, NT 0800", "url": "https://www.realestate.com.au/property-house-nt-darwin-5"},
+        {"listing_id": "6", "address": "6 Test Street, Cockburn, WA 6164", "url": "https://www.realestate.com.au/property-house-wa-cockburn-6"},
+    ]
+    ingest_calls = _patch_light_check_boundaries(monkeypatch, rows)
+
+    out = area_light_checker.light_check_area("db", "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date", enforce_target_area=True)
+
+    assert out["scan_status"] == "skipped_untrusted"
+    assert out["rows_area_matched"] == 0
+    assert out["rows_area_rejected"] == 6
+    assert ingest_calls == []
+
+
+def test_valid_area_light_check_accepts_noona_and_sets_area_label(monkeypatch):
+    rows = [{
+        "listing_id": "204091840",
+        "address": "12 Example Road, Noona, NSW 2835",
+        "url": "https://www.realestate.com.au/property-house-nsw-noona-204091840",
+        "price": "$200,000",
+    }]
+    ingest_calls = _patch_light_check_boundaries(monkeypatch, rows)
+
+    out = area_light_checker.light_check_area("db", "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1?activeSort=list-date", enforce_target_area=True)
+
+    assert out["scan_status"] == "ok"
+    assert out["trusted_scan"] is True
+    assert out["new_count"] == 1
+    assert out["new_listings"][0]["area_label"] == "Noona, NSW 2835"
+    assert ingest_calls
+    ingested_rows = ingest_calls[0][0][2]
+    assert ingested_rows[0]["area_label"] == "Noona, NSW 2835"
+
+
+def test_untrusted_light_check_creates_no_enrichment_or_dispatch(monkeypatch):
+    marked = []
+
+    class Conn:
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_light_checked", lambda conn, search_id: marked.append(search_id))
+    monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "skipped_untrusted", "trusted_scan": False, "stop_reason": "wrong_area", "new_count": 0, "new_listings": []})
+
+    result = monitoring_scheduler.execute_job({"JobID": 10, "JobType": job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, "SearchID": 42, "UserAreaID": 7})
+
+    assert result["status"] == "skipped_untrusted"
+    assert result["new_listing_jobs"] == []
+    assert "notification_dispatch_job" not in result
+    assert marked == [42]
+
+
+def test_notification_and_light_priorities_outrank_process_new_listing():
+    now = datetime.now()
+    process = job_queue.enqueue_job(job_queue.JOB_TYPE_PROCESS_NEW_LISTING, search_id=42, priority=job_queue.PRIORITY_NEW_LISTING_ENRICHMENT, run_after=now)
+    dispatch = job_queue.enqueue_job(job_queue.JOB_TYPE_NOTIFICATION_DISPATCH, search_id=42, priority=job_queue.PRIORITY_NOTIFICATION_DISPATCH, run_after=now)
+    light = job_queue.enqueue_job(job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS, search_id=42, priority=job_queue.PRIORITY_LIGHT_CHECK, run_after=now)
+
+    first = job_queue.claim_next_job("worker-1")
+    second = job_queue.claim_next_job("worker-2")
+    third = job_queue.claim_next_job("worker-3")
+
+    assert first["JobID"] == dispatch["JobID"]
+    assert second["JobID"] == light["JobID"]
+    assert third["JobID"] == process["JobID"]
+
+
+def test_process_new_listing_stale_recovery_consumes_attempt_and_then_fails():
+    old = datetime.now() - timedelta(minutes=60)
+    row = {
+        "JobID": 200,
+        "JobType": job_queue.JOB_TYPE_PROCESS_NEW_LISTING,
+        "SearchID": 42,
+        "UserAreaID": 7,
+        "Priority": job_queue.PRIORITY_NEW_LISTING_ENRICHMENT,
+        "Status": "running",
+        "RunAfter": old,
+        "AttemptCount": 2,
+        "MaxAttempts": 3,
+        "LockedBy": "old-worker",
+        "LockedAt": old,
+        "StartedAt": old,
+        "FinishedAt": None,
+        "LastError": None,
+        "PayloadJson": "{}",
+        "DedupeKey": "process_new_listing:test",
+        "CreatedAt": old,
+        "UpdatedAt": old,
+    }
+    job_queue.enable_in_memory_store([row])
+
+    out = job_queue.recover_stale_running_jobs(now=datetime.now())
+    stored = job_queue._TEST_STORE[0]
+
+    assert out["failed_count"] == 1
+    assert stored["Status"] == "failed"
+    assert stored["AttemptCount"] == 3
+
+
+def test_module1_pagination_total_pages_overrides_raw_next():
+    assert module1_list_scraper._normalize_has_next_page(True, page=2, total_pages=2) is False
+    assert module1_list_scraper._normalize_has_next_page(True, page=1, total_pages=2) is True
+
+
+def test_untrusted_full_sweep_does_not_mark_swept_or_dispatch(monkeypatch):
+    marked = []
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "skipped_untrusted", "trusted_scan": False, "stop_reason": "normal_content_without_cards"})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_full_listing_swept", lambda conn, search_id: marked.append(search_id))
+
+    result = monitoring_scheduler.run_daily_full_listing_sweep_for_search(42)
+
+    assert result["status"] == "skipped_untrusted"
+    assert result["new_listing_jobs"] == []
+    assert marked == []
 
 
 def test_fresh_detail_refresh_cooldown_is_not_rescheduled(monkeypatch):

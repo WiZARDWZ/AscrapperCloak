@@ -49,9 +49,10 @@ JOB_TYPE_TELEGRAM_SEND = "telegram_send"
 
 PRIORITY_SETUP = 0
 PRIORITY_MANUAL_OR_NEW_DETAIL = 10
-PRIORITY_NEW_LISTING_ENRICHMENT = 15
+PRIORITY_NOTIFICATION_DISPATCH = 8
+PRIORITY_LIGHT_CHECK = 10
 PRIORITY_LISTING_STATUS_RECHECK = 12
-PRIORITY_LIGHT_CHECK = 20
+PRIORITY_NEW_LISTING_ENRICHMENT = 30
 PRIORITY_DETAIL_REFRESH = 30
 PRIORITY_PRICE_RETRY_UNKNOWNS = 25
 PRIORITY_PRICE_REFRESH = 35
@@ -73,7 +74,7 @@ JOB_STALE_TIMEOUT_ENV_NAMES: dict[str, str] = {
 
 JOB_STALE_TIMEOUT_DEFAULT_MINUTES: dict[str, int] = {
     JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS: 45,
-    JOB_TYPE_PROCESS_NEW_LISTING: 90,
+    JOB_TYPE_PROCESS_NEW_LISTING: 30,
     JOB_TYPE_DETAIL_REFRESH_EXISTING: 180,
     JOB_TYPE_MODULE2_PRICE_REFRESH_AREA: 300,
     JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP: 120,
@@ -780,10 +781,12 @@ def recover_stale_running_jobs(conn=None, now: datetime | None = None) -> dict[s
             result["stale_job_ids"].append(job_id)
             attempts = int(row.get("AttemptCount") or 0)
             max_attempts = int(row.get("MaxAttempts") or 3)
-            if attempts < max_attempts:
+            next_attempt = attempts + 1
+            if next_attempt < max_attempts:
                 row.update({
                     "Status": "queued",
                     "RunAfter": now,
+                    "AttemptCount": next_attempt,
                     "LockedAt": None,
                     "LockedBy": None,
                     "StartedAt": None,
@@ -828,11 +831,13 @@ def recover_stale_running_jobs(conn=None, now: datetime | None = None) -> dict[s
             attempts = int(row.get("AttemptCount") or 0)
             max_attempts = int(row.get("MaxAttempts") or 3)
             result["stale_job_ids"].append(job_id)
-            if attempts < max_attempts:
+            next_attempt = attempts + 1
+            if next_attempt < max_attempts:
                 cur.execute("""
                     UPDATE dbo.Job
                     SET Status='queued',
                         RunAfter=SYSDATETIME(),
+                        AttemptCount=AttemptCount+1,
                         LockedAt=NULL,
                         LockedBy=NULL,
                         StartedAt=NULL,
@@ -847,6 +852,7 @@ def recover_stale_running_jobs(conn=None, now: datetime | None = None) -> dict[s
                 cur.execute("""
                     UPDATE dbo.Job
                     SET Status='failed',
+                        AttemptCount=AttemptCount+1,
                         FinishedAt=SYSDATETIME(),
                         LastError=?,
                         LockedAt=NULL,
