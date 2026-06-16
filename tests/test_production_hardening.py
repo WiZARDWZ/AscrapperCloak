@@ -465,7 +465,7 @@ def test_untrusted_light_check_creates_no_enrichment_or_dispatch(monkeypatch):
 
     assert result["status"] == "skipped_untrusted"
     assert result["new_listing_jobs"] == []
-    assert "notification_dispatch_job" not in result
+    assert result.get("notification_dispatch_job") is None
     assert marked == [42]
 
 
