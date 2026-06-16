@@ -799,6 +799,7 @@ def recover_stale_running_jobs(conn=None, now: datetime | None = None) -> dict[s
             else:
                 row.update({
                     "Status": "failed",
+                    "AttemptCount": next_attempt,
                     "FinishedAt": now,
                     "LockedAt": None,
                     "LockedBy": None,

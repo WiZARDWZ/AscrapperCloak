@@ -2367,24 +2367,29 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
                 "reason": light.get("blocked_reason") or light.get("stop_reason") or "blocked_rate_limited",
                 "retry_after_seconds": int(light.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
                 "light_check": light,
+                "notification_dispatch_job": None,
             }
         if light.get("scan_status") == "technical_failure":
             raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
-        if light.get("scan_status") == "skipped_untrusted" or not light.get("trusted_scan", True):
+        explicitly_untrusted = light.get("trusted_scan") is False or light.get("scan_trusted") is False
+        unsafe_scan_statuses = {"skipped_untrusted", "untrusted", "blocked", "blocked_rate_limited", "fallback", "redirected", "wrong_area", "mismatch_heavy"}
+        if str(light.get("scan_status") or "").lower() in unsafe_scan_statuses or explicitly_untrusted:
             conn = db_layer.connect(config.DB_PATH)
             try:
                 db_layer.mark_search_light_checked(conn, search_id)
             finally:
                 conn.close()
-            return {"status": "skipped_untrusted", "reason": light.get("stop_reason") or "untrusted_light_check", "light_check": light, "new_listing_jobs": [], "notifications": []}
+            return {"status": "skipped_untrusted", "reason": light.get("stop_reason") or "untrusted_light_check", "light_check": light, "new_listing_jobs": [], "notifications": [], "notification_dispatch_job": None}
         new_listing_jobs = _enqueue_new_listing_processing(search_id, user_area_id, _listing_ids_from_light(light))
         conn = db_layer.connect(config.DB_PATH)
         try:
             db_layer.mark_search_light_checked(conn, search_id)
         finally:
             conn.close()
-        result = {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": []}
-        if int(light.get("new_count") or 0) > 0 and light.get("trusted_scan", True):
+        result = {"status": "completed", "light_check": light, "new_listing_jobs": new_listing_jobs, "notifications": [], "notification_dispatch_job": None}
+        event_producing = int(light.get("new_count") or 0) > 0 or bool(light.get("new_listings") or [])
+        scan_ok = str(light.get("scan_status") or "").lower() == "ok"
+        if scan_ok and event_producing:
             result = _attach_notification_dispatch(result, search_id, user_area_id, "light_check_new_listings")
         return result
     if job_type == job_queue.JOB_TYPE_PROCESS_NEW_LISTING:
