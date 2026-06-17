@@ -290,6 +290,7 @@ def ensure_runtime_schema() -> None:
         conn.commit()
         recovery = job_queue.recover_stale_running_jobs(conn=conn)
         logger.info("startup runtime schema: %s", _format_summary({"schema_ok": runtime_schema.get("schema_ok"), "setup_detail_schema_ok": runtime_schema.get("setup_detail_schema_ok"), "area_monitoring_schema_ok": runtime_schema.get("area_monitoring_schema_ok")}))
+        logger.info("startup runtime mode: runtime_mode=queue legacy_tick_enabled=false operational_price_monitoring_enabled=%s", str(bool(getattr(config, "ENABLE_OPERATIONAL_PRICE_MONITORING", False))).lower())
         logger.info("startup notification outbox sanitizer: %s", _format_summary(notification_sanitizer))
         logger.info("startup stale job recovery: %s", _format_summary(_summarize_stale_recovery(recovery)))
     finally:
@@ -1003,7 +1004,7 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing required production configuration: {', '.join(missing)}")
     ensure_runtime_schema()
-    logger.info("Starting Telegram bot polling with queue scheduler/worker runtime")
+    logger.info("Starting Telegram bot polling with queue scheduler/worker runtime runtime_mode=queue legacy_tick_enabled=false")
     build_application(config.TELEGRAM_BOT_TOKEN).run_polling()
 
 

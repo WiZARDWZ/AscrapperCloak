@@ -170,6 +170,7 @@ def _patch_ready_scheduler(monkeypatch, now, subscriptions):
     monkeypatch.setattr(monitoring_scheduler.config, "SCHEDULE_TIMEZONE", "UTC")
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_REFRESH_TIMES", "12:00")
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_INFERENCE_ENABLED", True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: SchedulerConn())
     monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
@@ -209,11 +210,72 @@ def test_active_module2_price_refresh_area_blocks_new_scheduled_job(monkeypatch)
     assert any(job.get("reason") == "active_price_refresh_exists" for job in out["skipped_duplicates"])
 
 
+def test_operational_price_disabled_does_not_enqueue_price_jobs(monkeypatch):
+    now = datetime(2026, 6, 8, 12, 30, 0)
+    sub = _ready_price_subscription(now)
+    sub["LastPriceRefreshAt"] = None
+    monkeypatch.setattr(monitoring_scheduler.config, "SCHEDULE_TIMEZONE", "UTC")
+    monkeypatch.setattr(monitoring_scheduler.config, "PRICE_REFRESH_TIMES", "12:00")
+    monkeypatch.setattr(monitoring_scheduler.config, "PRICE_INFERENCE_ENABLED", True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", False, raising=False)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: SchedulerConn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: [sub])
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_due_price_retry_listing_ids", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not query retry ids when disabled")))
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    price_types = {
+        job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS,
+        job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING,
+        job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
+    }
+    assert not [job for job in out["created"] if job.get("JobType") in price_types]
+    assert any(row.get("reason") == "operational_price_monitoring_disabled" for row in out["not_due"])
+
+
+def test_setup_price_baseline_still_runs_when_operational_price_disabled(monkeypatch):
+    calls = []
+    monkeypatch.setattr(monitoring_scheduler.config, "PRICE_INFERENCE_ENABLED", True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", False, raising=False)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {})
+    monkeypatch.setattr(monitoring_scheduler, "_default_price_sweep_mode", lambda setup, sweep_mode, history: "setup_full_sweep")
+
+    class Conn:
+        def close(self): pass
+        def commit(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_listings_for_price_inference", lambda *a, **k: calls.append(("targets", k)) or [])
+    out = monitoring_scheduler.run_price_baseline_for_search(42, setup=True, dry_run=False, mark_search_complete=False)
+
+    assert out["status"] == "completed_no_targets"
+    assert calls
+
+
+def test_execute_existing_price_job_skips_when_operational_price_disabled(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", False, raising=False)
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_notification_dispatch", lambda search_id: True)
+
+    out = monitoring_scheduler.execute_job({
+        "JobID": 0,
+        "JobType": job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA,
+        "SearchID": 42,
+    })
+
+    assert out["status"] == "skipped_operational_price_disabled"
+
+
 def test_zero_candidate_price_refresh_marks_search_refreshed(monkeypatch):
     marked = []
     class Conn:
         def close(self): pass
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     monkeypatch.setattr(monitoring_scheduler, "run_price_baseline_for_search", lambda *a, **k: {"status": "completed", "processed_count": 0})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
     monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_listings_for_price_inference", lambda *a, **k: [])
@@ -228,6 +290,7 @@ def test_run_price_baseline_zero_candidates_can_advance_price_refresh(monkeypatc
     marked = []
     class Conn:
         def close(self): pass
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchURL": "url"})
     monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {})
     monkeypatch.setattr(monitoring_scheduler, "_default_price_sweep_mode", lambda setup, sweep_mode, history: "smart_refresh")
@@ -257,6 +320,7 @@ def test_price_retry_unknowns_marks_direct_price_rows_skipped(monkeypatch):
         "price_inference_status": "unknown_pending_retry",
     }
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchID": search_id, "SearchURL": "url"})
     monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
@@ -280,6 +344,7 @@ def test_price_retry_unknowns_no_targets_cleans_or_postpones_retry_state(monkeyp
         def commit(self): pass
 
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchID": search_id, "SearchURL": "url"})
     monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
@@ -327,6 +392,7 @@ def test_light_check_new_listings_enqueues_notification_dispatch(monkeypatch):
 
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
     monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_notification_dispatch", lambda search_id: True)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
     monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "ok", "new_listings": [{"listing_id": "204091840"}]})
     monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
@@ -346,6 +412,7 @@ def test_light_check_new_listings_enqueues_notification_dispatch(monkeypatch):
 def test_new_listing_dispatch_does_not_depend_on_process_new_listing_success(monkeypatch):
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
     monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_notification_dispatch", lambda search_id: True)
     dispatch = monitoring_scheduler._enqueue_notification_dispatch_for_search(42, user_area_id=7, reason="light_check_new_listings")
     with pytest.raises(RuntimeError):
         with monkeypatch.context() as m:
@@ -363,6 +430,22 @@ def test_new_listing_dispatch_does_not_depend_on_process_new_listing_success(mon
     ]
     assert dispatch and active_dispatch
     assert active_dispatch[0]["JobID"] == dispatch["JobID"]
+
+
+def test_notification_dispatch_queues_telegram_send_when_outbox_created(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_queue_notifications_for_search", lambda search_id, dry_run=False: [{"queued_count": 2}])
+
+    out = monitoring_scheduler.execute_job({
+        "JobID": 10,
+        "JobType": job_queue.JOB_TYPE_NOTIFICATION_DISPATCH,
+        "SearchID": 42,
+        "UserAreaID": 7,
+    })
+
+    assert out["telegram_send_job"]["JobType"] == job_queue.JOB_TYPE_TELEGRAM_SEND
+    assert out["telegram_send_job"]["Priority"] == job_queue.PRIORITY_NOTIFICATION_DISPATCH
 
 
 def _patch_light_check_boundaries(monkeypatch, rows, meta=None):
@@ -574,12 +657,80 @@ def test_fresh_detail_refresh_cooldown_is_not_rescheduled(monkeypatch):
 def test_price_retry_unknowns_dedupes_same_retry_window(monkeypatch):
     now = datetime(2026, 6, 8, 12, 30, 0)
     monkeypatch.setattr(monitoring_scheduler.config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
     first = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["a", "b"], run_after=now)
     second = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["b", "c"], run_after=now + timedelta(minutes=10))
     assert second["created"] is False
     assert second["reason"] == "merged_existing_price_retry_for_window"
     payload = json.loads(job_queue.get_jobs_by_dedupe_key(first["DedupeKey"])[0]["PayloadJson"])
     assert payload["listing_external_ids"] == ["a", "b", "c"]
+
+
+def test_running_price_retry_unknowns_merges_same_window(monkeypatch):
+    now = datetime(2026, 6, 8, 12, 30, 0)
+    monkeypatch.setattr(monitoring_scheduler.config, "PRICE_UNKNOWN_RETRY_INTERVAL_SECONDS", 3600)
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
+    first = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["a"], run_after=now)
+    claimed = job_queue.claim_next_job("worker-price")
+    assert claimed["JobID"] == first["JobID"]
+
+    second = monitoring_scheduler._enqueue_price_retry_unknowns(42, ["b", "a"], run_after=now + timedelta(minutes=5))
+
+    assert second["created"] is False
+    assert second["reason"] == "merged_existing_price_retry_for_window"
+    jobs = [row for row in job_queue.get_active_jobs() if row.get("JobType") == job_queue.JOB_TYPE_PRICE_RETRY_UNKNOWNS]
+    assert len(jobs) == 1
+    payload = json.loads(jobs[0]["PayloadJson"])
+    assert payload["listing_external_ids"] == ["a", "b"]
+
+
+def test_price_refresh_stops_after_no_progress_windows(monkeypatch):
+    import module2_infer_prices
+
+    class Conn:
+        def close(self): pass
+        def commit(self): pass
+
+    candidate = {
+        "db_listing_id": 99,
+        "listing_id": "abc",
+        "external_id": "abc",
+        "price_display": "Contact agent",
+        "inferred_price_low": None,
+        "inferred_price_high": None,
+        "price_inference_status": "unknown_pending_retry",
+    }
+    cleanup_calls = []
+    unknown_calls = []
+    monkeypatch.setattr(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True, raising=False)
+    monkeypatch.setattr(monitoring_scheduler.config, "OPERATIONAL_PRICE_MAX_WINDOWS_PER_JOB", 2, raising=False)
+    monkeypatch.setattr(monitoring_scheduler.config, "OPERATIONAL_PRICE_MAX_NO_PROGRESS_WINDOWS", 2, raising=False)
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"SearchID": search_id, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "_price_sweep_history", lambda conn, search_id: {"has_enough_history": True})
+    monkeypatch.setattr(monitoring_scheduler, "_default_price_sweep_mode", lambda setup, sweep_mode, history: "smart_refresh")
+    monkeypatch.setattr(monitoring_scheduler, "_write_price_inference_input", lambda rows, search_id: "input.json")
+    monkeypatch.setattr(monitoring_scheduler, "_load_module2_output_json", lambda path: {})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_listings_for_price_inference", lambda *a, **k: [candidate])
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "parse_price_bounds_from_text", lambda text: (None, None))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_price_inference_unknown_pending_retry", lambda conn, search_id, listing_id, reason=None: unknown_calls.append((listing_id, reason)))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "cleanup_price_retry_no_target_ids", lambda conn, search_id, ids, next_retry_at=None: cleanup_calls.append((list(ids), next_retry_at)) or {"postponed_not_due": list(ids)})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_price_refreshed", lambda *a, **k: None)
+
+    def fake_module2_run(*args, **kwargs):
+        module2_infer_prices.module2_run.last_result = {"status": "done", "target_count": 1, "remaining_count": 1, "windows_checked": 2, "sweep_mode": kwargs.get("sweep_mode")}
+        return "out.csv", "out.json"
+
+    monkeypatch.setattr(module2_infer_prices, "module2_run", fake_module2_run)
+
+    out = monitoring_scheduler.run_price_refresh_existing_for_search(42, payload={"run_started_at": datetime(2026, 6, 8, 12, 30).isoformat()}, dry_run=False)
+
+    assert out["status"] == "partial_no_progress"
+    assert out["price_refresh"]["stop_reason"] == "max_no_progress_windows"
+    assert out["enqueued_next_batch"] is None
+    assert cleanup_calls and cleanup_calls[0][0] == ["abc"]
+    assert unknown_calls
 
 
 def test_unknown_price_inference_sets_future_next_retry_at():
@@ -613,7 +764,7 @@ def test_browser_recovery_logs_requested_and_completed(monkeypatch):
     assert status == "recovered"
     assert rotations == 1
     assert profile == "/tmp/new_profile"
-    assert any("[recovery] requested" in item and "old_profile=/tmp/old_profile" in item and "job_id=123" in item and "search_id=42" in item for item in logs)
+    assert any("[recovery] requested" in item and "old_profile=" in item and "old_profile" in item and "job_id=123" in item and "search_id=42" in item for item in logs)
     assert any("[recovery] completed" in item and "new_profile=/tmp/new_profile" in item and "reason=chrome_error:unknown" in item for item in logs)
 
 
@@ -739,6 +890,29 @@ def test_startup_schema_recovers_stale_jobs(monkeypatch):
     monkeypatch.setattr(telegram_bot.job_queue, "recover_stale_running_jobs", lambda conn=None: called.append(conn) or {"recovered_count": 1, "failed_count": 0, "stale_job_ids": [1296], "recovered_job_types": [job_queue.JOB_TYPE_BASELINE_SETUP_AREA]})
     telegram_bot.ensure_runtime_schema()
     assert len(called) == 1
+
+
+def test_startup_logs_queue_runtime_mode(monkeypatch, caplog):
+    import logging
+    import telegram_bot
+
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(telegram_bot, "_connect", lambda: Conn())
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True, "setup_detail_schema_ok": True, "area_monitoring_schema_ok": True})
+    monkeypatch.setattr(telegram_bot.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(telegram_bot.db_layer, "sanitize_notification_outbox", lambda conn: {"notifications_skipped_by_revalidation": 0})
+    monkeypatch.setattr(telegram_bot.job_queue, "ensure_job_tables", lambda conn=None: None)
+    monkeypatch.setattr(telegram_bot.job_queue, "recover_stale_running_jobs", lambda conn=None: {"recovered_count": 0, "failed_count": 0, "stale_job_ids": [], "recovered_job_types": []})
+
+    with caplog.at_level(logging.INFO, logger="telegram_bot"):
+        telegram_bot.ensure_runtime_schema()
+
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "runtime_mode=queue" in text
+    assert "legacy_tick_enabled=false" in text
 
 
 def test_scheduler_summary_includes_stale_recovery_diagnostics():

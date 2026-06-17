@@ -1130,12 +1130,14 @@ class MonitoringRefactorTests(unittest.TestCase):
         without_ready_at = {**ready, "NotificationReadyAt": None}
         self.assertTrue(monitoring_scheduler._subscription_monitoring_readiness(ready)["ready"])
         self.assertTrue(monitoring_scheduler._subscription_monitoring_readiness(ready)["notification_eligible"])
-        self.assertFalse(monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["ready"])
-        self.assertIn("notification_ready_at_missing", monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["reasons"])
+        self.assertTrue(monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["ready"])
+        self.assertFalse(monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["notification_eligible"])
+        self.assertIn("notification_ready_at_missing", monitoring_scheduler._subscription_monitoring_readiness(without_ready_at)["notification_reasons"])
 
     def test_price_retry_unknowns_skips_when_no_due_rows(self):
         with mock.patch.object(monitoring_scheduler.db_layer, "connect", return_value=DummyConn()), \
              mock.patch.object(monitoring_scheduler, "_search_is_active_for_monitoring", return_value=True), \
+             mock.patch.object(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True), \
              mock.patch.object(monitoring_scheduler.db_layer, "get_due_price_retry_listing_ids", return_value=[]):
             result = monitoring_scheduler.run_price_retry_unknowns_for_search(7, payload={}, dry_run=True)
         self.assertEqual(result["price_retry"]["reason"], "no_due_unknown_prices")
@@ -1249,6 +1251,9 @@ class MonitoringRefactorTests(unittest.TestCase):
                  mock.patch.object(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda _conn: None), \
                  mock.patch.object(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", return_value=subscriptions), \
                  mock.patch.object(monitoring_scheduler.db_layer, "get_due_price_retry_listing_ids", return_value=[]), \
+                 mock.patch.object(monitoring_scheduler.config, "ENABLE_OPERATIONAL_PRICE_MONITORING", True), \
+                 mock.patch.object(monitoring_scheduler.config, "SCHEDULE_TIMEZONE", "UTC"), \
+                 mock.patch.object(monitoring_scheduler.config, "PRICE_REFRESH_TIMES", f"{now.hour:02d}:{now.minute:02d}"), \
                  mock.patch.object(monitoring_scheduler, "_fetch_sql_server_local_time", return_value=now):
                 result = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
 
