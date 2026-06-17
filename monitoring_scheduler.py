@@ -1282,13 +1282,23 @@ def enqueue_due_monitoring_jobs(now: datetime | None = None) -> dict[str, Any]:
                     "reason": "operational_price_monitoring_disabled" if getattr(config, "PRICE_INFERENCE_ENABLED", True) else "price_inference_disabled",
                 })
 
+            sweep_last_at = _effective_scheduled_last_at(group, "LastFullListingSweepAt")
             sweep_check = _scheduled_due_decision(
                 search_id,
                 job_queue.JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP,
-                _effective_scheduled_last_at(group, "LastFullListingSweepAt"),
+                sweep_last_at,
                 current_time_used,
                 getattr(config, "DAILY_FULL_LISTING_SWEEP_TIME", "04:00"),
             )
+            if sweep_last_at is not None and sweep_last_at > current_time_used and not sweep_check["is_due"]:
+                sweep_check["reason"] = "untrusted_cooldown_active"
+                sweep_check["cooldown_marker"] = "LastFullListingSweepAt"
+                sweep_check["next_full_sweep_after"] = sweep_last_at
+                logger.info(
+                    "scheduler full_sweep not_due search_id=%s reason=untrusted_cooldown_active next_full_sweep_after=%s",
+                    search_id,
+                    sweep_last_at,
+                )
             result["due_checks"].append(sweep_check)
             if sweep_check["is_due"]:
                 job = job_queue.enqueue_job_once(
@@ -1402,10 +1412,30 @@ def _queued_notification_count(results: list[dict[str, Any]] | None) -> int:
     return sum(int(row.get("queued_count") or 0) for row in (results or []) if isinstance(row, dict))
 
 
+def _eligible_unqueued_notification_count_for_search(search_id: int | None) -> int:
+    if not search_id:
+        return 0
+    try:
+        return _queued_notification_count(_queue_notifications_for_search(int(search_id), dry_run=True))
+    except Exception as exc:
+        logger.info("notification dispatch preview failed search_id=%s error=%s", search_id, config.mask_sensitive_text(exc))
+        return 0
+
+
 def _attach_notification_dispatch(result: dict[str, Any], search_id: int | None, user_area_id: int | None, reason: str) -> dict[str, Any]:
     dispatch = _enqueue_notification_dispatch_for_search(search_id, user_area_id=user_area_id, reason=reason)
     if dispatch:
         result["notification_dispatch_job"] = dispatch
+    return result
+
+
+def _attach_notification_dispatch_if_pending(result: dict[str, Any], search_id: int | None, user_area_id: int | None, reason: str) -> dict[str, Any]:
+    pending_count = _eligible_unqueued_notification_count_for_search(search_id)
+    result["notification_dispatch_preview_count"] = pending_count
+    if pending_count > 0:
+        return _attach_notification_dispatch(result, search_id, user_area_id, reason)
+    result.setdefault("notification_dispatch_job", None)
+    logger.info("notification dispatch skipped search_id=%s reason=%s queued_count=0", search_id, reason)
     return result
 
 
@@ -2395,6 +2425,44 @@ def run_price_refresh_existing_for_search(search_id: int, payload: dict[str, Any
     return {"status": status, "run_id": run_id, "run_started_at": run_started_at, "scheduled_at": scheduled_at, "remaining_count": remaining, "price_refresh": price, "enqueued_next_batch": enqueued}
 
 
+def _mark_untrusted_full_sweep_cooldown(search_id: int, status: str, reason: str | None = None) -> dict[str, Any]:
+    cooldown_seconds = int(getattr(config, "FULL_SWEEP_UNTRUSTED_RETRY_DELAY_SECONDS", 21600))
+    next_full_sweep_after = _utcnow() + timedelta(seconds=cooldown_seconds)
+    conn = db_layer.connect(config.DB_PATH)
+    try:
+        try:
+            attempt = db_layer.mark_search_full_listing_sweep_attempted(
+                conn,
+                search_id,
+                status,
+                reason=reason,
+                cooldown_seconds=cooldown_seconds,
+            )
+        except AttributeError:
+            db_layer.mark_search_full_listing_swept(conn, search_id)
+            attempt = {
+                "search_id": int(search_id),
+                "status": status,
+                "reason": reason or "",
+                "cooldown_seconds": cooldown_seconds,
+                "cooldown_marker": "LastFullListingSweepAt",
+                "destructive_actions": False,
+            }
+    finally:
+        conn.close()
+    attempt["next_full_sweep_after"] = next_full_sweep_after
+    logger.info(
+        "full_sweep skipped_untrusted search_id=%s status=%s reason=%s destructive_actions=false cooldown_applied_seconds=%s next_full_sweep_after=%s cooldown_marker=%s",
+        search_id,
+        status,
+        reason or "",
+        cooldown_seconds,
+        next_full_sweep_after,
+        attempt.get("cooldown_marker") or "LastFullListingSweepAt",
+    )
+    return attempt
+
+
 def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = False) -> dict[str, Any]:
     search_id = int(search_id)
     if not _search_is_active_for_monitoring(search_id):
@@ -2406,17 +2474,22 @@ def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = Fals
         return {"status": "dry_run", "search_id": search_id, "search_url": sub.get("SearchURL")}
     light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=getattr(config, "INITIAL_BASELINE_MAX_PAGES", None), timeout=config.PIPELINE_TIMEOUT, full_scan=True, dry_run=False, enforce_target_area=True)
     if light.get("scan_status") == "blocked_rate_limited":
+        cooldown = _mark_untrusted_full_sweep_cooldown(search_id, "blocked_rate_limited", light.get("blocked_reason") or light.get("stop_reason") or "blocked_rate_limited")
         return {
             "status": "retry_wait",
             "reason": light.get("blocked_reason") or light.get("stop_reason") or "blocked_rate_limited",
             "retry_after_seconds": int(light.get("retry_after_seconds") or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
             "full_sweep": light,
+            "sweep_attempt_cooldown": cooldown,
+            "destructive_actions": False,
         }
     if light.get("scan_status") == "technical_failure":
         raise RuntimeError(config.mask_sensitive_text(light.get("errors") or light.get("stop_reason") or "light_check_technical_failure"))
-    unsafe_full_sweep_statuses = {"skipped_untrusted", "untrusted", "blocked", "blocked_rate_limited", "fallback", "redirected", "wrong_area", "mismatch_heavy", "normal_content_without_cards"}
+    unsafe_full_sweep_statuses = {"skipped_untrusted", "untrusted", "blocked", "blocked_rate_limited", "fallback", "redirected", "wrong_area", "wrong_area_current_url", "wrong_area_mismatch_heavy", "mismatch_heavy", "mismatch-heavy", "normal_content_without_cards"}
     if str(light.get("scan_status") or "").lower() in unsafe_full_sweep_statuses or light.get("trusted_scan") is False or light.get("scan_trusted") is False:
-        return {"status": "skipped_untrusted", "reason": light.get("stop_reason") or "untrusted_full_sweep", "search_id": search_id, "full_sweep": light, "new_listing_jobs": []}
+        reason = light.get("stop_reason") or light.get("blocked_reason") or light.get("scan_status") or "untrusted_full_sweep"
+        cooldown = _mark_untrusted_full_sweep_cooldown(search_id, "skipped_untrusted", reason)
+        return {"status": "skipped_untrusted", "reason": reason, "search_id": search_id, "full_sweep": light, "new_listing_jobs": [], "sweep_attempt_cooldown": cooldown, "destructive_actions": False}
     if not _search_is_active_for_monitoring(search_id):
         return _inactive_job_result(search_id)
     listing_ids = _listing_ids_from_light(light)
@@ -2585,7 +2658,7 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         result = run_detail_refresh_existing_for_search(search_id, limit=int(getattr(config, "DETAIL_REFRESH_BATCH_SIZE", 35)), dry_run=False, send_telegram=False)
         if job_id:
             job_queue.touch_job_heartbeat(job_id)
-        return _attach_notification_dispatch(result, search_id, user_area_id, "detail_refresh_existing")
+        return _attach_notification_dispatch_if_pending(result, search_id, user_area_id, "detail_refresh_existing")
     if job_type == job_queue.JOB_TYPE_LISTING_STATUS_RECHECK:
         result = run_listing_status_recheck_job(job, send_telegram=False)
         return _attach_notification_dispatch(result, search_id, user_area_id, "listing_status_recheck")

@@ -5735,6 +5735,32 @@ def mark_search_full_listing_swept(conn, search_id: int) -> None:
     ensure_telegram_bot_tables(conn)
     conn.cursor().execute("UPDATE dbo.UserAreaSubscription SET LastFullListingSweepAt=SYSDATETIME(), UpdatedAt=SYSDATETIME() WHERE SearchID=? AND IsActive=1", int(search_id)); conn.commit()
 
+
+def mark_search_full_listing_sweep_attempted(conn, search_id: int, status: str, reason: str | None = None, cooldown_seconds: int | None = None) -> dict:
+    """Record a non-destructive full-sweep attempt cooldown using existing schema."""
+    ensure_telegram_bot_tables(conn)
+    safe_seconds = max(0, int(cooldown_seconds or 0))
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE dbo.UserAreaSubscription
+        SET LastFullListingSweepAt=DATEADD(second, ?, SYSDATETIME()),
+            UpdatedAt=SYSDATETIME()
+        WHERE SearchID=? AND IsActive=1
+        """,
+        safe_seconds,
+        int(search_id),
+    )
+    conn.commit()
+    return {
+        "search_id": int(search_id),
+        "status": str(status or ""),
+        "reason": config.mask_sensitive_text(reason or ""),
+        "cooldown_seconds": safe_seconds,
+        "cooldown_marker": "LastFullListingSweepAt",
+        "destructive_actions": False,
+    }
+
 # Phase 2B SearchID-scoped monitoring helpers
 
 def get_active_user_area_subscriptions_for_search(conn, search_id: int) -> list[dict]:

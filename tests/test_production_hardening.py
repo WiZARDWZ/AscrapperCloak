@@ -384,6 +384,32 @@ def test_noop_detail_refresh_marks_cooldown(monkeypatch):
     assert marked == [42]
 
 
+def test_detail_refresh_noop_does_not_enqueue_empty_notification_dispatch(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_search_ready_for_operational_monitoring", lambda search_id: True)
+    monkeypatch.setattr(
+        monitoring_scheduler,
+        "run_detail_refresh_existing_for_search",
+        lambda *a, **k: {"status": "completed", "detail_refresh": {"processed_count": 0, "refreshed_count": 0}},
+    )
+    monkeypatch.setattr(monitoring_scheduler, "_eligible_unqueued_notification_count_for_search", lambda search_id: 0)
+    monkeypatch.setattr(
+        monitoring_scheduler,
+        "_enqueue_notification_dispatch_for_search",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not enqueue empty detail dispatch")),
+    )
+
+    out = monitoring_scheduler.execute_job({
+        "JobID": 0,
+        "JobType": job_queue.JOB_TYPE_DETAIL_REFRESH_EXISTING,
+        "SearchID": 42,
+        "UserAreaID": 7,
+    })
+
+    assert out["notification_dispatch_job"] is None
+    assert out["notification_dispatch_preview_count"] == 0
+
+
 def test_light_check_new_listings_enqueues_notification_dispatch(monkeypatch):
     now = datetime(2026, 6, 14, 11, 50, 0)
 
@@ -604,19 +630,84 @@ def test_module1_pagination_total_pages_overrides_raw_next():
     assert module1_list_scraper._normalize_has_next_page(True, page=1, total_pages=2) is True
 
 
-def test_untrusted_full_sweep_does_not_mark_swept_or_dispatch(monkeypatch):
-    marked = []
+def test_untrusted_full_sweep_applies_non_destructive_cooldown(monkeypatch):
+    swept = []
+    attempted = []
+
+    class Conn:
+        def close(self): pass
 
     monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
     monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
     monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "skipped_untrusted", "trusted_scan": False, "stop_reason": "normal_content_without_cards"})
-    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_full_listing_swept", lambda conn, search_id: marked.append(search_id))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_full_listing_swept", lambda conn, search_id: swept.append(search_id))
+    monkeypatch.setattr(
+        monitoring_scheduler.db_layer,
+        "mark_search_full_listing_sweep_attempted",
+        lambda conn, search_id, status, reason=None, cooldown_seconds=None: attempted.append((search_id, status, reason, cooldown_seconds)) or {"cooldown_marker": "LastFullListingSweepAt", "destructive_actions": False},
+    )
 
     result = monitoring_scheduler.run_daily_full_listing_sweep_for_search(42)
 
     assert result["status"] == "skipped_untrusted"
     assert result["new_listing_jobs"] == []
-    assert marked == []
+    assert result["destructive_actions"] is False
+    assert swept == []
+    assert attempted and attempted[0][0] == 42
+    assert attempted[0][1] == "skipped_untrusted"
+    assert attempted[0][2] == "normal_content_without_cards"
+    assert attempted[0][3] == monitoring_scheduler.config.FULL_SWEEP_UNTRUSTED_RETRY_DELAY_SECONDS
+
+
+def test_trusted_full_sweep_marks_swept_normally(monkeypatch):
+    swept = []
+    attempted = []
+
+    class Conn:
+        def close(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler, "_search_is_active_for_monitoring", lambda search_id: True)
+    monkeypatch.setattr(monitoring_scheduler, "_load_search_subscription", lambda search_id, preferred_user_area_id=None: {"UserAreaID": 7, "SearchURL": "url"})
+    monkeypatch.setattr(monitoring_scheduler, "light_check_area", lambda *a, **k: {"scan_status": "ok", "trusted_scan": True, "new_listings": []})
+    monkeypatch.setattr(monitoring_scheduler, "_enqueue_new_listing_processing", lambda *a, **k: [])
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_full_listing_swept", lambda conn, search_id: swept.append(search_id))
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "mark_search_full_listing_sweep_attempted", lambda *a, **k: attempted.append((a, k)))
+
+    result = monitoring_scheduler.run_daily_full_listing_sweep_for_search(42)
+
+    assert result["status"] == "completed"
+    assert swept == [42]
+    assert attempted == []
+
+
+def test_scheduler_respects_untrusted_full_sweep_cooldown(monkeypatch):
+    now = datetime(2026, 6, 14, 12, 30, 0)
+    cooldown_until = now + timedelta(hours=6)
+    sub = _ready_price_subscription(now, last_price_refresh_at=now)
+    sub["LastFullListingSweepAt"] = cooldown_until
+
+    class Conn:
+        def cursor(self): return self
+        def execute(self, *a, **k): return self
+        def fetchone(self): return [now]
+        def close(self): pass
+        def commit(self): pass
+
+    monkeypatch.setattr(monitoring_scheduler.config, "SCHEDULE_TIMEZONE", "UTC")
+    monkeypatch.setattr(monitoring_scheduler.config, "DAILY_FULL_LISTING_SWEEP_TIME", "12:00")
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_runtime_monitoring_schema", lambda conn: {"schema_ok": True})
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "get_active_user_area_subscriptions", lambda conn: [sub])
+
+    out = monitoring_scheduler.enqueue_due_monitoring_jobs(now=now)
+
+    assert not [job for job in out["created"] if job.get("JobType") == job_queue.JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP]
+    sweep_checks = [row for row in out["not_due"] if row.get("job_type") == job_queue.JOB_TYPE_MODULE1_FULL_SAFETY_SWEEP]
+    assert sweep_checks
+    assert sweep_checks[0]["reason"] == "untrusted_cooldown_active"
 
 
 def test_fresh_detail_refresh_cooldown_is_not_rescheduled(monkeypatch):
