@@ -86,3 +86,20 @@ def test_build_active_listings_excel_creates_workbook_with_effective_price(monke
     assert headers.index("CurrentPriceDisplay") != headers.index("InferredPriceLow")
     assert values[headers.index("CurrentPriceDisplay")] == "Contact agent"
     assert values[headers.index("EffectivePriceDisplay")] == "Contact agent"
+
+
+def test_excel_denied_until_current_setup_ready():
+    historical_preparing = {
+        "AreaLabel": "Noona", "AreaSetupStatus": "preparing", "BaselineStatus": "completed",
+        "DetailBaselineStatus": "pending", "PriceBaselineStatus": "pending", "NotificationReadyAt": None,
+    }
+    retry_wait = {**historical_preparing, "DetailBaselineStatus": "retry_wait"}
+    ready = {
+        "AreaLabel": "Noona", "AreaSetupStatus": "ready", "BaselineStatus": "completed",
+        "DetailBaselineStatus": "completed", "PriceBaselineStatus": "completed", "NotificationReadyAt": object(),
+    }
+
+    assert excel_exporter.current_setup_readiness(historical_preparing)["ready"] is False
+    assert excel_exporter.current_setup_readiness(retry_wait)["ready"] is False
+    assert excel_exporter.current_setup_readiness(ready)["ready"] is True
+    assert "Setup is still preparing" in excel_exporter.setup_preparing_message(historical_preparing)
