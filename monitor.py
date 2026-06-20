@@ -103,6 +103,50 @@ def _log_baseline_scan_result(on_log, **fields: Any) -> None:
         on_log(message)
 
 
+def evaluate_module1_baseline_scan(scan_result: Dict[str, Any], search_url: str) -> Dict[str, Any]:
+    """Apply the shared Module1 terminal-state and target-area trust decision."""
+    rows_scraped = list(scan_result.get("rows") or [])
+    guard = apply_target_area_guard(rows_scraped, search_url, current_url=scan_result.get("current_url"))
+    accepted_rows = list(guard.get("accepted_rows") or [])
+    scan_status = str(scan_result.get("scan_status") or "unknown")
+    stop_reason = str(scan_result.get("stop_reason") or scan_status)
+    page_state = str(scan_result.get("page_state") or "")
+    explicit_no_results = (
+        not rows_scraped
+        and stop_reason == "no_results"
+        and page_state == "no_results"
+        and scan_result.get("trusted_scan") is True
+    )
+    terminal_values = {scan_status.lower(), stop_reason.lower(), page_state.lower()}
+    terminal_untrusted = bool(
+        terminal_values
+        & (_BASELINE_BLOCKED_STATES | _BASELINE_TECHNICAL_STATES | _BASELINE_WRONG_AREA_STATES)
+    )
+    trusted_scan = (
+        scan_result.get("trusted_scan") is True
+        and guard.get("trusted") is True
+        and not terminal_untrusted
+        and (bool(accepted_rows) or explicit_no_results)
+    )
+    scan_retryable = _baseline_scan_is_retryable(scan_result)
+    effective_stop_reason = str(
+        stop_reason if scan_retryable else (guard.get("untrusted_reason") or stop_reason)
+    )
+    return {
+        **scan_result,
+        "rows": accepted_rows,
+        "rows_scraped": len(rows_scraped),
+        "rows_accepted": len(accepted_rows),
+        "rows_rejected": len(guard.get("rejected_rows") or []),
+        "area_rejection_reasons": guard.get("rejection_reasons") or {},
+        "current_url_matches_target": guard.get("current_url_ok") is True,
+        "trusted_scan": trusted_scan,
+        "scan_retryable": scan_retryable,
+        "stop_reason": effective_stop_reason,
+        "explicit_no_results": explicit_no_results,
+    }
+
+
 def _module3_retryable_last_result() -> Dict[str, Any] | None:
     result = getattr(module3_enrich_details.module3_run, "last_result", {}) or {}
     status = str(result.get("status") or "").lower()
@@ -641,33 +685,15 @@ def baseline_setup_area(
     if getattr(cancel_token, "is_set", lambda: False)():
         return {"status": "cancelled", "area_id": area_id}
 
-    guard = apply_target_area_guard(rows_scraped, normalized_url, current_url=scan_result.get("current_url"))
-    rows1 = list(guard.get("accepted_rows") or [])
-    rows_rejected = len(guard.get("rejected_rows") or [])
-    scan_status = str(scan_result.get("scan_status") or "unknown")
-    stop_reason = str(scan_result.get("stop_reason") or scan_status)
-    page_state = str(scan_result.get("page_state") or "")
-    explicit_no_results = (
-        not rows_scraped
-        and stop_reason == "no_results"
-        and page_state == "no_results"
-        and scan_result.get("trusted_scan") is True
-    )
-    terminal_values = {scan_status.lower(), stop_reason.lower(), page_state.lower()}
-    terminal_untrusted = bool(
-        terminal_values
-        & (_BASELINE_BLOCKED_STATES | _BASELINE_TECHNICAL_STATES | _BASELINE_WRONG_AREA_STATES)
-    )
-    trusted_scan = (
-        scan_result.get("trusted_scan") is True
-        and guard.get("trusted") is True
-        and not terminal_untrusted
-        and (bool(rows1) or explicit_no_results)
-    )
-    scan_retryable = _baseline_scan_is_retryable(scan_result)
-    effective_stop_reason = str(
-        stop_reason if scan_retryable else (guard.get("untrusted_reason") or stop_reason)
-    )
+    scan_evaluation = evaluate_module1_baseline_scan(scan_result, normalized_url)
+    rows1 = list(scan_evaluation["rows"])
+    rows_rejected = int(scan_evaluation["rows_rejected"])
+    scan_status = str(scan_evaluation.get("scan_status") or "unknown")
+    page_state = str(scan_evaluation.get("page_state") or "")
+    explicit_no_results = bool(scan_evaluation["explicit_no_results"])
+    trusted_scan = bool(scan_evaluation["trusted_scan"])
+    scan_retryable = bool(scan_evaluation["scan_retryable"])
+    effective_stop_reason = str(scan_evaluation["stop_reason"])
 
     if not trusted_scan:
         retryable = scan_retryable
@@ -702,7 +728,7 @@ def baseline_setup_area(
             rows_rejected=rows_rejected,
             pages_checked=scan_result.get("pages_checked"),
             total_pages_detected=scan_result.get("total_pages_detected"),
-            current_url_matches_target=guard.get("current_url_ok") is True,
+            current_url_matches_target=scan_evaluation["current_url_matches_target"],
             ingest_allowed=False,
             detail_job_enqueued=False,
         )
@@ -715,6 +741,77 @@ def baseline_setup_area(
                 ),
             )
         raise RuntimeError(last_error)
+
+    existing_listing_counts = {
+        "total_count": 0,
+        "active_count": 0,
+        "not_found_count": 0,
+        "setup_pending_count": 0,
+    }
+    if explicit_no_results:
+        conn = connect(config.DB_PATH)
+        try:
+            existing_listing_counts = db_layer.get_relevant_listing_counts_for_search(conn, area_id)
+        finally:
+            conn.close()
+        if int(existing_listing_counts.get("total_count") or 0) > 0:
+            reconciliation_reason = "trusted_no_results_with_existing_listings"
+            retry_after_seconds = int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
+            conn = connect(config.DB_PATH)
+            try:
+                upsert_area_monitoring_state(
+                    conn,
+                    area_id,
+                    setup_status="preparing",
+                    module1_status="retry_wait",
+                    module3_status="pending",
+                    module2_status="pending",
+                    last_error=(
+                        f"{reconciliation_reason}: total={existing_listing_counts['total_count']} "
+                        f"active={existing_listing_counts['active_count']} "
+                        f"not_found={existing_listing_counts['not_found_count']} "
+                        f"setup_pending={existing_listing_counts['setup_pending_count']}"
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            _log_baseline_scan_result(
+                on_log,
+                search_id=area_id,
+                user_area_id=None,
+                scan_status=scan_status,
+                trusted_scan=True,
+                stop_reason=reconciliation_reason,
+                rows_scraped=0,
+                rows_accepted=0,
+                rows_rejected=0,
+                pages_checked=scan_result.get("pages_checked"),
+                total_pages_detected=scan_result.get("total_pages_detected"),
+                current_url_matches_target=True,
+                ingest_allowed=False,
+                detail_job_enqueued=False,
+            )
+            return {
+                "status": "retry_wait_reconciliation_required",
+                "reason": reconciliation_reason,
+                "retry_after_seconds": retry_after_seconds,
+                "area_id": area_id,
+                "scan_status": scan_status,
+                "trusted_scan": True,
+                "stop_reason": reconciliation_reason,
+                "page_state": page_state or None,
+                "pages_checked": scan_result.get("pages_checked"),
+                "total_pages_detected": scan_result.get("total_pages_detected"),
+                "current_url": scan_result.get("current_url"),
+                "current_url_matches_target": True,
+                "rows_scraped": 0,
+                "rows_accepted": 0,
+                "rows_rejected": 0,
+                "ingest_allowed": False,
+                "detail_job_enqueued": False,
+                "existing_listing_counts": existing_listing_counts,
+            }
 
     if getattr(cancel_token, "is_set", lambda: False)():
         return {"status": "cancelled", "area_id": area_id}
@@ -820,11 +917,12 @@ def baseline_setup_area(
         "rows_scraped": len(rows_scraped),
         "rows_accepted": len(rows1),
         "rows_rejected": rows_rejected,
-        "area_rejection_reasons": guard.get("rejection_reasons") or {},
+        "area_rejection_reasons": scan_evaluation["area_rejection_reasons"],
         "ingest_allowed": bool(rows1),
         "detail_job_enqueued": detail_job_enqueued,
         "empty_market": explicit_no_results,
         "completed_empty": explicit_no_results,
+        "existing_listing_counts": existing_listing_counts,
     }
 
 

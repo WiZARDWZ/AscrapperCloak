@@ -1114,6 +1114,40 @@ def get_existing_external_ids_for_search(conn, search_url: str) -> set[str]:
     return {str(r[0]).strip() for r in cur.fetchall() if r and r[0] is not None}
 
 
+def get_relevant_listing_counts_for_search(conn, search_id: int) -> dict[str, int]:
+    """Return read-only listing-state counts used to validate an empty baseline."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            COUNT(1) AS total_count,
+            SUM(CASE
+                    WHEN LOWER(COALESCE(ListingLifecycleStatus, Status, 'active'))='active'
+                    THEN 1 ELSE 0
+                END) AS active_count,
+            SUM(CASE
+                    WHEN LOWER(COALESCE(ListingLifecycleStatus, Status, '')) IN ('not_found','missing')
+                    THEN 1 ELSE 0
+                END) AS not_found_count,
+            SUM(CASE
+                    WHEN LOWER(COALESCE(SetupDetailStatus, 'pending'))
+                         IN ('pending','running','detail_retry_wait','detail_partial_complete')
+                    THEN 1 ELSE 0
+                END) AS setup_pending_count
+        FROM dbo.ListingSearchState
+        WHERE SearchID=?
+        """,
+        int(search_id),
+    )
+    row = cur.fetchone()
+    return {
+        "total_count": int(row[0] or 0) if row else 0,
+        "active_count": int(row[1] or 0) if row else 0,
+        "not_found_count": int(row[2] or 0) if row else 0,
+        "setup_pending_count": int(row[3] or 0) if row else 0,
+    }
+
+
 def get_latest_listing_state(conn, external_id: str) -> dict | None:
     cur = conn.cursor()
     row = _one(cur, """

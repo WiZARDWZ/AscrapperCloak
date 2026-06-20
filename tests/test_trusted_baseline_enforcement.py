@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import threading
 from unittest import mock
 
 import pytest
 
 import monitor
+import module1_list_scraper
 from realestate_errors import RealEstateBlockedError
+from tools import verify_trusted_baseline_scan
 
 
 TARGET_URL = "https://www.realestate.com.au/buy/in-yadboro,+nsw+2539/list-1"
@@ -73,6 +76,16 @@ def _patch_baseline(monkeypatch, scan_result, *, detail_results=None):
         monitor.db_layer,
         "mark_search_baseline_completed",
         lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        monitor.db_layer,
+        "get_relevant_listing_counts_for_search",
+        lambda conn, search_id: {
+            "total_count": 0,
+            "active_count": 0,
+            "not_found_count": 0,
+            "setup_pending_count": 0,
+        },
     )
     monkeypatch.setattr(
         monitor.db_layer,
@@ -195,6 +208,57 @@ def test_trusted_explicit_no_results_advances_without_zero_full_scan(monkeypatch
     assert _calls(calls, "state")[-1][2]["setup_status"] == "preparing"
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"total_count": 2, "active_count": 2, "not_found_count": 0, "setup_pending_count": 0},
+        {"total_count": 3, "active_count": 0, "not_found_count": 0, "setup_pending_count": 3},
+        {"total_count": 1, "active_count": 0, "not_found_count": 1, "setup_pending_count": 0},
+    ],
+)
+def test_trusted_no_results_with_existing_listing_state_requires_reconciliation(monkeypatch, counts):
+    calls = _patch_baseline(
+        monkeypatch,
+        _scan([], scan_status="valid_empty_result", stop_reason="no_results", page_state="no_results", total_pages_detected=None),
+    )
+    monkeypatch.setattr(
+        monitor.db_layer,
+        "get_relevant_listing_counts_for_search",
+        lambda conn, search_id: dict(counts),
+    )
+
+    out = monitor.baseline_setup_area(TARGET_URL)
+
+    assert out["status"] == "retry_wait_reconciliation_required"
+    assert out["reason"] == "trusted_no_results_with_existing_listings"
+    assert out["existing_listing_counts"] == counts
+    assert _calls(calls, "ingest") == []
+    assert _calls(calls, "baseline_completed") == []
+    assert _calls(calls, "detail_job") == []
+    assert _calls(calls, "state")[-1][2]["module1_status"] == "retry_wait"
+
+
+def test_trusted_no_results_reconciliation_rerun_is_idempotent(monkeypatch):
+    calls = _patch_baseline(
+        monkeypatch,
+        _scan([], scan_status="valid_empty_result", stop_reason="no_results", page_state="no_results", total_pages_detected=None),
+    )
+    counts = {"total_count": 4, "active_count": 2, "not_found_count": 1, "setup_pending_count": 1}
+    monkeypatch.setattr(
+        monitor.db_layer,
+        "get_relevant_listing_counts_for_search",
+        lambda conn, search_id: dict(counts),
+    )
+
+    first = monitor.baseline_setup_area(TARGET_URL)
+    second = monitor.baseline_setup_area(TARGET_URL)
+
+    assert first["status"] == second["status"] == "retry_wait_reconciliation_required"
+    assert _calls(calls, "ingest") == []
+    assert _calls(calls, "baseline_completed") == []
+    assert _calls(calls, "detail_job") == []
+
+
 def test_trusted_rerun_dedupes_active_detail_job_and_never_emits_events(monkeypatch):
     calls = _patch_baseline(monkeypatch, _scan([_row("401")]), detail_results=[{"created": True}, {"created": False, "duplicate": True}])
 
@@ -226,19 +290,94 @@ def test_untrusted_reruns_preserve_listing_lifecycle(monkeypatch):
 
 def test_scrape_search_with_result_keeps_legacy_list_contract(monkeypatch):
     rows = [_row("601")]
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", mock.Mock(return_value=rows))
-    monitor.module1_list_scraper.scrape_search.last_result = {
-        "scan_status": "ok",
-        "trusted_scan": True,
-        "stop_reason": "max_pages_reached",
-        "pages_checked": 50,
-        "total_pages_detected": 60,
-        "current_url": TARGET_URL,
-        "page_state": "listings",
-    }
+    def fake_scrape(*args, _result_sink=None, **kwargs):
+        _result_sink["result"] = {
+            "scan_status": "ok",
+            "trusted_scan": True,
+            "stop_reason": "max_pages_reached",
+            "pages_checked": 50,
+            "total_pages_detected": 60,
+            "current_url": TARGET_URL,
+            "page_state": "listings",
+        }
+        return rows
+
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", fake_scrape)
 
     result = monitor.module1_list_scraper.scrape_search_with_result(TARGET_URL, max_pages=50)
 
     assert result["rows"] == rows
     assert result["trusted_scan"] is True
     assert result["stop_reason"] == "max_pages_reached"
+
+
+def test_scrape_search_with_result_metadata_is_invocation_local_under_interleaving(monkeypatch):
+    barrier = threading.Barrier(2)
+
+    def fake_scrape(base_url, *args, _result_sink=None, **kwargs):
+        marker = "first" if "first" in base_url else "second"
+        metadata = {
+            "scan_status": "ok",
+            "trusted_scan": True,
+            "stop_reason": marker,
+            "pages_checked": 1,
+            "total_pages_detected": 1,
+            "current_url": base_url,
+            "page_state": "listings",
+        }
+        _result_sink["result"] = dict(metadata)
+        fake_scrape.last_result = {
+            **metadata,
+            "stop_reason": "other_invocation_overwrote_global",
+        }
+        barrier.wait(timeout=5)
+        return [_row(marker)]
+
+    fake_scrape.last_result = {}
+    monkeypatch.setattr(module1_list_scraper, "scrape_search", fake_scrape)
+    results = {}
+
+    def run(name):
+        results[name] = module1_list_scraper.scrape_search_with_result(
+            f"https://www.realestate.com.au/buy/in-{name},+nsw+2539/list-1"
+        )
+
+    threads = [threading.Thread(target=run, args=("first",)), threading.Thread(target=run, args=("second",))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert results["first"]["stop_reason"] == "first"
+    assert results["second"]["stop_reason"] == "second"
+    assert results["first"]["current_url"].endswith("/buy/in-first,+nsw+2539/list-1")
+    assert results["second"]["current_url"].endswith("/buy/in-second,+nsw+2539/list-1")
+
+
+def test_read_only_verification_tool_never_calls_mutation_boundaries(monkeypatch):
+    rows = [_row("701")]
+    monkeypatch.setattr(
+        verify_trusted_baseline_scan.module1_list_scraper,
+        "scrape_search_with_result",
+        lambda *args, **kwargs: _scan(rows),
+    )
+    forbidden = [
+        mock.patch.object(monitor, "ingest_full_rows", side_effect=AssertionError("must not ingest")),
+        mock.patch.object(monitor, "upsert_area_monitoring_state", side_effect=AssertionError("must not mutate setup state")),
+        mock.patch.object(monitor, "activate_area_subscriptions", side_effect=AssertionError("must not activate")),
+        mock.patch.object(monitor.db_layer, "enqueue_setup_detail_baseline_job", side_effect=AssertionError("must not enqueue")),
+        mock.patch.object(monitor, "mark_events_sent", side_effect=AssertionError("must not mutate notifications")),
+    ]
+
+    with forbidden[0] as ingest, forbidden[1] as state, forbidden[2] as activate, forbidden[3] as enqueue, forbidden[4] as notifications:
+        result = verify_trusted_baseline_scan.verify_trusted_baseline_scan(search_url=TARGET_URL)
+
+    assert result["trusted_scan"] is True
+    assert result["ingest_allowed"] is True
+    assert result["detail_job_enqueued"] is False
+    assert result["database_mutated"] is False
+    ingest.assert_not_called()
+    state.assert_not_called()
+    activate.assert_not_called()
+    enqueue.assert_not_called()
+    notifications.assert_not_called()

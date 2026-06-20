@@ -1086,6 +1086,7 @@ def test_baseline_true_no_results_keeps_setup_preparing_and_notifications_disabl
     monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("trusted zero result must not mutate existing lifecycle")))
     monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
     monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    monkeypatch.setattr(monitor.db_layer, "get_relevant_listing_counts_for_search", lambda conn, search_id: {"total_count": 0, "active_count": 0, "not_found_count": 0, "setup_pending_count": 0})
     target_url = "https://www.realestate.com.au/buy/in-empty,+nsw+2999/list-1"
     monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
         "rows": [],

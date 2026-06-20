@@ -1215,7 +1215,24 @@ def _module1_scan_metadata(
     }
 
 
-def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, on_log=None, on_progress=None):
+def _publish_module1_scan_result(metadata: dict, result_sink: dict | None = None) -> dict:
+    """Publish legacy diagnostics and an invocation-local immutable snapshot."""
+    snapshot = dict(metadata)
+    scrape_search.last_result = snapshot
+    if result_sink is not None:
+        result_sink["result"] = dict(snapshot)
+    return snapshot
+
+
+def scrape_search(
+    base_url: str,
+    max_pages=None,
+    timeout=25,
+    cancel_token=None,
+    on_log=None,
+    on_progress=None,
+    _result_sink: dict | None = None,
+):
     """
     max_pages:
       - None  => تا آخرین صفحه می‌رود
@@ -1228,13 +1245,16 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
     rotations_used = 0
     session_health = BrowserSessionHealth(module_name="Module1")
     recovery_policy = RecoveryPolicy()
-    scrape_search.last_result = _module1_scan_metadata(
-        status="running",
-        rows=0,
-        stop_reason=None,
-        page_state=None,
-        trusted_scan=False,
-        scan_status="running",
+    _publish_module1_scan_result(
+        _module1_scan_metadata(
+            status="running",
+            rows=0,
+            stop_reason=None,
+            page_state=None,
+            trusted_scan=False,
+            scan_status="running",
+        ),
+        _result_sink,
     )
 
     def log(msg: str) -> None:
@@ -1371,49 +1391,58 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                         log_session_health(session_health, url_type="list", page_state=state_result.state, action="retry_wait", log_func=log)
                         if not all_rows:
                             raise RealEstateBlockedError(reason, retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
-                        scrape_search.last_result = _module1_scan_metadata(
-                            status="partial_blocked",
-                            scan_status="partial_blocked",
-                            trusted_scan=False,
-                            rows=len(all_rows),
-                            stop_reason=state_result.state,
-                            page_state=state_result.state,
-                            pages_checked=page,
-                            total_pages_detected=total_pages,
-                            current_url=state_result.current_url or _current_url(driver) or url,
-                            blocked_reason=state_result.state,
-                            retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                        _publish_module1_scan_result(
+                            _module1_scan_metadata(
+                                status="partial_blocked",
+                                scan_status="partial_blocked",
+                                trusted_scan=False,
+                                rows=len(all_rows),
+                                stop_reason=state_result.state,
+                                page_state=state_result.state,
+                                pages_checked=page,
+                                total_pages_detected=total_pages,
+                                current_url=state_result.current_url or _current_url(driver) or url,
+                                blocked_reason=state_result.state,
+                                retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                            ),
+                            _result_sink,
                         )
                         return all_rows
                 elif state_result.state == PageState.NO_RESULTS:
                     log("No results page detected. Stop.")
-                    scrape_search.last_result = _module1_scan_metadata(
-                        status="no_results",
-                        scan_status="valid_empty_result" if not all_rows else "ok",
-                        trusted_scan=True,
-                        rows=len(all_rows),
-                        stop_reason="no_results",
-                        page_state=state_result.state,
-                        pages_checked=page,
-                        total_pages_detected=total_pages,
-                        current_url=state_result.current_url or _current_url(driver) or url,
+                    _publish_module1_scan_result(
+                        _module1_scan_metadata(
+                            status="no_results",
+                            scan_status="valid_empty_result" if not all_rows else "ok",
+                            trusted_scan=True,
+                            rows=len(all_rows),
+                            stop_reason="no_results",
+                            page_state=state_result.state,
+                            pages_checked=page,
+                            total_pages_detected=total_pages,
+                            current_url=state_result.current_url or _current_url(driver) or url,
+                        ),
+                        _result_sink,
                     )
                     return all_rows
                 else:
                     log(f"Page render not usable state={state_result.state} reason={state_result.reason}. Stop.")
-                    scrape_search.last_result = {
-                        "status": "render_timeout",
-                        "scan_status": "technical_failure",
-                        "trusted_scan": False,
-                        "rows": len(all_rows),
-                        "stop_reason": state_result.state if state_result.state != PageState.UNKNOWN else "render_timeout",
-                        "page_state": state_result.state,
-                        "pages_checked": page,
-                        "total_pages_detected": total_pages,
-                        "current_url": state_result.current_url or _current_url(driver) or url,
-                        "blocked_reason": None,
-                        "retry_after_seconds": int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)),
-                    }
+                    _publish_module1_scan_result(
+                        _module1_scan_metadata(
+                            status="render_timeout",
+                            scan_status="technical_failure",
+                            trusted_scan=False,
+                            rows=len(all_rows),
+                            stop_reason=state_result.state if state_result.state != PageState.UNKNOWN else "render_timeout",
+                            page_state=state_result.state,
+                            pages_checked=page,
+                            total_pages_detected=total_pages,
+                            current_url=state_result.current_url or _current_url(driver) or url,
+                            blocked_reason=None,
+                            retry_after_seconds=int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)),
+                        ),
+                        _result_sink,
+                    )
                     return all_rows
                 save_results(all_rows, out_dir=config.OUTPUT_DIR)
                 log_session_health(session_health, url_type="list", page_state=state_result.state, action="rotate_profile", log_func=log)
@@ -1431,18 +1460,21 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     if not all_rows:
                         raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
                     log("Module1 recovery rotation limit reached. Returning partial rows gracefully.")
-                    scrape_search.last_result = _module1_scan_metadata(
-                        status="partial_blocked",
-                        scan_status="partial_blocked",
-                        trusted_scan=False,
-                        rows=len(all_rows),
-                        stop_reason=state_result.state,
-                        page_state=state_result.state,
-                        pages_checked=page,
-                        total_pages_detected=total_pages,
-                        current_url=state_result.current_url or _current_url(driver) or url,
-                        blocked_reason=state_result.state,
-                        retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                    _publish_module1_scan_result(
+                        _module1_scan_metadata(
+                            status="partial_blocked",
+                            scan_status="partial_blocked",
+                            trusted_scan=False,
+                            rows=len(all_rows),
+                            stop_reason=state_result.state,
+                            page_state=state_result.state,
+                            pages_checked=page,
+                            total_pages_detected=total_pages,
+                            current_url=state_result.current_url or _current_url(driver) or url,
+                            blocked_reason=state_result.state,
+                            retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                        ),
+                        _result_sink,
                     )
                     return all_rows
                 session_health.record_rotation(_module1_recovery_reason(driver, state_result, navigation_info))
@@ -1451,18 +1483,21 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
                     if not all_rows:
                         raise RealEstateBlockedError(_module1_recovery_reason(driver, state_result, navigation_info), retry_after_seconds=getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
                     log("Module1 page retry limit after recovery reached. Returning partial rows gracefully.")
-                    scrape_search.last_result = _module1_scan_metadata(
-                        status="partial_blocked",
-                        scan_status="partial_blocked",
-                        trusted_scan=False,
-                        rows=len(all_rows),
-                        stop_reason=state_result.state,
-                        page_state=state_result.state,
-                        pages_checked=page,
-                        total_pages_detected=total_pages,
-                        current_url=state_result.current_url or _current_url(driver) or url,
-                        blocked_reason=state_result.state,
-                        retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                    _publish_module1_scan_result(
+                        _module1_scan_metadata(
+                            status="partial_blocked",
+                            scan_status="partial_blocked",
+                            trusted_scan=False,
+                            rows=len(all_rows),
+                            stop_reason=state_result.state,
+                            page_state=state_result.state,
+                            pages_checked=page,
+                            total_pages_detected=total_pages,
+                            current_url=state_result.current_url or _current_url(driver) or url,
+                            blocked_reason=state_result.state,
+                            retry_after_seconds=int(getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)),
+                        ),
+                        _result_sink,
                     )
                     return all_rows
                 navigation_info = _last_navigation(driver)
@@ -1584,20 +1619,23 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
         stop_reason = terminal_stop_reason or "completed"
         trusted_scan = bool(all_rows) and stop_reason not in {"cancelled", "redirected_back", "no_cards_timeout"}
-        scrape_search.last_result = _module1_scan_metadata(
-            status="completed" if trusted_scan else stop_reason,
-            scan_status="ok" if trusted_scan else ("cancelled" if stop_reason == "cancelled" else "technical_failure"),
-            trusted_scan=trusted_scan,
-            rows=len(all_rows),
-            stop_reason=stop_reason,
-            page_state=PageState.LISTINGS if all_rows else None,
-            pages_checked=max([int(item.get("page") or 0) for item in page_stats] or [0]),
-            total_pages_detected=total_pages,
-            current_url=_current_url(driver) or (page_stats[-1].get("url") if page_stats else None),
-            retry_after_seconds=int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)) if not trusted_scan and stop_reason != "cancelled" else None,
-            pagination_nav_mode=nav_mode,
-            fallback_paths=fallback_paths,
-            page_stats=page_stats,
+        _publish_module1_scan_result(
+            _module1_scan_metadata(
+                status="completed" if trusted_scan else stop_reason,
+                scan_status="ok" if trusted_scan else ("cancelled" if stop_reason == "cancelled" else "technical_failure"),
+                trusted_scan=trusted_scan,
+                rows=len(all_rows),
+                stop_reason=stop_reason,
+                page_state=PageState.LISTINGS if all_rows else None,
+                pages_checked=max([int(item.get("page") or 0) for item in page_stats] or [0]),
+                total_pages_detected=total_pages,
+                current_url=_current_url(driver) or (page_stats[-1].get("url") if page_stats else None),
+                retry_after_seconds=int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)) if not trusted_scan and stop_reason != "cancelled" else None,
+                pagination_nav_mode=nav_mode,
+                fallback_paths=fallback_paths,
+                page_stats=page_stats,
+            ),
+            _result_sink,
         )
         return all_rows
 
@@ -1614,15 +1652,48 @@ def scrape_search(base_url: str, max_pages=None, timeout=25, cancel_token=None, 
 
 def scrape_search_with_result(base_url: str, max_pages=None, timeout=25, cancel_token=None, on_log=None, on_progress=None) -> dict:
     """Return rows and terminal metadata while preserving scrape_search's list contract."""
-    rows = scrape_search(
-        base_url,
-        max_pages=max_pages,
-        timeout=timeout,
-        cancel_token=cancel_token,
-        on_log=on_log,
-        on_progress=on_progress,
-    )
-    metadata = dict(getattr(scrape_search, "last_result", {}) or {})
+    invocation_result: dict = {}
+    try:
+        rows = scrape_search(
+            base_url,
+            max_pages=max_pages,
+            timeout=timeout,
+            cancel_token=cancel_token,
+            on_log=on_log,
+            on_progress=on_progress,
+            _result_sink=invocation_result,
+        )
+    except RealEstateBlockedError as exc:
+        reason_text = str(getattr(exc, "reason", None) or exc).lower()
+        if "http_429" in reason_text or "429" in reason_text:
+            blocked_reason = PageState.BLOCKED_HTTP_429
+        elif "kpsdk" in reason_text:
+            blocked_reason = PageState.BLOCKED_KPSDK
+        elif "access" in reason_text:
+            blocked_reason = PageState.BLOCKED_ACCESS_DENIED
+        else:
+            blocked_reason = "blocked_rate_limited"
+        metadata = dict(invocation_result.get("result") or {})
+        metadata.update(
+            {
+                "status": "blocked",
+                "scan_status": "blocked_rate_limited",
+                "trusted_scan": False,
+                "rows": 0,
+                "stop_reason": blocked_reason,
+                "page_state": blocked_reason,
+                "blocked_reason": blocked_reason,
+                "retry_after_seconds": int(
+                    getattr(exc, "retry_after_seconds", None)
+                    or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)
+                ),
+            }
+        )
+        rows = []
+        invocation_result["result"] = metadata
+    metadata = dict(invocation_result.get("result") or {})
+    if not metadata:
+        raise RuntimeError("Module1 invocation completed without invocation-local scan metadata")
     return {
         "rows": list(rows or []),
         "scan_status": metadata.get("scan_status") or metadata.get("status") or "unknown",
