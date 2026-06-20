@@ -1045,6 +1045,12 @@ def test_run_next_job_once_does_not_leave_job_running_on_handled_exception(monke
     assert stored["Status"] != "running"
 
 
+def test_telegram_worker_keeps_sync_browser_jobs_off_the_asyncio_loop():
+    source = Path("telegram_bot.py").read_text(encoding="utf-8")
+
+    assert "await asyncio.to_thread(run_next_job_once, worker_id=worker_id, send_telegram=True)" in source
+
+
 
 def test_production_area_setup_status_writes_use_supported_contract():
     import re
