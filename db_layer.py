@@ -2978,6 +2978,34 @@ def _active_subscription_status_sql() -> str:
     return "'active','preparing'"
 
 
+
+def normalize_inactive_area_state(conn, search_id: int, reason: str = INACTIVE_AREA_REASON_NO_SUBSCRIBERS) -> None:
+    """Put inactive area modules into terminal/inactive state without deleting history."""
+    upsert_area_monitoring_state(
+        conn, int(search_id), setup_status="inactive", module1_status="inactive", module3_status="inactive", module2_status="inactive",
+        last_error=config.mask_sensitive_text(reason), set_deactivated=True, deactivated_reason=reason, last_subscription_count=0,
+    )
+
+
+def area_job_eligibility(conn, search_id: int | None, job_type: str | None = None, setup_started_at=None) -> dict:
+    """Shared pre-flight guard for area-scoped jobs before launching browser work."""
+    if search_id is None:
+        return {"eligible": True, "reason": "global_job"}
+    sid = int(search_id)
+    state = get_area_monitoring_state(conn, sid) or {}
+    active_count = count_active_subscriptions_for_area(conn, search_id=sid)
+    setup_status = str(state.get("setup_status") or "not_started").lower()
+    if active_count <= 0 or setup_status == "inactive":
+        cancelled = cancel_jobs_for_inactive_area(conn, search_id=sid, reason=INACTIVE_AREA_REASON_NO_SUBSCRIBERS)
+        normalize_inactive_area_state(conn, sid, reason=INACTIVE_AREA_REASON_NO_SUBSCRIBERS)
+        return {"eligible": False, "reason": "area_inactive_or_no_active_subscriptions", "cancelled_jobs": cancelled, "active_subscription_count": active_count, "setup_status": "inactive"}
+    if setup_started_at is not None:
+        subs = get_active_user_area_subscriptions_for_search(conn, sid)
+        current_starts = {str(sub.get("DetailBaselineStartedAt") or sub.get("BaselineStartedAt") or "") for sub in subs}
+        if str(setup_started_at) not in current_starts:
+            return {"eligible": False, "reason": "stale_setup_run", "active_subscription_count": active_count, "setup_status": setup_status}
+    return {"eligible": True, "reason": "eligible", "active_subscription_count": active_count, "setup_status": setup_status}
+
 def count_active_subscriptions_for_area(conn, area_id: int | None = None, search_id: int | None = None) -> int:
     """Count active/preparing subscriptions for one shared SearchID/area_id."""
     ensure_telegram_bot_tables(conn)
@@ -3021,7 +3049,7 @@ def cancel_jobs_for_inactive_area(conn, area_id: int | None = None, search_id: i
             UpdatedAt=SYSDATETIME(),
             LastError=?
         WHERE SearchID=?
-          AND Status IN ('pending','paused','queued','retry_wait','scheduled')
+          AND Status IN ('pending','paused','queued','retry_wait','scheduled','running')
         """, f"cancelled because area has no active subscribers: {safe_reason}", resolved_id)
     try:
         return int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0)
@@ -3042,18 +3070,7 @@ def deactivate_area_if_unused(conn, area_id: int | None = None, search_id: int |
             "action": "kept_active",
             "cancelled_jobs": 0,
         }
-    upsert_area_monitoring_state(
-        conn,
-        resolved_id,
-        setup_status="inactive",
-        module1_status=None,
-        module3_status=None,
-        module2_status=None,
-        last_error=None,
-        set_deactivated=True,
-        deactivated_reason=reason,
-        last_subscription_count=0,
-    )
+    normalize_inactive_area_state(conn, resolved_id, reason=reason)
     cur = conn.cursor()
     cur.execute("""
         UPDATE dbo.user_area_subscription_state
@@ -3216,7 +3233,7 @@ def cancel_setup_phase_jobs_for_search(conn, search_id: int, reason: str = "setu
             LastError=?
         WHERE SearchID=?
           AND JobType IN ('setup_detail_baseline','setup_price_baseline')
-          AND Status IN ('pending','paused','queued','retry_wait','scheduled')
+          AND Status IN ('pending','paused','queued','retry_wait','scheduled','running')
         """,
         safe_reason,
         int(search_id),

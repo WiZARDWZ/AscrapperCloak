@@ -1558,13 +1558,15 @@ def enrich_detail_rows(
                 log,
             )
             if not ok:
-                if isinstance(err, RealEstateBlockedError) and any(token in str(err).lower() for token in ("429", "http_response_code_failure", "http_error_429", "temporarily blocked")):
-                    if on_row_blocked:
-                        try:
-                            on_row_blocked(dict(merged), err)
-                        except Exception:
-                            pass
-                    raise err
+                if isinstance(err, RealEstateBlockedError):
+                    should_abort_batch = on_row_blocked is None or any(token in str(err).lower() for token in ("429", "http_response_code_failure", "http_error_429", "temporarily blocked", "kpsdk", "blocked"))
+                    if should_abort_batch:
+                        if on_row_blocked:
+                            try:
+                                on_row_blocked(dict(merged), err)
+                            except Exception:
+                                pass
+                        raise err
                 _mark_detail_failure(merged, "get_failed")
                 enriched.append(merged)
                 continue

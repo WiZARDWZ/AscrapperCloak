@@ -132,6 +132,9 @@ def get_authorized_export_area(telegram_user_id: int, user_area_id: int) -> dict
 
 def current_setup_readiness(area: dict) -> dict:
     """Return whether the current active subscription/setup run is eligible for final Excel export."""
+    readiness_keys = {"AreaSetupStatus", "BaselineStatus", "DetailBaselineStatus", "PriceBaselineStatus", "NotificationReadyAt"}
+    if not any(key in area for key in readiness_keys):
+        return {"ready": True, "reasons": ["legacy_area_without_setup_fields"]}
     area_status = str(area.get("AreaSetupStatus") or "").lower()
     baseline = str(area.get("BaselineStatus") or "pending").lower()
     detail = str(area.get("DetailBaselineStatus") or "pending").lower()

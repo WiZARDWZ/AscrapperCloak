@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import types
 from datetime import datetime, timedelta
@@ -2359,3 +2360,48 @@ def test_last_subscriber_removal_cancels_jobs_and_keeps_history(monkeypatch):
     assert out["cancelled_jobs"] == 3
     assert ("cancel_jobs", 88) in calls
     assert not any("DELETE FROM dbo.Listing" in call[1] for call in calls if call[0] == "sql")
+
+
+def test_canonical_detail_batch_size_is_75_and_alias_validated():
+    import inspect
+    source = inspect.getsource(monitoring_scheduler.config)
+    assert 'BASELINE_DETAIL_BATCH_SIZE = int(_BASELINE_DETAIL_BATCH_ENV or _SETUP_DETAIL_BATCH_ENV or "75")' in source
+    assert 'SETUP_DETAIL_BATCH_SIZE = BASELINE_DETAIL_BATCH_SIZE' in source
+
+
+def test_execute_job_inactive_area_cancels_before_browser_launch(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler, "_area_job_eligibility", lambda search_id, job_type=None: {"eligible": False, "reason": "area_inactive_or_no_active_subscriptions"})
+
+    out = monitoring_scheduler.execute_job({"JobID": 7, "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "SearchID": 44}, send_telegram=False)
+
+    assert out["status"] == "cancelled"
+    assert out["reason"] == "area_inactive_or_no_active_subscriptions"
+
+
+def test_cloak_profile_lock_blocks_live_owner_and_releases(tmp_path):
+    from cloak_browser_helper import BrowserProfileInUseError, CloakProfileLock
+
+    profile = tmp_path / "rea_profile"
+    profile.mkdir()
+    with CloakProfileLock(str(profile), job_id=1, search_id=2):
+        try:
+            with CloakProfileLock(str(profile), job_id=3, search_id=2):
+                raise AssertionError("second lock should not be acquired")
+        except BrowserProfileInUseError:
+            pass
+    with CloakProfileLock(str(profile), job_id=4, search_id=2):
+        pass
+
+
+def test_cloak_headed_missing_display_is_configuration_error(monkeypatch, tmp_path):
+    from cloak_browser_helper import BrowserConfigurationError, validate_cloak_runtime
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    if os.name == "nt":
+        return
+    try:
+        validate_cloak_runtime(str(tmp_path), {"headless": False})
+    except BrowserConfigurationError as exc:
+        assert "DISPLAY" in str(exc)
+    else:
+        raise AssertionError("missing DISPLAY should fail before launch")
