@@ -2405,3 +2405,130 @@ def test_cloak_headed_missing_display_is_configuration_error(monkeypatch, tmp_pa
         assert "DISPLAY" in str(exc)
     else:
         raise AssertionError("missing DISPLAY should fail before launch")
+
+
+def test_running_job_cancelled_during_worker_success_is_not_marked_succeeded(monkeypatch):
+    job_queue.enable_in_memory_store()
+    job = job_queue.enqueue_job(job_queue.JOB_TYPE_BASELINE_SETUP_AREA, search_id=91, payload={"search_url": "url"}, max_attempts=3)
+    enqueued_next = []
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: enqueued_next.append(k) or {"created": True})
+
+    def fake_execute(claimed, send_telegram=True):
+        job_queue.mark_job_cancelled(claimed["JobID"], "last subscriber removed")
+        return {"status": "ready", "area_id": 91}
+
+    monkeypatch.setattr(monitoring_scheduler, "execute_job", fake_execute)
+    out = monitoring_scheduler.run_next_job_once(worker_id="race-test", send_telegram=False)
+    stored = job_queue._TEST_STORE[0]
+
+    assert stored["Status"] == "cancelled"
+    assert out["finalizer_applied"] is False
+    assert out["finalizer"]["current_status"] == "cancelled"
+    assert enqueued_next == []
+
+
+def test_trusted_wrong_suburb_empty_baseline_marks_ready_without_ingest_or_detail(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("wrong-suburb rows must not persist")))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("detail must be skipped for empty exact-area baseline")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "trusted_empty_exact_area", "trusted_scan": True, "rows_area_rejected": 26, "stop_reason": "wrong_suburb_same_postcode"}
+
+    out = monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+
+    assert out["status"] == "ready"
+    assert out["completed_empty"] is True
+    assert out["detail_batches_enqueued"] == 0
+    assert out["price_setup_enqueued"] is False
+    assert ("activate", 77) in calls
+    state_call = [call for call in calls if call[0] == "state"][-1]
+    assert state_call[2]["active_listing_count"] == 0
+
+
+def test_blocked_zero_rows_does_not_become_trusted_empty(monkeypatch):
+    import monitor
+
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda *a, **k: None)
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda *a, **k: (_ for _ in ()).throw(AssertionError("blocked page must not activate")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "partial_blocked", "trusted_scan": False, "stop_reason": "blocked_kpsdk"}
+
+    with pytest.raises(RuntimeError):
+        monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+
+
+def test_cloak_partial_initialization_failures_cleanup_lock(monkeypatch, tmp_path):
+    import sys
+    import types
+    import cloak_browser_helper as cbh
+
+    class ClosingContext:
+        def __init__(self, mode):
+            self.mode = mode
+            self.closed = False
+        @property
+        def pages(self):
+            if self.mode == "pages_fail":
+                raise RuntimeError("pages failed")
+            return []
+        def new_page(self):
+            if self.mode == "new_page_fail":
+                raise RuntimeError("new_page failed")
+            return object()
+        def close(self):
+            self.closed = True
+
+    original_driver_cls = cbh.CloakDriver
+    for mode in ["launch_fail", "pages_fail", "new_page_fail", "driver_fail", "timeout_fail"]:
+        profile = tmp_path / mode
+        context_holder = {}
+        def launch(profile_dir, **kwargs):
+            if mode == "launch_fail":
+                raise RuntimeError("launch failed")
+            ctx = ClosingContext(mode)
+            context_holder["ctx"] = ctx
+            return ctx
+        monkeypatch.setitem(sys.modules, "cloakbrowser", types.SimpleNamespace(launch_persistent_context=launch))
+        if mode == "driver_fail":
+            monkeypatch.setattr(cbh, "CloakDriver", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("driver failed")))
+        elif mode == "timeout_fail":
+            class BadTimeoutDriver:
+                def __init__(self, context, page, profile_dir, temp_profile=False):
+                    self.context = context
+                    self.profile_dir = profile_dir
+                    self._temp_profile = temp_profile
+                    self._profile_lock = None
+                def set_page_load_timeout(self, value):
+                    raise RuntimeError("timeout failed")
+                def quit(self):
+                    self.context.close()
+                    if self._profile_lock:
+                        self._profile_lock.__exit__(None, None, None)
+            monkeypatch.setattr(cbh, "CloakDriver", BadTimeoutDriver)
+        else:
+            monkeypatch.setattr(cbh, "CloakDriver", original_driver_cls)
+        with pytest.raises(RuntimeError):
+            cbh.build_cloak_driver(profile_dir_override=str(profile))
+        if "ctx" in context_holder:
+            assert context_holder["ctx"].closed is True
+        assert not (profile / ".ascrapper_profile.lock").exists()
+        with cbh.CloakProfileLock(str(profile)):
+            pass

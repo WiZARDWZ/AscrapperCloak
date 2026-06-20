@@ -654,28 +654,38 @@ def build_cloak_driver(profile_dir_override: str | None = None) -> CloakDriver:
         )
     )
     profile_lock = None
+    context = None
+    driver = None
     try:
         if getattr(config, "CLOAK_USE_PERSISTENT_CONTEXT", True) and not temp_profile:
             profile_lock = CloakProfileLock(profile_dir).__enter__()
-        context = launch_persistent_context(profile_dir, **launch_kwargs)
-    except TypeError as exc:
-        if profile_lock is not None:
-            profile_lock.__exit__(None, None, None)
-        raise RuntimeError(
-            "Installed cloakbrowser.launch_persistent_context rejected the configured launch options. "
-            "Upgrade cloakbrowser or unset unsupported CLOAK_* options."
-        ) from exc
+        try:
+            context = launch_persistent_context(profile_dir, **launch_kwargs)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Installed cloakbrowser.launch_persistent_context rejected the configured launch options. "
+                "Upgrade cloakbrowser or unset unsupported CLOAK_* options."
+            ) from exc
+        pages_attr = getattr(context, "pages", [])
+        pages = pages_attr() if callable(pages_attr) else pages_attr
+        page = pages[0] if pages else context.new_page()
+        driver = CloakDriver(context=context, page=page, profile_dir=profile_dir, temp_profile=temp_profile)
+        driver._profile_lock = profile_lock
+        profile_lock = None
+        driver.set_page_load_timeout(60)
+        return driver
     except Exception:
+        if driver is not None:
+            with contextlib.suppress(Exception):
+                driver.quit()
+        elif context is not None:
+            with contextlib.suppress(Exception):
+                context.close()
         if profile_lock is not None:
             profile_lock.__exit__(None, None, None)
+        if temp_profile and os.path.isdir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
         raise
-    pages_attr = getattr(context, "pages", [])
-    pages = pages_attr() if callable(pages_attr) else pages_attr
-    page = pages[0] if pages else context.new_page()
-    driver = CloakDriver(context=context, page=page, profile_dir=profile_dir, temp_profile=temp_profile)
-    driver._profile_lock = profile_lock
-    driver.set_page_load_timeout(60)
-    return driver
 
 
 def cleanup_cloak_driver(driver) -> None:

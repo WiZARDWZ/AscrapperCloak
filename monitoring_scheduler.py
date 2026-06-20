@@ -2516,6 +2516,21 @@ def run_daily_full_listing_sweep_for_search(search_id: int, dry_run: bool = Fals
     return {"status": "completed", "search_id": search_id, "full_sweep": light, "new_listing_jobs": enqueued}
 
 
+
+class AreaCancellationToken:
+    def __init__(self, search_id: int | None):
+        self.search_id = int(search_id) if search_id is not None else None
+
+    def is_set(self) -> bool:
+        if self.search_id is None:
+            return False
+        return not _search_is_active_for_monitoring(self.search_id)
+
+
+def _raise_if_cancelled(cancel_token: Any | None, search_id: int | None = None) -> None:
+    if getattr(cancel_token, "is_set", lambda: False)():
+        raise RuntimeError(f"area job cancelled search_id={search_id}")
+
 def _notify_baseline_setup_area_ready(search_id: int, baseline_result: dict[str, Any], send_telegram: bool = True) -> list[dict[str, Any]]:
     conn = db_layer.connect(config.DB_PATH)
     try:
@@ -2544,6 +2559,7 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
     job_type = job.get("JobType")
     search_id = int(job.get("SearchID") or 0) if job.get("SearchID") is not None else None
     user_area_id = int(job.get("UserAreaID") or 0) if job.get("UserAreaID") is not None else None
+    cancel_token = AreaCancellationToken(search_id)
     if search_id is not None:
         if not _search_is_active_for_monitoring(search_id):
             return _inactive_job_result(search_id)
@@ -2584,13 +2600,24 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
             return {"status": "skipped", "reason": "missing_search_url"}
         try:
             try:
-                result = baseline_setup_area(area_url, on_log=_heartbeat_on_log)
+                result = baseline_setup_area(area_url, on_log=_heartbeat_on_log, cancel_token=cancel_token)
             except TypeError as exc:
-                if "on_log" not in str(exc):
+                message = str(exc)
+                if "on_log" in message:
+                    try:
+                        result = baseline_setup_area(area_url, cancel_token=cancel_token)
+                    except TypeError as inner_exc:
+                        if "cancel_token" not in str(inner_exc):
+                            raise
+                        result = baseline_setup_area(area_url)
+                elif "cancel_token" in message:
+                    result = baseline_setup_area(area_url, on_log=_heartbeat_on_log)
+                else:
                     raise
-                result = baseline_setup_area(area_url)
             if job_id:
                 job_queue.touch_job_heartbeat(job_id)
+            if getattr(cancel_token, "is_set", lambda: False)():
+                return _inactive_job_result(search_id)
             if search_id and not _search_is_active_for_monitoring(search_id):
                 return _inactive_job_result(search_id)
             if result.get("status") == "ready" and search_id:
@@ -2625,18 +2652,26 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         if not sub:
             return {"status": "skipped", "reason": "subscription_not_found"}
         baseline = run_initial_baseline_for_subscription(int(sub["UserAreaID"]), dry_run=False)
-        if baseline.get("status") == "completed":
+        if baseline.get("status") == "completed" and not cancel_token.is_set():
             job_queue.enqueue_job_once(job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE, search_id=search_id, user_area_id=int(sub["UserAreaID"]), priority=job_queue.PRIORITY_SETUP, run_after=_utcnow())
         return {"status": baseline.get("status"), "baseline": baseline}
     if job_type == job_queue.JOB_TYPE_SETUP_DETAIL_BASELINE:
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         return _run_setup_detail_batch(job, send_telegram=send_telegram, on_log=_heartbeat_on_log)
     if job_type == job_queue.JOB_TYPE_SETUP_PRICE_BASELINE:
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         return _run_setup_price_batch(job, send_telegram=send_telegram, on_log=_heartbeat_on_log)
     if job_type == job_queue.JOB_TYPE_LIGHT_CHECK_NEW_LISTINGS:
         sub = _load_search_subscription(search_id, user_area_id)
         if not sub:
             return {"status": "skipped", "reason": "subscription_not_found"}
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         light = light_check_area(config.DB_PATH, sub["SearchURL"], max_pages=config.LIGHT_CHECK_PAGES, timeout=config.PIPELINE_TIMEOUT, dry_run=False, enforce_target_area=True)
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         if light.get("scan_status") == "blocked_rate_limited":
             return {
                 "status": "retry_wait",
@@ -2673,7 +2708,11 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         result = run_process_new_listing_for_search(search_id, payload.get("listing_ids") or [], dry_run=False, send_telegram=False)
         return _attach_notification_dispatch(result, search_id, user_area_id, "process_new_listing")
     if job_type in {job_queue.JOB_TYPE_DETAIL_REFRESH_EXISTING, job_queue.JOB_TYPE_MODULE3_REFRESH_AREA}:
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         result = run_detail_refresh_existing_for_search(search_id, limit=int(getattr(config, "DETAIL_REFRESH_BATCH_SIZE", 35)), dry_run=False, send_telegram=False)
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         if job_id:
             job_queue.touch_job_heartbeat(job_id)
         return _attach_notification_dispatch_if_pending(result, search_id, user_area_id, "detail_refresh_existing")
@@ -2681,7 +2720,11 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
         result = run_listing_status_recheck_job(job, send_telegram=False)
         return _attach_notification_dispatch(result, search_id, user_area_id, "listing_status_recheck")
     if job_type in {job_queue.JOB_TYPE_PRICE_REFRESH_EXISTING, job_queue.JOB_TYPE_MODULE2_PRICE_REFRESH_AREA}:
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         result = run_price_refresh_existing_for_search(search_id, payload=_job_payload(job), dry_run=False, current_job_id=job_id or None)
+        if cancel_token.is_set():
+            return _inactive_job_result(search_id)
         if job_id:
             job_queue.touch_job_heartbeat(job_id)
         if str(result.get("status") or "") in {"skipped_operational_price_disabled", "completed_no_targets", "skipped_no_price_targets", "partial_no_progress"}:
@@ -2738,20 +2781,23 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         return {"status": "idle", "reason": "no_due_jobs", "claimed_job": None, "stale_recovery": stale_recovery}
     try:
         result = execute_job(job, send_telegram=send_telegram)
+        finalizer = None
         if result.get("status") == "cancelled":
-            job_queue.mark_job_cancelled(int(job["JobID"]), result.get("reason") or "area inactive / no active subscriptions")
+            finalizer = job_queue.mark_job_cancelled(int(job["JobID"]), result.get("reason") or "area inactive / no active subscriptions")
         elif result.get("status") == "skipped":
-            job_queue.mark_job_succeeded(int(job["JobID"]), result)
+            finalizer = job_queue.mark_job_succeeded(int(job["JobID"]), result)
         elif str(result.get("status") or "").startswith("retry_wait"):
             retry_after_seconds = int(result.get("retry_after_seconds") or int(getattr(config, "DETAIL_REFRESH_INTERVAL_HOURS", 1)) * 3600)
             retry_reason = str(result.get("reason") or "")
             if retry_reason.startswith("realestate_rate_limited_or_blocked") or retry_reason in {"blocked_http_429", "blocked_kpsdk", "blocked_access_denied", "blocked_rate_limited", "partial_blocked"}:
-                job_queue.mark_job_retry_wait(int(job["JobID"]), result.get("reason") or result, retry_after_seconds=retry_after_seconds)
+                finalizer = job_queue.mark_job_retry_wait(int(job["JobID"]), result.get("reason") or result, retry_after_seconds=retry_after_seconds)
             else:
-                job_queue.mark_job_failed(int(job["JobID"]), result.get("reason") or result, retryable=True, retry_after_seconds=retry_after_seconds)
+                finalizer = job_queue.mark_job_failed(int(job["JobID"]), result.get("reason") or result, retryable=True, retry_after_seconds=retry_after_seconds)
         else:
-            job_queue.mark_job_succeeded(int(job["JobID"]), result)
-        return {"status": "completed", "claimed_job": job, "job_result": result, "stale_recovery": stale_recovery}
+            finalizer = job_queue.mark_job_succeeded(int(job["JobID"]), result)
+        if finalizer and finalizer.get("transition_applied") is False:
+            return {"status": "completed", "claimed_job": job, "job_result": result, "finalizer": finalizer, "finalizer_applied": False, "stale_recovery": stale_recovery}
+        return {"status": "completed", "claimed_job": job, "job_result": result, "finalizer": finalizer, "finalizer_applied": True, "stale_recovery": stale_recovery}
     except (KeyboardInterrupt, SystemExit) as exc:
         job_queue.requeue_running_job(int(job["JobID"]), f"job interrupted by {type(exc).__name__}; released running lock")
         raise
@@ -2759,15 +2805,15 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         reason = config.mask_sensitive_text(getattr(exc, "reason", str(exc)))
         retry_after_seconds = int(getattr(exc, "retry_after_seconds", None) or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600))
         failure = job_queue.mark_job_retry_wait(int(job["JobID"]), reason, retry_after_seconds=retry_after_seconds)
-        return {"status": "retry_wait", "claimed_job": job, "error": reason, "failure": failure, "stale_recovery": stale_recovery}
+        return {"status": "retry_wait", "claimed_job": job, "error": reason, "failure": failure, "finalizer_applied": failure.get("transition_applied") is not False, "stale_recovery": stale_recovery}
     except Exception as exc:
         non_retryable_names = {"BrowserConfigurationError"}
         retryable_names = {"BrowserProfileInUseError"}
         if exc.__class__.__name__ in non_retryable_names:
             failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=False)
-            return {"status": "failed", "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "stale_recovery": stale_recovery}
+            return {"status": "failed", "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "finalizer_applied": failure.get("transition_applied") is not False, "stale_recovery": stale_recovery}
         retryable = exc.__class__.__name__ in retryable_names or is_retryable_navigation_error(exc) or isinstance(exc, Module2RetryableInterruption)
         retry_after = int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)) if exc.__class__.__name__ in retryable_names else None
         failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=retryable, retry_after_seconds=retry_after)
         status = "retry_wait" if retryable else "failed"
-        return {"status": status, "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "stale_recovery": stale_recovery}
+        return {"status": status, "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "finalizer_applied": failure.get("transition_applied") is not False, "stale_recovery": stale_recovery}
