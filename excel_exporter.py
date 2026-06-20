@@ -129,6 +129,28 @@ def get_authorized_export_area(telegram_user_id: int, user_area_id: int) -> dict
     return None
 
 
+
+def current_setup_readiness(area: dict) -> dict:
+    """Return whether the current active subscription/setup run is eligible for final Excel export."""
+    area_status = str(area.get("AreaSetupStatus") or "").lower()
+    baseline = str(area.get("BaselineStatus") or "pending").lower()
+    detail = str(area.get("DetailBaselineStatus") or "pending").lower()
+    price = str(area.get("PriceBaselineStatus") or "pending").lower()
+    notification_ready = bool(area.get("NotificationReadyAt"))
+    ready = (area_status == "ready" and baseline == "completed" and detail == "completed" and price in {"completed", "completed_with_unknowns", "skipped"} and notification_ready)
+    reasons = []
+    if area_status != "ready": reasons.append(f"setup_status_{area_status or 'missing'}")
+    if baseline != "completed": reasons.append(f"module1_{baseline}")
+    if detail != "completed": reasons.append(f"module3_{detail}")
+    if price not in {"completed", "completed_with_unknowns", "skipped"}: reasons.append(f"module2_{price}")
+    if not notification_ready: reasons.append("notification_ready_at_missing")
+    return {"ready": ready, "reasons": reasons}
+
+
+def setup_preparing_message(area: dict) -> str:
+    label = area.get("AreaLabel") or "this area"
+    return f"⏳ Setup is still preparing for {label}. Excel export will be available after the current baseline, detail, and price setup finishes."
+
 def normalize_export_mode(mode: str | None = None) -> str:
     normalized = str(mode or "normal").strip().lower()
     return normalized if normalized in {"normal", "debug"} else "normal"
@@ -292,4 +314,6 @@ __all__ = [
     "get_authorized_export_area",
     "get_user_export_areas",
     "get_zero_row_diagnostics",
+    "current_setup_readiness",
+    "setup_preparing_message",
 ]

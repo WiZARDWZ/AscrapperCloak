@@ -2304,3 +2304,52 @@ def test_reset_setup_state_tool_does_not_reference_area_notification_ready_colum
     assert "notification_ready_at" not in source
     assert "setupdetailstatus" in source
     assert "setup_detail_baseline" in source
+
+
+def test_readd_inactive_area_resets_current_setup_and_keeps_history(monkeypatch):
+    calls = []
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "ensure_sort_list_date", lambda url: url)
+    monkeypatch.setattr(db_layer, "get_or_create_suburb_search", lambda conn, url, **k: (77, False))
+    monkeypatch.setattr(db_layer, "user_already_subscribed", lambda conn, user, sid: False)
+    monkeypatch.setattr(db_layer, "active_area_count_for_user", lambda conn, user: 0)
+    monkeypatch.setattr(db_layer, "get_search_setup_state", lambda conn, sid: {"state": "inactive", "is_ready": False})
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, sid, **k: calls.append(("area_state", sid, k)))
+    monkeypatch.setattr(db_layer, "create_or_reactivate_subscription", lambda conn, *a, **k: ("reactivated", {"user_area_id": 5, "search_id": 77, "baseline_status": "pending", "detail_baseline_status": "pending", "price_baseline_status": "pending"}))
+    monkeypatch.setattr(db_layer, "upsert_user_area_subscription_state", lambda conn, user, sid, **k: calls.append(("sub_state", sid, k)))
+    monkeypatch.setattr(db_layer, "reset_search_setup_for_new_baseline", lambda conn, sid: calls.append(("reset", sid)))
+    monkeypatch.setattr(db_layer, "enqueue_baseline_setup_job", lambda conn, sid, url: calls.append(("module1", sid)) or {"created": True})
+
+    class Conn:
+        def commit(self): calls.append(("commit",))
+
+    ok, payload = db_layer.add_user_area_subscription(Conn(), 10, "url", "Noona")
+
+    assert ok is True
+    assert payload["reason"] == "setup_required"
+    assert ("reset", 77) in calls
+    assert ("module1", 77) in calls
+    assert any(call[0] == "sub_state" and call[2]["status"] == "preparing" and call[2]["notify_enabled"] is False for call in calls)
+
+
+def test_last_subscriber_removal_cancels_jobs_and_keeps_history(monkeypatch):
+    calls = []
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "count_active_subscriptions_for_area", lambda conn, **k: 0)
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, sid, **k: calls.append(("inactive", sid, k)))
+    monkeypatch.setattr(db_layer, "cancel_jobs_for_inactive_area", lambda conn, **k: calls.append(("cancel_jobs", k.get("search_id"))) or 3)
+
+    class Cursor:
+        rowcount = 0
+        def execute(self, sql, *args):
+            calls.append(("sql", sql))
+            return self
+    class Conn:
+        def cursor(self): return Cursor()
+
+    out = db_layer.deactivate_area_if_unused(Conn(), search_id=88)
+
+    assert out["action"] == "inactivated"
+    assert out["cancelled_jobs"] == 3
+    assert ("cancel_jobs", 88) in calls
+    assert not any("DELETE FROM dbo.Listing" in call[1] for call in calls if call[0] == "sql")
