@@ -400,12 +400,16 @@ def wait_for_search_page_state(driver, timeout, min_cards: int = 1) -> tuple[Pag
     poll = max(0.05, float(getattr(config, "BROWSER_BLOCK_POLL_SECONDS", 1.0)))
     no_results_seen_at = None
     last = classify_search_page(driver, min_cards=min_cards)
+    if last.state == PageState.CHROME_ERROR:
+        return last, []
     while time.time() <= deadline:
         cards = get_listing_cards(driver, min_cards=min_cards)
         if len(cards) >= min_cards:
             return classify_search_page(driver, min_cards=min_cards), cards
         current = classify_search_page(driver, timeout=timeout, min_cards=min_cards)
         last = current
+        if current.state == PageState.CHROME_ERROR:
+            return current, []
         if current.state == PageState.NO_RESULTS:
             if no_results_seen_at is None:
                 no_results_seen_at = time.time()
@@ -429,9 +433,13 @@ def wait_for_detail_page_state(driver, timeout) -> PageStateResult:
     deadline = time.time() + float(timeout or getattr(config, "BROWSER_BLOCK_GRACE_SECONDS", 30))
     poll = max(0.05, float(getattr(config, "BROWSER_BLOCK_POLL_SECONDS", 1.0)))
     last = classify_detail_page(driver, timeout=timeout)
+    if last.state == PageState.CHROME_ERROR:
+        return last
     while time.time() <= deadline:
         current = classify_detail_page(driver, timeout=timeout)
         last = current
+        if current.state == PageState.CHROME_ERROR:
+            return current
         if current.is_usable:
             return current
         if current.is_blocked and any(marker.startswith("html:") for marker in current.detected_markers):
