@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import types
 from datetime import datetime, timedelta
@@ -2304,3 +2305,224 @@ def test_reset_setup_state_tool_does_not_reference_area_notification_ready_colum
     assert "notification_ready_at" not in source
     assert "setupdetailstatus" in source
     assert "setup_detail_baseline" in source
+
+
+def test_readd_inactive_area_resets_current_setup_and_keeps_history(monkeypatch):
+    calls = []
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "ensure_sort_list_date", lambda url: url)
+    monkeypatch.setattr(db_layer, "get_or_create_suburb_search", lambda conn, url, **k: (77, False))
+    monkeypatch.setattr(db_layer, "user_already_subscribed", lambda conn, user, sid: False)
+    monkeypatch.setattr(db_layer, "active_area_count_for_user", lambda conn, user: 0)
+    monkeypatch.setattr(db_layer, "get_search_setup_state", lambda conn, sid: {"state": "inactive", "is_ready": False})
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, sid, **k: calls.append(("area_state", sid, k)))
+    monkeypatch.setattr(db_layer, "create_or_reactivate_subscription", lambda conn, *a, **k: ("reactivated", {"user_area_id": 5, "search_id": 77, "baseline_status": "pending", "detail_baseline_status": "pending", "price_baseline_status": "pending"}))
+    monkeypatch.setattr(db_layer, "upsert_user_area_subscription_state", lambda conn, user, sid, **k: calls.append(("sub_state", sid, k)))
+    monkeypatch.setattr(db_layer, "reset_search_setup_for_new_baseline", lambda conn, sid: calls.append(("reset", sid)))
+    monkeypatch.setattr(db_layer, "enqueue_baseline_setup_job", lambda conn, sid, url: calls.append(("module1", sid)) or {"created": True})
+
+    class Conn:
+        def commit(self): calls.append(("commit",))
+
+    ok, payload = db_layer.add_user_area_subscription(Conn(), 10, "url", "Noona")
+
+    assert ok is True
+    assert payload["reason"] == "setup_required"
+    assert ("reset", 77) in calls
+    assert ("module1", 77) in calls
+    assert any(call[0] == "sub_state" and call[2]["status"] == "preparing" and call[2]["notify_enabled"] is False for call in calls)
+
+
+def test_last_subscriber_removal_cancels_jobs_and_keeps_history(monkeypatch):
+    calls = []
+    monkeypatch.setattr(db_layer, "ensure_telegram_bot_tables", lambda conn: None)
+    monkeypatch.setattr(db_layer, "count_active_subscriptions_for_area", lambda conn, **k: 0)
+    monkeypatch.setattr(db_layer, "upsert_area_monitoring_state", lambda conn, sid, **k: calls.append(("inactive", sid, k)))
+    monkeypatch.setattr(db_layer, "cancel_jobs_for_inactive_area", lambda conn, **k: calls.append(("cancel_jobs", k.get("search_id"))) or 3)
+
+    class Cursor:
+        rowcount = 0
+        def execute(self, sql, *args):
+            calls.append(("sql", sql))
+            return self
+    class Conn:
+        def cursor(self): return Cursor()
+
+    out = db_layer.deactivate_area_if_unused(Conn(), search_id=88)
+
+    assert out["action"] == "inactivated"
+    assert out["cancelled_jobs"] == 3
+    assert ("cancel_jobs", 88) in calls
+    assert not any("DELETE FROM dbo.Listing" in call[1] for call in calls if call[0] == "sql")
+
+
+def test_canonical_detail_batch_size_is_75_and_alias_validated():
+    import inspect
+    source = inspect.getsource(monitoring_scheduler.config)
+    assert 'BASELINE_DETAIL_BATCH_SIZE = int(_BASELINE_DETAIL_BATCH_ENV or _SETUP_DETAIL_BATCH_ENV or "75")' in source
+    assert 'SETUP_DETAIL_BATCH_SIZE = BASELINE_DETAIL_BATCH_SIZE' in source
+
+
+def test_execute_job_inactive_area_cancels_before_browser_launch(monkeypatch):
+    monkeypatch.setattr(monitoring_scheduler, "_area_job_eligibility", lambda search_id, job_type=None: {"eligible": False, "reason": "area_inactive_or_no_active_subscriptions"})
+
+    out = monitoring_scheduler.execute_job({"JobID": 7, "JobType": job_queue.JOB_TYPE_BASELINE_SETUP_AREA, "SearchID": 44}, send_telegram=False)
+
+    assert out["status"] == "cancelled"
+    assert out["reason"] == "area_inactive_or_no_active_subscriptions"
+
+
+def test_cloak_profile_lock_blocks_live_owner_and_releases(tmp_path):
+    from cloak_browser_helper import BrowserProfileInUseError, CloakProfileLock
+
+    profile = tmp_path / "rea_profile"
+    profile.mkdir()
+    with CloakProfileLock(str(profile), job_id=1, search_id=2):
+        try:
+            with CloakProfileLock(str(profile), job_id=3, search_id=2):
+                raise AssertionError("second lock should not be acquired")
+        except BrowserProfileInUseError:
+            pass
+    with CloakProfileLock(str(profile), job_id=4, search_id=2):
+        pass
+
+
+def test_cloak_headed_missing_display_is_configuration_error(monkeypatch, tmp_path):
+    from cloak_browser_helper import BrowserConfigurationError, validate_cloak_runtime
+
+    monkeypatch.delenv("DISPLAY", raising=False)
+    if os.name == "nt":
+        return
+    try:
+        validate_cloak_runtime(str(tmp_path), {"headless": False})
+    except BrowserConfigurationError as exc:
+        assert "DISPLAY" in str(exc)
+    else:
+        raise AssertionError("missing DISPLAY should fail before launch")
+
+
+def test_running_job_cancelled_during_worker_success_is_not_marked_succeeded(monkeypatch):
+    job_queue.enable_in_memory_store()
+    job = job_queue.enqueue_job(job_queue.JOB_TYPE_BASELINE_SETUP_AREA, search_id=91, payload={"search_url": "url"}, max_attempts=3)
+    enqueued_next = []
+    monkeypatch.setattr(monitoring_scheduler.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: enqueued_next.append(k) or {"created": True})
+
+    def fake_execute(claimed, send_telegram=True):
+        job_queue.mark_job_cancelled(claimed["JobID"], "last subscriber removed")
+        return {"status": "ready", "area_id": 91}
+
+    monkeypatch.setattr(monitoring_scheduler, "execute_job", fake_execute)
+    out = monitoring_scheduler.run_next_job_once(worker_id="race-test", send_telegram=False)
+    stored = job_queue._TEST_STORE[0]
+
+    assert stored["Status"] == "cancelled"
+    assert out["finalizer_applied"] is False
+    assert out["finalizer"]["current_status"] == "cancelled"
+    assert enqueued_next == []
+
+
+def test_trusted_wrong_suburb_empty_baseline_marks_ready_without_ingest_or_detail(monkeypatch):
+    import monitor
+
+    calls = []
+    class Conn:
+        def commit(self): calls.append(("commit",))
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("wrong-suburb rows must not persist")))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("detail must be skipped for empty exact-area baseline")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "trusted_empty_exact_area", "trusted_scan": True, "rows_area_rejected": 26, "stop_reason": "wrong_suburb_same_postcode"}
+
+    out = monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+
+    assert out["status"] == "ready"
+    assert out["completed_empty"] is True
+    assert out["detail_batches_enqueued"] == 0
+    assert out["price_setup_enqueued"] is False
+    assert ("activate", 77) in calls
+    state_call = [call for call in calls if call[0] == "state"][-1]
+    assert state_call[2]["active_listing_count"] == 0
+
+
+def test_blocked_zero_rows_does_not_become_trusted_empty(monkeypatch):
+    import monitor
+
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    monkeypatch.setattr(monitor, "init_db", lambda path: None)
+    monkeypatch.setattr(monitor, "connect", lambda path: Conn())
+    monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
+    monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda *a, **k: None)
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda *a, **k: (_ for _ in ()).throw(AssertionError("blocked page must not activate")))
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
+    monitor.module1_list_scraper.scrape_search.last_result = {"status": "partial_blocked", "trusted_scan": False, "stop_reason": "blocked_kpsdk"}
+
+    with pytest.raises(RuntimeError):
+        monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+
+
+def test_cloak_partial_initialization_failures_cleanup_lock(monkeypatch, tmp_path):
+    import sys
+    import types
+    import cloak_browser_helper as cbh
+
+    class ClosingContext:
+        def __init__(self, mode):
+            self.mode = mode
+            self.closed = False
+        @property
+        def pages(self):
+            if self.mode == "pages_fail":
+                raise RuntimeError("pages failed")
+            return []
+        def new_page(self):
+            if self.mode == "new_page_fail":
+                raise RuntimeError("new_page failed")
+            return object()
+        def close(self):
+            self.closed = True
+
+    original_driver_cls = cbh.CloakDriver
+    for mode in ["launch_fail", "pages_fail", "new_page_fail", "driver_fail", "timeout_fail"]:
+        profile = tmp_path / mode
+        context_holder = {}
+        def launch(profile_dir, **kwargs):
+            if mode == "launch_fail":
+                raise RuntimeError("launch failed")
+            ctx = ClosingContext(mode)
+            context_holder["ctx"] = ctx
+            return ctx
+        monkeypatch.setitem(sys.modules, "cloakbrowser", types.SimpleNamespace(launch_persistent_context=launch))
+        if mode == "driver_fail":
+            monkeypatch.setattr(cbh, "CloakDriver", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("driver failed")))
+        elif mode == "timeout_fail":
+            class BadTimeoutDriver:
+                def __init__(self, context, page, profile_dir, temp_profile=False):
+                    self.context = context
+                    self.profile_dir = profile_dir
+                    self._temp_profile = temp_profile
+                    self._profile_lock = None
+                def set_page_load_timeout(self, value):
+                    raise RuntimeError("timeout failed")
+                def quit(self):
+                    self.context.close()
+                    if self._profile_lock:
+                        self._profile_lock.__exit__(None, None, None)
+            monkeypatch.setattr(cbh, "CloakDriver", BadTimeoutDriver)
+        else:
+            monkeypatch.setattr(cbh, "CloakDriver", original_driver_cls)
+        with pytest.raises(RuntimeError):
+            cbh.build_cloak_driver(profile_dir_override=str(profile))
+        if "ctx" in context_holder:
+            assert context_holder["ctx"].closed is True
+        assert not (profile / ".ascrapper_profile.lock").exists()
+        with cbh.CloakProfileLock(str(profile)):
+            pass

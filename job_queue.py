@@ -581,18 +581,21 @@ def mark_job_succeeded(job_id: int, result_summary: Any = None) -> dict[str, Any
     now = _now()
     if _TEST_STORE is not None:
         row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        if str(row.get("Status") or "").lower() != "running":
+            return {**dict(row), "transition_applied": False, "current_status": row.get("Status")}
         row.update({"Status": "succeeded", "FinishedAt": now, "LastError": None, "UpdatedAt": now})
-        return dict(row)
+        return {**dict(row), "transition_applied": True, "current_status": "succeeded"}
     conn = _connect()
     try:
         cur = conn.cursor()
         cur.execute("""
             UPDATE dbo.Job
             SET Status='succeeded', FinishedAt=SYSDATETIME(), LastError=NULL, UpdatedAt=SYSDATETIME()
-            WHERE JobID=?
+            WHERE JobID=? AND Status='running'
         """, int(job_id))
+        applied = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0) > 0
         conn.commit()
-        return {"job_id": int(job_id), "status": "succeeded"}
+        return {"job_id": int(job_id), "status": "succeeded", "transition_applied": applied}
     finally:
         conn.close()
 
@@ -604,12 +607,14 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
     retry_after_seconds = int(retry_after_seconds if retry_after_seconds is not None else 300)
     if _TEST_STORE is not None:
         row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        if str(row.get("Status") or "").lower() != "running":
+            return {**dict(row), "transition_applied": False, "current_status": row.get("Status")}
         row["AttemptCount"] = int(row.get("AttemptCount") or 0) + 1
         if retryable and row["AttemptCount"] < int(row.get("MaxAttempts") or 3):
             row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
         else:
             row.update({"Status": "failed", "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
-        return dict(row)
+        return {**dict(row), "transition_applied": True, "current_status": row.get("Status")}
     conn = _connect()
     try:
         cur = conn.cursor()
@@ -621,10 +626,11 @@ def mark_job_failed(job_id: int, error: Any, retryable: bool = True, retry_after
                 LockedAt=NULL,
                 LockedBy=NULL,
                 FinishedAt=SYSDATETIME(), LastError=?, UpdatedAt=SYSDATETIME()
-            WHERE JobID=?
+            WHERE JobID=? AND Status='running'
         """, 1 if retryable else 0, 1 if retryable else 0, retry_after_seconds, error_text, int(job_id))
+        applied = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0) > 0
         conn.commit()
-        return {"job_id": int(job_id), "status": "retry_wait_or_failed", "retryable": bool(retryable)}
+        return {"job_id": int(job_id), "status": "retry_wait_or_failed", "retryable": bool(retryable), "transition_applied": applied}
     finally:
         conn.close()
 
@@ -641,8 +647,10 @@ def mark_job_retry_wait(job_id: int, error: Any, retry_after_seconds: int | None
     retry_after_seconds = int(retry_after_seconds if retry_after_seconds is not None else 300)
     if _TEST_STORE is not None:
         row = next(r for r in _TEST_STORE if int(r["JobID"]) == int(job_id))
+        if str(row.get("Status") or "").lower() != "running":
+            return {**dict(row), "transition_applied": False, "current_status": row.get("Status")}
         row.update({"Status": "retry_wait", "RunAfter": now + timedelta(seconds=retry_after_seconds), "LockedAt": None, "LockedBy": None, "FinishedAt": now, "LastError": error_text, "UpdatedAt": now})
-        return dict(row)
+        return {**dict(row), "transition_applied": True, "current_status": "retry_wait"}
     conn = _connect()
     try:
         cur = conn.cursor()
@@ -655,10 +663,11 @@ def mark_job_retry_wait(job_id: int, error: Any, retry_after_seconds: int | None
                 FinishedAt=SYSDATETIME(),
                 LastError=?,
                 UpdatedAt=SYSDATETIME()
-            WHERE JobID=?
+            WHERE JobID=? AND Status='running'
         """, retry_after_seconds, error_text, int(job_id))
+        applied = int(cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0) > 0
         conn.commit()
-        return {"job_id": int(job_id), "status": "retry_wait", "retry_after_seconds": retry_after_seconds}
+        return {"job_id": int(job_id), "status": "retry_wait", "retry_after_seconds": retry_after_seconds, "transition_applied": applied}
     finally:
         conn.close()
 

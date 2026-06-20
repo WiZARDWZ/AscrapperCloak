@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import fnmatch
 import inspect
 import json
@@ -5,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,6 +16,119 @@ import config
 
 
 LAST_CLOAK_LAUNCH_CONFIG: dict = {}
+
+
+class BrowserConfigurationError(RuntimeError):
+    """Non-retryable CloakBrowser runtime/configuration failure."""
+
+
+class BrowserProfileInUseError(RuntimeError):
+    """Retryable failure raised when another live process owns the profile lock."""
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _asyncio_loop_running() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _profile_lock_path(profile_dir: str) -> str:
+    return os.path.join(profile_dir, ".ascrapper_profile.lock")
+
+
+def _read_profile_lock(lock_path: str) -> dict:
+    try:
+        with open(lock_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {"unreadable": True}
+
+
+class CloakProfileLock:
+    def __init__(self, profile_dir: str, *, job_id=None, search_id=None):
+        self.profile_dir = os.path.abspath(profile_dir)
+        self.lock_path = _profile_lock_path(self.profile_dir)
+        self.job_id = job_id or os.getenv("ASCRAPPER_CURRENT_JOB_ID")
+        self.search_id = search_id or os.getenv("ASCRAPPER_CURRENT_SEARCH_ID")
+        self.acquired = False
+
+    def __enter__(self):
+        Path(self.profile_dir).mkdir(parents=True, exist_ok=True)
+        existing = _read_profile_lock(self.lock_path)
+        owner_pid = int(existing.get("pid") or 0) if existing else 0
+        if existing and owner_pid and _process_is_alive(owner_pid):
+            raise BrowserProfileInUseError(
+                f"Cloak profile in use: profile_dir={self.profile_dir} owner_pid={owner_pid} "
+                f"job_id={existing.get('job_id')} search_id={existing.get('search_id')}"
+            )
+        if existing and (not owner_pid or not _process_is_alive(owner_pid)):
+            with contextlib.suppress(Exception):
+                os.remove(self.lock_path)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        payload = {
+            "pid": os.getpid(),
+            "job_id": self.job_id,
+            "search_id": self.search_id,
+            "timestamp": time.time(),
+            "thread_id": threading.get_ident(),
+            "thread_name": threading.current_thread().name,
+        }
+        try:
+            fd = os.open(self.lock_path, flags)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            self.acquired = True
+            print(f"cloak_profile_lock_acquired profile_dir={self.profile_dir} pid={payload['pid']} job_id={self.job_id} search_id={self.search_id}")
+            return self
+        except FileExistsError:
+            existing = _read_profile_lock(self.lock_path)
+            raise BrowserProfileInUseError(f"Cloak profile lock exists: profile_dir={self.profile_dir} owner={existing}")
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.acquired:
+            with contextlib.suppress(Exception):
+                existing = _read_profile_lock(self.lock_path)
+                if int(existing.get("pid") or 0) == os.getpid():
+                    os.remove(self.lock_path)
+            print(f"cloak_profile_lock_released profile_dir={self.profile_dir} pid={os.getpid()} job_id={self.job_id} search_id={self.search_id}")
+        self.acquired = False
+        return False
+
+
+def profile_lock_status(profile_dir: str | None = None) -> dict:
+    profile = os.path.abspath(profile_dir or _profile_dir(None)[0])
+    lock_path = _profile_lock_path(profile)
+    data = _read_profile_lock(lock_path)
+    pid = int(data.get("pid") or 0) if data else 0
+    return {"profile_dir": profile, "lock_path": lock_path, "locked": bool(data), "owner": data, "owner_alive": _process_is_alive(pid) if pid else False}
+
+
+def validate_cloak_runtime(profile_dir: str, kwargs: dict, *, enforce_display: bool = True) -> None:
+    if enforce_display and os.name != "nt" and not bool(kwargs.get("headless")) and not os.getenv("DISPLAY"):
+        raise BrowserConfigurationError("CloakBrowser headed mode requires DISPLAY/Xvfb; start service with xvfb-run or set HEADLESS=1")
+    if _asyncio_loop_running():
+        raise BrowserConfigurationError("CloakBrowser synchronous launch attempted inside an active asyncio event loop thread")
+    if os.path.isdir(profile_dir) and not os.access(profile_dir, os.W_OK):
+        raise BrowserConfigurationError(f"CloakBrowser profile directory is not writable: {profile_dir}")
 
 
 class TimeoutException(Exception):
@@ -340,6 +456,8 @@ class CloakDriver:
         self.page = page
         self.profile_dir = profile_dir
         self._temp_profile = temp_profile
+        self._temp_profile_dir = profile_dir if temp_profile else None
+        self._profile_lock = None
         self._page_load_timeout_seconds = 60
         self._performance_logs: list[dict] = []
         self._http_errors: list[dict] = []
@@ -505,12 +623,17 @@ class CloakDriver:
         try:
             self.context.close()
         finally:
+            lock = getattr(self, "_profile_lock", None)
+            if lock is not None:
+                lock.__exit__(None, None, None)
+                self._profile_lock = None
             if self._temp_profile and os.path.isdir(self.profile_dir):
                 shutil.rmtree(self.profile_dir, ignore_errors=True)
 
 
 def build_cloak_driver(profile_dir_override: str | None = None) -> CloakDriver:
     try:
+        import cloakbrowser as _cloakbrowser_module
         from cloakbrowser import launch_persistent_context
     except Exception as exc:
         raise RuntimeError("cloakbrowser is not installed. Run: python -m pip install cloakbrowser playwright") from exc
@@ -519,24 +642,57 @@ def build_cloak_driver(profile_dir_override: str | None = None) -> CloakDriver:
     Path(profile_dir).mkdir(parents=True, exist_ok=True)
     launch_kwargs = _cloak_launch_kwargs(profile_dir)
     _validate_launch_kwargs(launch_persistent_context, launch_kwargs)
+    # Unit tests install an in-memory fake cloakbrowser module; production modules have __file__.
+    validate_cloak_runtime(profile_dir, launch_kwargs, enforce_display=hasattr(_cloakbrowser_module, "__file__"))
     _record_and_log_launch_config(profile_dir, launch_kwargs)
+    print(
+        "cloak_runtime_startup pid={pid} thread_id={tid} thread_name={tname} asyncio_loop_running={loop} "
+        "engine={engine} headless={headless} display={display} profile_dir={profile_dir}".format(
+            pid=os.getpid(), tid=threading.get_ident(), tname=threading.current_thread().name,
+            loop=_asyncio_loop_running(), engine=getattr(config, "BROWSER_ENGINE", "cloak"),
+            headless=bool(launch_kwargs.get("headless")), display=os.getenv("DISPLAY", ""), profile_dir=profile_dir,
+        )
+    )
+    profile_lock = None
+    context = None
+    driver = None
     try:
-        context = launch_persistent_context(profile_dir, **launch_kwargs)
-    except TypeError as exc:
-        raise RuntimeError(
-            "Installed cloakbrowser.launch_persistent_context rejected the configured launch options. "
-            "Upgrade cloakbrowser or unset unsupported CLOAK_* options."
-        ) from exc
-    pages_attr = getattr(context, "pages", [])
-    pages = pages_attr() if callable(pages_attr) else pages_attr
-    page = pages[0] if pages else context.new_page()
-    driver = CloakDriver(context=context, page=page, profile_dir=profile_dir, temp_profile=temp_profile)
-    driver.set_page_load_timeout(60)
-    return driver
+        if getattr(config, "CLOAK_USE_PERSISTENT_CONTEXT", True) and not temp_profile:
+            profile_lock = CloakProfileLock(profile_dir).__enter__()
+        try:
+            context = launch_persistent_context(profile_dir, **launch_kwargs)
+        except TypeError as exc:
+            raise RuntimeError(
+                "Installed cloakbrowser.launch_persistent_context rejected the configured launch options. "
+                "Upgrade cloakbrowser or unset unsupported CLOAK_* options."
+            ) from exc
+        pages_attr = getattr(context, "pages", [])
+        pages = pages_attr() if callable(pages_attr) else pages_attr
+        page = pages[0] if pages else context.new_page()
+        driver = CloakDriver(context=context, page=page, profile_dir=profile_dir, temp_profile=temp_profile)
+        driver._profile_lock = profile_lock
+        profile_lock = None
+        driver.set_page_load_timeout(60)
+        return driver
+    except Exception:
+        if driver is not None:
+            with contextlib.suppress(Exception):
+                driver.quit()
+        elif context is not None:
+            with contextlib.suppress(Exception):
+                context.close()
+        if profile_lock is not None:
+            profile_lock.__exit__(None, None, None)
+        if temp_profile and os.path.isdir(profile_dir):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
 
 
 def cleanup_cloak_driver(driver) -> None:
-    temp_profile_dir = getattr(driver, "_temp_profile_dir", None)
+    if driver is not None:
+        with contextlib.suppress(Exception):
+            driver.quit()
+    temp_profile_dir = getattr(driver, "_temp_profile_dir", None) or (getattr(driver, "profile_dir", None) if getattr(driver, "_temp_profile", False) else None)
     if temp_profile_dir and os.path.isdir(temp_profile_dir):
         shutil.rmtree(temp_profile_dir, ignore_errors=True)
 
