@@ -1331,14 +1331,28 @@ def _load_search_subscription(search_id: int, preferred_user_area_id: int | None
         conn.close()
 
 
-def _search_is_active_for_monitoring(search_id: int | None) -> bool:
+def _area_job_eligibility(search_id: int | None, job_type: str | None = None) -> dict[str, Any]:
     if search_id is None:
-        return True
+        return {"eligible": True, "reason": "global_job"}
     conn = db_layer.connect(config.DB_PATH)
+    if conn is None or not hasattr(conn, "cursor"):
+        return {"eligible": True, "reason": "eligibility_unavailable"}
     try:
-        return db_layer.is_area_active_for_monitoring(conn, search_id=int(search_id))
+        result = db_layer.area_job_eligibility(conn, int(search_id), job_type=job_type)
+        conn.commit()
+        return result
+    except Exception as exc:
+        logger.warning("area job eligibility fallback search_id=%s job_type=%s error=%s", search_id, job_type, config.mask_sensitive_text(exc))
+        return {"eligible": True, "reason": "eligibility_check_failed"}
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _search_is_active_for_monitoring(search_id: int | None) -> bool:
+    return bool(_area_job_eligibility(search_id).get("eligible"))
 
 
 def _search_ready_for_operational_monitoring(search_id: int | None) -> bool:
@@ -2530,8 +2544,12 @@ def execute_job(job: dict[str, Any], send_telegram: bool = True) -> dict[str, An
     job_type = job.get("JobType")
     search_id = int(job.get("SearchID") or 0) if job.get("SearchID") is not None else None
     user_area_id = int(job.get("UserAreaID") or 0) if job.get("UserAreaID") is not None else None
-    if search_id is not None and not _search_is_active_for_monitoring(search_id):
-        return _inactive_job_result(search_id)
+    if search_id is not None:
+        if not _search_is_active_for_monitoring(search_id):
+            return _inactive_job_result(search_id)
+        eligibility = _area_job_eligibility(search_id, job_type)
+        if not eligibility.get("eligible"):
+            return {**_inactive_job_result(search_id), "eligibility": eligibility}
     setup_job_types = {
         job_queue.JOB_TYPE_BASELINE_SETUP_AREA,
         job_queue.JOB_TYPE_SETUP_FULL_BASELINE,
@@ -2743,7 +2761,13 @@ def run_next_job_once(worker_id: str | None = None, send_telegram: bool = True) 
         failure = job_queue.mark_job_retry_wait(int(job["JobID"]), reason, retry_after_seconds=retry_after_seconds)
         return {"status": "retry_wait", "claimed_job": job, "error": reason, "failure": failure, "stale_recovery": stale_recovery}
     except Exception as exc:
-        retryable = is_retryable_navigation_error(exc) or isinstance(exc, Module2RetryableInterruption)
-        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=retryable)
+        non_retryable_names = {"BrowserConfigurationError"}
+        retryable_names = {"BrowserProfileInUseError"}
+        if exc.__class__.__name__ in non_retryable_names:
+            failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=False)
+            return {"status": "failed", "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "stale_recovery": stale_recovery}
+        retryable = exc.__class__.__name__ in retryable_names or is_retryable_navigation_error(exc) or isinstance(exc, Module2RetryableInterruption)
+        retry_after = int(getattr(config, "PROFILE_LOCK_RETRY_SECONDS", 300)) if exc.__class__.__name__ in retryable_names else None
+        failure = job_queue.mark_job_failed(int(job["JobID"]), config.mask_sensitive_text(exc), retryable=retryable, retry_after_seconds=retry_after)
         status = "retry_wait" if retryable else "failed"
         return {"status": status, "claimed_job": job, "error": config.mask_sensitive_text(exc), "failure": failure, "stale_recovery": stale_recovery}
