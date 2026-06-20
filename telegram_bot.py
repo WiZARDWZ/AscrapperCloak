@@ -856,6 +856,11 @@ async def handle_export_area_selection(update: Update, context: ContextTypes.DEF
     if not area:
         await query.edit_message_text("That export area is not available for your account.")
         return
+    readiness = excel_exporter.current_setup_readiness(area)
+    if not readiness.get("ready"):
+        await query.edit_message_text(excel_exporter.setup_preparing_message(area))
+        await update.effective_chat.send_message("Choose an option below.", reply_markup=main_menu_keyboard())
+        return
     area_label = _area_label_from(area, area.get("SearchID"))
     search_id = int(area["SearchID"])
     await query.edit_message_text(f"Generating Excel for {area_label}...")

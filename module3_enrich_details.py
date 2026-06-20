@@ -1519,6 +1519,8 @@ def enrich_detail_rows(
     sleep_between: float | None = None,
     empty_retry: int = 1,
     on_log=None,
+    on_row_enriched=None,
+    on_row_blocked=None,
 ) -> list[dict]:
     out_dir = output_dir or "output"
     wait_timeout = int(wait_timeout or config.MODULE3_WAIT_TIMEOUT)
@@ -1557,13 +1559,22 @@ def enrich_detail_rows(
             )
             if not ok:
                 if isinstance(err, RealEstateBlockedError):
-                    raise err
+                    should_abort_batch = on_row_blocked is None or any(token in str(err).lower() for token in ("429", "http_response_code_failure", "http_error_429", "temporarily blocked", "kpsdk", "blocked"))
+                    if should_abort_batch:
+                        if on_row_blocked:
+                            try:
+                                on_row_blocked(dict(merged), err)
+                            except Exception:
+                                pass
+                        raise err
                 _mark_detail_failure(merged, "get_failed")
                 enriched.append(merged)
                 continue
             if detail_state.state in {PageState.DETAIL_REMOVED, PageState.DETAIL_NOT_FOUND, PageState.DETAIL_SOLD}:
                 _mark_detail_lifecycle_state(merged, detail_state)
                 enriched.append(merged)
+                if on_row_enriched:
+                    on_row_enriched(dict(merged))
                 time.sleep(max(0.0, sleep_between))
                 continue
             if detail_state.state in {PageState.RENDER_TIMEOUT, PageState.BLANK_RENDER, PageState.UNKNOWN}:
@@ -1629,6 +1640,8 @@ def enrich_detail_rows(
             if original_db_listing_id is not None:
                 merged["db_listing_id"] = original_db_listing_id
             enriched.append(merged)
+            if on_row_enriched:
+                on_row_enriched(dict(merged))
             time.sleep(max(0.0, sleep_between))
         return enriched
     finally:

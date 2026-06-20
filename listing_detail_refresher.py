@@ -126,16 +126,59 @@ def refresh_active_listings(
         "sleep_between": sleep_between if sleep_between is not None else config.DETAIL_REFRESH_SLEEP_BETWEEN,
         "on_log": on_log,
     }
-    enriched_rows = enrich_func(candidates, **enrich_kwargs)
+    persisted_items: list[dict[str, Any]] = []
+    persisted_external_ids: set[str] = set()
+
+    def _persist_successful_row(row: dict[str, Any]) -> None:
+        if dry_run or _detail_refresh_failed(row):
+            return
+        ingest_one = getattr(db_layer, "ingest_detail_refresh_row_durable", None)
+        if ingest_one is None:
+            return
+        ingest = ingest_one(config.DB_PATH, search_url, row, context=context, suppress_notifications=suppress_notifications)
+        persisted_items.extend(ingest.get("items", []))
+        ext = row.get("external_id") or row.get("listing_id")
+        if ext is not None:
+            persisted_external_ids.add(str(ext))
+
+    def _mark_blocked_row_retryable(row: dict[str, Any], err: Exception) -> None:
+        if context != "initial_detail_baseline" or dry_run:
+            return
+        conn2 = db_layer.connect(config.DB_PATH)
+        try:
+            search_id = int((subscription or {}).get("SearchID") or db_layer._detail_refresh_search_id(conn2, search_url, subscription=subscription))
+            db_layer.mark_listing_setup_detail_failed(
+                conn2, search_id, listing_id=row.get("db_listing_id") or row.get("internal_listing_id"),
+                external_id=row.get("external_id") or row.get("listing_id"), error=str(err),
+                max_attempts=getattr(config, "DETAIL_BASELINE_MAX_ATTEMPTS", 5),
+            )
+            conn2.commit()
+        finally:
+            conn2.close()
+
+    callback_kwargs = dict(enrich_kwargs)
+    callback_kwargs["on_row_enriched"] = _persist_successful_row
+    callback_kwargs["on_row_blocked"] = _mark_blocked_row_retryable
+    try:
+        enriched_rows = enrich_func(candidates, **callback_kwargs)
+    except TypeError:
+        enriched_rows = enrich_func(candidates, **enrich_kwargs)
+    except Exception as exc:
+        if exc.__class__.__name__ == "RealEstateBlockedError":
+            enriched_rows = []
+            result["blocked_error"] = str(exc)
+        else:
+            raise
     initial_failed = [row for row in enriched_rows if _detail_refresh_failed(row)]
     if enriched_rows and len(initial_failed) / len(enriched_rows) >= 0.8 and any(is_retryable_detail_error(_failed_item(row)["error"]) for row in initial_failed):
         # module3 owns browser lifecycle; reinvoking it forces a fresh driver/recovery boundary.
         enriched_rows = enrich_func(candidates, **enrich_kwargs)
         result["immediate_retry_performed"] = True
-    result["processed_count"] = len(enriched_rows)
     failed_rows = [r for r in enriched_rows if _detail_refresh_failed(r)]
     successful_rows = [r for r in enriched_rows if not _detail_refresh_failed(r)]
-    result["refreshed_count"] = len(successful_rows)
+    unpersisted_successful_rows = [r for r in successful_rows if str(r.get("external_id") or r.get("listing_id")) not in persisted_external_ids]
+    result["processed_count"] = len(failed_rows) + len(unpersisted_successful_rows) + len(persisted_external_ids)
+    result["refreshed_count"] = len(unpersisted_successful_rows) + len(persisted_external_ids)
     result["failed_count"] = len(failed_rows)
     for row in failed_rows:
         item = _failed_item(row)
@@ -199,7 +242,13 @@ def refresh_active_listings(
             conn.close()
         return result
 
-    ingest = db_layer.ingest_detail_refresh_rows(config.DB_PATH, search_url, successful_rows, dry_run=False, context=context, suppress_notifications=suppress_notifications)
+    successful_rows = unpersisted_successful_rows
+    if persisted_items and not successful_rows:
+        ingest = {"items": persisted_items, "events_created": sum(int(i.get("events_created", 0) or 0) for i in persisted_items), "suppressed_sold_count": sum(int(i.get("suppressed_sold_count", 0) or 0) for i in persisted_items), "weak_sold_evidence_count": sum(int(i.get("weak_sold_evidence_count", 0) or 0) for i in persisted_items), "strong_sold_evidence_count": sum(int(i.get("strong_sold_evidence_count", 0) or 0) for i in persisted_items)}
+    else:
+        ingest = db_layer.ingest_detail_refresh_rows(config.DB_PATH, search_url, successful_rows, dry_run=False, context=context, suppress_notifications=suppress_notifications)
+        if persisted_items:
+            ingest["items"] = persisted_items + ingest.get("items", [])
     result["events_created"] = ingest.get("events_created", 0)
     result["suppressed_sold_count"] = int(ingest.get("suppressed_sold_count", 0))
     result["weak_sold_evidence_count"] = int(ingest.get("weak_sold_evidence_count", 0))

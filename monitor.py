@@ -414,7 +414,12 @@ def full_run_area(
         on_progress("module1_done", {"rows": rows_module1})
     if rows_module1 == 0:
         module1_state = getattr(module1_list_scraper.scrape_search, "last_result", {}) or {}
-        if module1_state.get("status") == "no_results" or module1_state.get("stop_reason") == "no_results":
+        trusted_empty = (
+            module1_state.get("status") in {"no_results", "trusted_empty_exact_area", "completed_empty"}
+            or module1_state.get("stop_reason") in {"no_results", "wrong_suburb_same_postcode", "wrong_area_exact_empty"}
+            or (module1_state.get("trusted_scan") is True and int(module1_state.get("rows_area_rejected") or 0) > 0)
+        )
+        if trusted_empty:
             conn = connect(config.DB_PATH)
             try:
                 area_id = get_or_create_area(conn, normalized_url)
@@ -575,7 +580,12 @@ def baseline_setup_area(
         return {"status": "cancelled", "area_id": area_id}
     if not rows1:
         module1_state = getattr(module1_list_scraper.scrape_search, "last_result", {}) or {}
-        if module1_state.get("status") == "no_results" or module1_state.get("stop_reason") == "no_results":
+        trusted_empty = (
+            module1_state.get("status") in {"no_results", "trusted_empty_exact_area", "completed_empty"}
+            or module1_state.get("stop_reason") in {"no_results", "wrong_suburb_same_postcode", "wrong_area_exact_empty"}
+            or (module1_state.get("trusted_scan") is True and int(module1_state.get("rows_area_rejected") or 0) > 0)
+        )
+        if trusted_empty:
             conn = connect(config.DB_PATH)
             try:
                 upsert_area_monitoring_state(
@@ -604,9 +614,11 @@ def baseline_setup_area(
                 "inferred_price_count": 0,
                 "unknown_price_count": 0,
                 "events_count": 0,
-                "stop_reason": "no_results",
-                "page_state": "no_results",
+                "stop_reason": module1_state.get("stop_reason") or "no_results",
+                "page_state": module1_state.get("page_state") or "no_results",
                 "empty_market": True,
+                "completed_empty": True,
+                "setup_status_detail": "setup_batched_empty",
                 "detail_batches_enqueued": 0,
                 "price_setup_enqueued": False,
             }
@@ -619,10 +631,15 @@ def baseline_setup_area(
             conn.close()
         raise RuntimeError(last_error)
 
+    if getattr(cancel_token, "is_set", lambda: False)():
+        return {"status": "cancelled", "area_id": area_id}
+
     # Persist Module1/listing-shell data only. Detail enrichment and price inference
     # are intentionally separate setup jobs so large suburbs never run as one
     # multi-hour baseline_setup_area job.
     try:
+        if getattr(cancel_token, "is_set", lambda: False)():
+            return {"status": "cancelled", "area_id": area_id}
         run_id = ingest_full_rows(config.DB_PATH, normalized_url, rows1, full_scan=True, emit_events=False)
     except Exception as exc:
         conn = connect(config.DB_PATH)
@@ -667,6 +684,9 @@ def baseline_setup_area(
             unknown_price_count=0,
             last_error=f"details 0/{len(rows1)}",
         )
+        if getattr(cancel_token, "is_set", lambda: False)():
+            conn.rollback() if hasattr(conn, "rollback") else None
+            return {"status": "cancelled", "area_id": area_id}
         detail_job = db_layer.enqueue_setup_detail_baseline_job(conn, area_id, dedupe_suffix="initial")
         conn.commit()
     finally:

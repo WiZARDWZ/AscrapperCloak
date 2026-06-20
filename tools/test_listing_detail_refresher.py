@@ -526,3 +526,47 @@ if __name__ == "__main__":
     test_enrich_detail_rows_failed_extract_preserves_candidate_contact_fields()
     test_enrich_detail_rows_preserves_listing_ids_when_detail_data_contains_internal_like_id()
     print("OK")
+
+
+def test_initial_detail_baseline_persists_partial_progress_before_block(monkeypatch):
+    from realestate_errors import RealEstateBlockedError
+
+    persisted = []
+    failed = []
+    candidates = [
+        {"db_listing_id": 1, "external_id": "A", "listing_id": "A", "url": "uA"},
+        {"db_listing_id": 2, "external_id": "B", "listing_id": "B", "url": "uB"},
+        {"db_listing_id": 3, "external_id": "C", "listing_id": "C", "url": "uC"},
+    ]
+
+    class Conn:
+        def commit(self): pass
+        def close(self): pass
+
+    def fake_enrich(rows, **kwargs):
+        kwargs["on_row_enriched"]({**rows[0], "description": "A detail", "detail_refresh_success": True})
+        kwargs["on_row_enriched"]({**rows[1], "description": "B detail", "detail_refresh_success": True})
+        err = RealEstateBlockedError("http_error_429", retry_after_seconds=3600)
+        kwargs["on_row_blocked"](rows[2], err)
+        raise err
+
+    monkeypatch.setattr(ldr.db_layer, "connect", lambda path=None: Conn())
+    monkeypatch.setattr(ldr.db_layer, "get_active_listings_for_detail_refresh", lambda *a, **k: candidates)
+    monkeypatch.setattr(ldr.db_layer, "_detail_refresh_search_id", lambda *a, **k: 42)
+    monkeypatch.setattr(ldr.db_layer, "ingest_detail_refresh_row_durable", lambda db_path, url, row, **k: persisted.append(row["external_id"]) or {"items": [{"external_id": row["external_id"], "db_listing_id": row["db_listing_id"], "events_created": 0}]})
+    monkeypatch.setattr(ldr.db_layer, "mark_listing_setup_detail_failed", lambda conn, search_id, **k: failed.append(k.get("external_id")) or {"updated": True})
+    monkeypatch.setattr(ldr, "ENRICH_DETAIL_ROWS_FUNC", fake_enrich)
+
+    result = ldr.refresh_active_listings("search", limit=3, stale_hours=0, context="initial_detail_baseline", subscription={"SearchID": 42})
+
+    assert result["processed_count"] == 2
+    assert result["refreshed_count"] == 2
+    assert persisted == ["A", "B"]
+    assert failed == ["C"]
+
+    remaining = [row for row in candidates if row["external_id"] not in persisted]
+    assert [row["external_id"] for row in remaining] == ["C"]
+
+
+if __name__ == "__main__":
+    test_initial_detail_baseline_persists_partial_progress_before_block(__import__('pytest').MonkeyPatch())
