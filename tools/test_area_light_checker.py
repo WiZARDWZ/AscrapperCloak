@@ -41,6 +41,7 @@ def test_compact_listing_for_notification() -> None:
         "bedrooms": "3",
         "bathrooms": "2",
         "parking": "1",
+        "area_label": None,
     }
     compact = compact_listing_for_notification(row)
     assert compact == {
@@ -52,6 +53,7 @@ def test_compact_listing_for_notification() -> None:
         "bedrooms": "3",
         "bathrooms": "2",
         "parking": "1",
+        "area_label": None,
     }
 
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime
@@ -10,6 +11,7 @@ import db_layer
 import module1_list_scraper
 import module2_infer_prices
 import module3_enrich_details
+from area_light_checker import apply_target_area_guard
 from realestate_errors import RealEstateBlockedError
 from db_layer import (
     activate_area_subscriptions,
@@ -40,6 +42,65 @@ WATCH_EVENT_TYPES = [
     "inspection_or_auction_change",
     "removed_or_missing",
 ]
+
+logger = logging.getLogger(__name__)
+
+_BASELINE_BLOCKED_STATES = {
+    "blocked_http_429",
+    "blocked_kpsdk",
+    "blocked_access_denied",
+    "blocked_rate_limited",
+    "partial_blocked",
+}
+_BASELINE_TECHNICAL_STATES = {
+    "render_timeout",
+    "blank_render",
+    "chrome_error",
+    "unknown",
+    "technical_failure",
+    "no_cards_timeout",
+    "normal_content_without_cards",
+    "navigation_failure",
+    "navigation_failed",
+}
+_BASELINE_WRONG_AREA_STATES = {
+    "redirected_back",
+    "wrong_area",
+    "wrong_area_current_url",
+    "wrong_area_mismatch_heavy",
+}
+
+
+def _baseline_scan_is_retryable(scan_result: Dict[str, Any]) -> bool:
+    values = {
+        str(scan_result.get("scan_status") or "").lower(),
+        str(scan_result.get("stop_reason") or "").lower(),
+        str(scan_result.get("page_state") or "").lower(),
+        str(scan_result.get("blocked_reason") or "").lower(),
+    }
+    return bool(values & (_BASELINE_BLOCKED_STATES | _BASELINE_TECHNICAL_STATES))
+
+
+def _log_baseline_scan_result(on_log, **fields: Any) -> None:
+    keys = (
+        "search_id",
+        "user_area_id",
+        "scan_status",
+        "trusted_scan",
+        "stop_reason",
+        "rows_scraped",
+        "rows_accepted",
+        "rows_rejected",
+        "pages_checked",
+        "total_pages_detected",
+        "current_url_matches_target",
+        "ingest_allowed",
+        "detail_job_enqueued",
+    )
+    message = "baseline_scan_result " + " ".join(f"{key}={fields.get(key)}" for key in keys)
+    logger.info(message)
+    if on_log:
+        on_log(message)
 
 
 def _module3_retryable_last_result() -> Dict[str, Any] | None:
@@ -568,7 +629,7 @@ def baseline_setup_area(
     finally:
         conn.close()
 
-    rows1 = module1_list_scraper.scrape_search(
+    scan_result = module1_list_scraper.scrape_search_with_result(
         normalized_url,
         max_pages=config.INITIAL_BASELINE_MAX_PAGES,
         timeout=config.PIPELINE_TIMEOUT,
@@ -576,59 +637,83 @@ def baseline_setup_area(
         on_log=on_log,
         on_progress=on_progress,
     )
+    rows_scraped = list(scan_result.get("rows") or [])
     if getattr(cancel_token, "is_set", lambda: False)():
         return {"status": "cancelled", "area_id": area_id}
-    if not rows1:
-        module1_state = getattr(module1_list_scraper.scrape_search, "last_result", {}) or {}
-        trusted_empty = (
-            module1_state.get("status") in {"no_results", "trusted_empty_exact_area", "completed_empty"}
-            or module1_state.get("stop_reason") in {"no_results", "wrong_suburb_same_postcode", "wrong_area_exact_empty"}
-            or (module1_state.get("trusted_scan") is True and int(module1_state.get("rows_area_rejected") or 0) > 0)
+
+    guard = apply_target_area_guard(rows_scraped, normalized_url, current_url=scan_result.get("current_url"))
+    rows1 = list(guard.get("accepted_rows") or [])
+    rows_rejected = len(guard.get("rejected_rows") or [])
+    scan_status = str(scan_result.get("scan_status") or "unknown")
+    stop_reason = str(scan_result.get("stop_reason") or scan_status)
+    page_state = str(scan_result.get("page_state") or "")
+    explicit_no_results = (
+        not rows_scraped
+        and stop_reason == "no_results"
+        and page_state == "no_results"
+        and scan_result.get("trusted_scan") is True
+    )
+    terminal_values = {scan_status.lower(), stop_reason.lower(), page_state.lower()}
+    terminal_untrusted = bool(
+        terminal_values
+        & (_BASELINE_BLOCKED_STATES | _BASELINE_TECHNICAL_STATES | _BASELINE_WRONG_AREA_STATES)
+    )
+    trusted_scan = (
+        scan_result.get("trusted_scan") is True
+        and guard.get("trusted") is True
+        and not terminal_untrusted
+        and (bool(rows1) or explicit_no_results)
+    )
+    scan_retryable = _baseline_scan_is_retryable(scan_result)
+    effective_stop_reason = str(
+        stop_reason if scan_retryable else (guard.get("untrusted_reason") or stop_reason)
+    )
+
+    if not trusted_scan:
+        retryable = scan_retryable
+        last_error = config.mask_sensitive_text(
+            f"untrusted Module1 baseline: scan_status={scan_status} stop_reason={effective_stop_reason} "
+            f"page_state={page_state or None} rows_scraped={len(rows_scraped)} "
+            f"rows_accepted={len(rows1)} rows_rejected={rows_rejected}"
         )
-        if trusted_empty:
-            conn = connect(config.DB_PATH)
-            try:
-                upsert_area_monitoring_state(
-                    conn,
-                    area_id,
-                    setup_status="ready",
-                    module1_status="completed",
-                    module3_status="completed",
-                    module2_status="completed",
-                    active_listing_count=0,
-                    inferred_price_count=0,
-                    unknown_price_count=0,
-                    last_error=None,
-                    set_ready=True,
-                )
-                activate_area_subscriptions(conn, area_id)
-                conn.commit()
-            finally:
-                conn.close()
-            return {
-                "status": "ready",
-                "area_id": area_id,
-                "rows_module1": 0,
-                "rows_full": 0,
-                "active_listing_count": 0,
-                "inferred_price_count": 0,
-                "unknown_price_count": 0,
-                "events_count": 0,
-                "stop_reason": module1_state.get("stop_reason") or "no_results",
-                "page_state": module1_state.get("page_state") or "no_results",
-                "empty_market": True,
-                "completed_empty": True,
-                "setup_status_detail": "setup_batched_empty",
-                "detail_batches_enqueued": 0,
-                "price_setup_enqueued": False,
-            }
         conn = connect(config.DB_PATH)
         try:
-            last_error = f"Module1 returned 0 rows without confirmed no_results. page_state={module1_state.get('page_state')} stop_reason={module1_state.get('stop_reason')}"
-            upsert_area_monitoring_state(conn, area_id, setup_status="failed", module1_status="failed", last_error=last_error)
+            upsert_area_monitoring_state(
+                conn,
+                area_id,
+                setup_status="preparing" if retryable else "failed",
+                module1_status="retry_wait" if retryable else "failed",
+                module3_status="pending",
+                module2_status="pending",
+                last_error=last_error,
+            )
             conn.commit()
         finally:
             conn.close()
+        _log_baseline_scan_result(
+            on_log,
+            search_id=area_id,
+            user_area_id=None,
+            scan_status=scan_status,
+            trusted_scan=False,
+            stop_reason=effective_stop_reason,
+            rows_scraped=len(rows_scraped),
+            rows_accepted=len(rows1),
+            rows_rejected=rows_rejected,
+            pages_checked=scan_result.get("pages_checked"),
+            total_pages_detected=scan_result.get("total_pages_detected"),
+            current_url_matches_target=guard.get("current_url_ok") is True,
+            ingest_allowed=False,
+            detail_job_enqueued=False,
+        )
+        if retryable:
+            raise RealEstateBlockedError(
+                effective_stop_reason or "untrusted_baseline_scan",
+                retry_after_seconds=int(
+                    scan_result.get("retry_after_seconds")
+                    or getattr(config, "REA_RATE_LIMIT_BACKOFF_SECONDS", 21600)
+                ),
+            )
         raise RuntimeError(last_error)
 
     if getattr(cancel_token, "is_set", lambda: False)():
@@ -640,7 +725,9 @@ def baseline_setup_area(
     try:
         if getattr(cancel_token, "is_set", lambda: False)():
             return {"status": "cancelled", "area_id": area_id}
-        run_id = ingest_full_rows(config.DB_PATH, normalized_url, rows1, full_scan=True, emit_events=False)
+        # A trusted explicit zero-result scan advances setup without applying a
+        # zero-row full scan to any pre-existing shared/rerun listing lifecycle.
+        run_id = ingest_full_rows(config.DB_PATH, normalized_url, rows1, full_scan=True, emit_events=False) if rows1 else None
     except Exception as exc:
         conn = connect(config.DB_PATH)
         try:
@@ -648,7 +735,7 @@ def baseline_setup_area(
                 conn,
                 area_id,
                 setup_status="failed",
-                module1_status="completed",
+                module1_status="failed",
                 module3_status="pending",
                 module2_status="pending",
                 active_listing_count=len(rows1),
@@ -668,9 +755,9 @@ def baseline_setup_area(
             area_id,
             listings_collected=len(rows1),
             new_count=0,
-            pages_checked=None,
-            total_pages_detected=None,
-            stop_reason="module1_setup_batched",
+            pages_checked=scan_result.get("pages_checked"),
+            total_pages_detected=scan_result.get("total_pages_detected"),
+            stop_reason=effective_stop_reason,
         )
         upsert_area_monitoring_state(
             conn,
@@ -693,6 +780,23 @@ def baseline_setup_area(
         conn.close()
     if on_log:
         on_log(f"Baseline setup batched: area_id={area_id} rows_module1={len(rows1)} detail_batch_size={batch_size} detail_batches_planned={planned_batches}")
+    detail_job_enqueued = bool(detail_job and detail_job.get("created", True))
+    _log_baseline_scan_result(
+        on_log,
+        search_id=area_id,
+        user_area_id=None,
+        scan_status=scan_status,
+        trusted_scan=True,
+        stop_reason=effective_stop_reason,
+        rows_scraped=len(rows_scraped),
+        rows_accepted=len(rows1),
+        rows_rejected=rows_rejected,
+        pages_checked=scan_result.get("pages_checked"),
+        total_pages_detected=scan_result.get("total_pages_detected"),
+        current_url_matches_target=True,
+        ingest_allowed=bool(rows1),
+        detail_job_enqueued=detail_job_enqueued,
+    )
     return {
         "status": "setup_batched",
         "area_id": area_id,
@@ -705,6 +809,22 @@ def baseline_setup_area(
         "detail_batches_enqueued": 1 if detail_job and detail_job.get("created", True) else 0,
         "detail_job": detail_job,
         "price_setup_enqueued": False,
+        "scan_status": scan_status,
+        "trusted_scan": True,
+        "stop_reason": effective_stop_reason,
+        "page_state": page_state or None,
+        "pages_checked": scan_result.get("pages_checked"),
+        "total_pages_detected": scan_result.get("total_pages_detected"),
+        "current_url": scan_result.get("current_url"),
+        "current_url_matches_target": True,
+        "rows_scraped": len(rows_scraped),
+        "rows_accepted": len(rows1),
+        "rows_rejected": rows_rejected,
+        "area_rejection_reasons": guard.get("rejection_reasons") or {},
+        "ingest_allowed": bool(rows1),
+        "detail_job_enqueued": detail_job_enqueued,
+        "empty_market": explicit_no_results,
+        "completed_empty": explicit_no_results,
     }
 
 

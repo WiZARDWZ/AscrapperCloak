@@ -834,7 +834,12 @@ def test_unknown_price_inference_sets_future_next_retry_at():
 
 
 def test_browser_recovery_logs_requested_and_completed(monkeypatch):
+    import importlib
+    import sys
     import browser_recovery
+    if not getattr(browser_recovery, "__file__", None):
+        sys.modules.pop("browser_recovery", None)
+        browser_recovery = importlib.import_module("browser_recovery")
 
     logs = []
     monkeypatch.setattr(
@@ -1065,7 +1070,7 @@ def test_production_area_setup_status_writes_use_supported_contract():
     assert offenders == []
 
 
-def test_baseline_true_no_results_marks_area_ready_and_activates(monkeypatch):
+def test_baseline_true_no_results_keeps_setup_preparing_and_notifications_disabled(monkeypatch):
     import monitor
 
     calls = []
@@ -1077,20 +1082,35 @@ def test_baseline_true_no_results_marks_area_ready_and_activates(monkeypatch):
     monkeypatch.setattr(monitor, "connect", lambda path: Conn())
     monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
     monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
-    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
-    monitor.module1_list_scraper.scrape_search.last_result = {"status": "no_results", "stop_reason": "no_results"}
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: (_ for _ in ()).throw(AssertionError("must not activate during Module1")))
+    monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("trusted zero result must not mutate existing lifecycle")))
+    monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
+    monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
+    target_url = "https://www.realestate.com.au/buy/in-empty,+nsw+2999/list-1"
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": [],
+        "scan_status": "valid_empty_result",
+        "trusted_scan": True,
+        "stop_reason": "no_results",
+        "page_state": "no_results",
+        "pages_checked": 1,
+        "total_pages_detected": None,
+        "current_url": target_url,
+    })
 
-    out = monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
+    out = monitor.baseline_setup_area(target_url)
 
-    assert out["status"] == "ready"
+    assert out["status"] == "setup_batched"
     assert out["active_listing_count"] == 0
     state_calls = [item for item in calls if item[0] == "state"]
-    assert state_calls[-1][2]["setup_status"] == "ready"
+    assert state_calls[-1][2]["setup_status"] == "preparing"
+    assert state_calls[-1][2]["module1_status"] == "completed"
     assert state_calls[-1][2]["active_listing_count"] == 0
     assert state_calls[-1][2]["inferred_price_count"] == 0
     assert state_calls[-1][2]["unknown_price_count"] == 0
-    assert ("activate", 42) in calls
+    assert any(item[0] == "detail_job" for item in calls)
+    assert out["empty_market"] is True
+    assert out["ingest_allowed"] is False
 
 
 def test_baseline_untrusted_zero_rows_fails_without_ready(monkeypatch):
@@ -1106,18 +1126,27 @@ def test_baseline_untrusted_zero_rows_fails_without_ready(monkeypatch):
     monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
     monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
     monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: (_ for _ in ()).throw(AssertionError("should not activate")))
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
-    monitor.module1_list_scraper.scrape_search.last_result = {"status": "render_timeout", "page_state": "render_timeout", "stop_reason": "render_timeout"}
+    target_url = "https://www.realestate.com.au/buy/in-empty,+nsw+2999/list-1"
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": [],
+        "scan_status": "technical_failure",
+        "trusted_scan": False,
+        "stop_reason": "render_timeout",
+        "page_state": "render_timeout",
+        "pages_checked": 1,
+        "current_url": target_url,
+        "retry_after_seconds": 60,
+    })
 
     try:
-        monitor.baseline_setup_area("https://example.test/buy/in-empty,+nsw+2999/list-1")
-    except RuntimeError as exc:
-        assert "Module1 returned 0 rows" in str(exc)
+        monitor.baseline_setup_area(target_url)
+    except RealEstateBlockedError as exc:
+        assert exc.reason == "render_timeout"
     else:
-        raise AssertionError("expected RuntimeError")
+        raise AssertionError("expected RealEstateBlockedError")
 
-    assert calls[-1]["setup_status"] == "failed"
-    assert calls[-1]["module1_status"] == "failed"
+    assert calls[-1]["setup_status"] == "preparing"
+    assert calls[-1]["module1_status"] == "retry_wait"
 
 
 def test_retryable_baseline_error_uses_supported_preparing_area_state(monkeypatch):
@@ -1162,7 +1191,24 @@ def test_ingest_failure_uses_failed_setup_status_and_preserves_reason(monkeypatc
     monkeypatch.setattr(monitor, "connect", lambda path: Conn())
     monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 42)
     monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows1)
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": rows1,
+        "scan_status": "ok",
+        "trusted_scan": True,
+        "stop_reason": "reached_total_pages",
+        "page_state": "listings",
+        "pages_checked": 1,
+        "total_pages_detected": 1,
+        "current_url": "https://www.realestate.com.au/buy/in-area,+nsw+2999/list-1",
+    })
+    monkeypatch.setattr(monitor, "apply_target_area_guard", lambda rows, search_url, current_url=None: {
+        "accepted_rows": rows,
+        "rejected_rows": [],
+        "rejection_reasons": {},
+        "trusted": True,
+        "untrusted_reason": None,
+        "current_url_ok": True,
+    })
     monkeypatch.setattr(monitor.module1_list_scraper, "save_results", lambda rows, out_dir=None: (str(tmp_path / "m1.csv"), str(json1)))
     monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (str(tmp_path / "m3.csv"), str(json3)))
     monitor.module3_enrich_details.module3_run.last_result = {"status": "completed", "success_count": 1}
@@ -1171,7 +1217,7 @@ def test_ingest_failure_uses_failed_setup_status_and_preserves_reason(monkeypatc
     monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ingest boom")))
 
     try:
-        monitor.baseline_setup_area("https://example.test/buy/in-area,+nsw+2999/list-1")
+        monitor.baseline_setup_area("https://www.realestate.com.au/buy/in-area,+nsw+2999/list-1")
     except RuntimeError as exc:
         assert "ingest boom" in str(exc)
     else:
@@ -1476,7 +1522,24 @@ def test_large_baseline_orchestration_batches_detail_without_inline_module3_or_m
     monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: calls.append(("ingest", k)) or 77)
     monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
     monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": rows,
+        "scan_status": "ok",
+        "trusted_scan": True,
+        "stop_reason": "max_pages_reached",
+        "page_state": "listings",
+        "pages_checked": 50,
+        "total_pages_detected": 60,
+        "current_url": "https://www.realestate.com.au/buy/in-yadboro,+nsw+2539/list-50",
+    })
+    monkeypatch.setattr(monitor, "apply_target_area_guard", lambda guarded_rows, search_url, current_url=None: {
+        "accepted_rows": guarded_rows,
+        "rejected_rows": [],
+        "rejection_reasons": {},
+        "trusted": True,
+        "untrusted_reason": None,
+        "current_url_ok": True,
+    })
     monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
     monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
 
@@ -1674,7 +1737,24 @@ Inspection tomorrow"""
     monkeypatch.setattr(monitor, "ingest_full_rows", fake_ingest)
     monkeypatch.setattr(monitor.db_layer, "mark_search_baseline_completed", lambda conn, search_id, **kwargs: calls.append(("baseline_completed", search_id, kwargs)))
     monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda conn, search_id, **kwargs: calls.append(("detail_job", search_id, kwargs)) or {"created": True})
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: rows)
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": rows,
+        "scan_status": "ok",
+        "trusted_scan": True,
+        "stop_reason": "reached_total_pages",
+        "page_state": "listings",
+        "pages_checked": 1,
+        "total_pages_detected": 1,
+        "current_url": "https://www.realestate.com.au/buy/in-rushcutters-bay,+nsw+2011/list-1",
+    })
+    monkeypatch.setattr(monitor, "apply_target_area_guard", lambda guarded_rows, search_url, current_url=None: {
+        "accepted_rows": guarded_rows,
+        "rejected_rows": [],
+        "rejection_reasons": {},
+        "trusted": True,
+        "untrusted_reason": None,
+        "current_url_ok": True,
+    })
     monkeypatch.setattr(monitor.module3_enrich_details, "module3_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module3 must not run inline")))
     monkeypatch.setattr(monitor.module2_infer_prices, "module2_run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Module2 must not run inline")))
 
@@ -2427,7 +2507,7 @@ def test_running_job_cancelled_during_worker_success_is_not_marked_succeeded(mon
     assert enqueued_next == []
 
 
-def test_trusted_wrong_suburb_empty_baseline_marks_ready_without_ingest_or_detail(monkeypatch):
+def test_wrong_suburb_empty_baseline_is_rejected_without_ingest_or_detail(monkeypatch):
     import monitor
 
     calls = []
@@ -2439,21 +2519,26 @@ def test_trusted_wrong_suburb_empty_baseline_marks_ready_without_ingest_or_detai
     monkeypatch.setattr(monitor, "connect", lambda path: Conn())
     monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
     monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda conn, area_id, **kwargs: calls.append(("state", area_id, kwargs)))
-    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: calls.append(("activate", area_id)))
+    monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda conn, area_id: (_ for _ in ()).throw(AssertionError("wrong area must not activate")))
     monkeypatch.setattr(monitor, "ingest_full_rows", lambda *a, **k: (_ for _ in ()).throw(AssertionError("wrong-suburb rows must not persist")))
     monkeypatch.setattr(monitor.db_layer, "enqueue_setup_detail_baseline_job", lambda *a, **k: (_ for _ in ()).throw(AssertionError("detail must be skipped for empty exact-area baseline")))
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
-    monitor.module1_list_scraper.scrape_search.last_result = {"status": "trusted_empty_exact_area", "trusted_scan": True, "rows_area_rejected": 26, "stop_reason": "wrong_suburb_same_postcode"}
+    target_url = "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1"
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": [],
+        "scan_status": "skipped_untrusted",
+        "trusted_scan": False,
+        "stop_reason": "wrong_area",
+        "page_state": "listings",
+        "pages_checked": 1,
+        "current_url": target_url,
+    })
 
-    out = monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+    with pytest.raises(RuntimeError):
+        monitor.baseline_setup_area(target_url)
 
-    assert out["status"] == "ready"
-    assert out["completed_empty"] is True
-    assert out["detail_batches_enqueued"] == 0
-    assert out["price_setup_enqueued"] is False
-    assert ("activate", 77) in calls
     state_call = [call for call in calls if call[0] == "state"][-1]
-    assert state_call[2]["active_listing_count"] == 0
+    assert state_call[2]["setup_status"] == "failed"
+    assert state_call[2]["module1_status"] == "failed"
 
 
 def test_blocked_zero_rows_does_not_become_trusted_empty(monkeypatch):
@@ -2468,11 +2553,21 @@ def test_blocked_zero_rows_does_not_become_trusted_empty(monkeypatch):
     monkeypatch.setattr(monitor, "get_or_create_area", lambda conn, url: 77)
     monkeypatch.setattr(monitor, "upsert_area_monitoring_state", lambda *a, **k: None)
     monkeypatch.setattr(monitor, "activate_area_subscriptions", lambda *a, **k: (_ for _ in ()).throw(AssertionError("blocked page must not activate")))
-    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search", lambda *a, **k: [])
-    monitor.module1_list_scraper.scrape_search.last_result = {"status": "partial_blocked", "trusted_scan": False, "stop_reason": "blocked_kpsdk"}
+    target_url = "https://www.realestate.com.au/buy/in-noona,+nsw+2835/list-1"
+    monkeypatch.setattr(monitor.module1_list_scraper, "scrape_search_with_result", lambda *a, **k: {
+        "rows": [],
+        "scan_status": "partial_blocked",
+        "trusted_scan": False,
+        "stop_reason": "blocked_kpsdk",
+        "page_state": "blocked_kpsdk",
+        "pages_checked": 1,
+        "current_url": target_url,
+        "blocked_reason": "blocked_kpsdk",
+        "retry_after_seconds": 60,
+    })
 
-    with pytest.raises(RuntimeError):
-        monitor.baseline_setup_area("https://example.test/buy/in-noona,+nsw+2835/list-1")
+    with pytest.raises(RealEstateBlockedError):
+        monitor.baseline_setup_area(target_url)
 
 
 def test_cloak_partial_initialization_failures_cleanup_lock(monkeypatch, tmp_path):

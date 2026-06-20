@@ -241,6 +241,20 @@ class MonitoringRefactorTests(unittest.TestCase):
                 calls.append("module1")
                 return rows1
 
+            def scrape_with_result(*args, **kwargs):
+                return {
+                    "rows": scrape(*args, **kwargs),
+                    "scan_status": "ok",
+                    "trusted_scan": True,
+                    "stop_reason": "reached_total_pages",
+                    "pages_checked": 1,
+                    "total_pages_detected": 1,
+                    "current_url": "https://www.realestate.com.au/buy/in-yadboro,+nsw+2539/list-1",
+                    "blocked_reason": None,
+                    "retry_after_seconds": None,
+                    "page_state": "listings",
+                }
+
             def save(rows, out_dir):
                 with open(json1, "w", encoding="utf-8") as f:
                     json.dump(rows, f)
@@ -266,12 +280,28 @@ class MonitoringRefactorTests(unittest.TestCase):
                 mock.patch.object(monitor, "ingest_full_rows", return_value=77),
                 mock.patch.object(monitor, "upsert_price_inference_state"),
                 mock.patch.object(monitor.db_layer, "enqueue_setup_detail_baseline_job", return_value={"created": True, "JobType": "setup_detail_baseline"}),
-                mock.patch.object(monitor.module1_list_scraper, "scrape_search", side_effect=scrape),
+                mock.patch.object(
+                    monitor.module1_list_scraper,
+                    "scrape_search_with_result",
+                    side_effect=scrape_with_result,
+                ),
+                mock.patch.object(
+                    monitor,
+                    "apply_target_area_guard",
+                    return_value={
+                        "accepted_rows": rows1,
+                        "rejected_rows": [],
+                        "rejection_reasons": {},
+                        "trusted": True,
+                        "untrusted_reason": None,
+                        "current_url_ok": True,
+                    },
+                ),
                 mock.patch.object(monitor.module1_list_scraper, "save_results", side_effect=save),
                 mock.patch.object(monitor.module3_enrich_details, "module3_run", side_effect=module3_run),
                 mock.patch.object(monitor.module2_infer_prices, "module2_run", side_effect=module2_run),
             ]
-            with patches[0], patches[1], patches[2], patches[3] as state, patches[4], patches[5] as ingest, patches[6] as price_state, patches[7], patches[8], patches[9], patches[10], patches[11] as module2_mock:
+            with patches[0], patches[1], patches[2], patches[3] as state, patches[4], patches[5] as ingest, patches[6] as price_state, patches[7], patches[8], patches[9], patches[10], patches[11], patches[12] as module2_mock:
                 result = monitor.baseline_setup_area("https://example.test/search")
 
         return {
