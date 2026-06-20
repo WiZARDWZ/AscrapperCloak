@@ -4,7 +4,14 @@ from unittest import mock
 
 import browser_recovery
 import config
-from realestate_page_state import PageState, classify_detail_page, classify_search_page
+import realestate_page_state
+from realestate_page_state import (
+    PageState,
+    classify_detail_page,
+    classify_search_page,
+    wait_for_detail_page_state,
+    wait_for_search_page_state,
+)
 
 
 class FakeElement:
@@ -135,6 +142,35 @@ class RealEstatePageStateTests(unittest.TestCase):
         result = classify_detail_page(driver, timeout=1)
         self.assertEqual(result.state, PageState.CHROME_ERROR)
         self.assertFalse(result.is_usable)
+
+    def test_search_wait_returns_chrome_error_without_polling(self):
+        driver = FakeDriver(
+            url="chrome-error://chromewebdata/",
+            title="This site can't be reached",
+            body="The webpage might be temporarily down.",
+            html="<html><body>ERR_HTTP_RESPONSE_CODE_FAILURE</body></html>",
+        )
+
+        with mock.patch.object(realestate_page_state.time, "sleep") as sleep:
+            result, cards = wait_for_search_page_state(driver, timeout=25)
+
+        self.assertEqual(result.state, PageState.CHROME_ERROR)
+        self.assertEqual(cards, [])
+        sleep.assert_not_called()
+
+    def test_detail_wait_returns_chrome_error_without_polling(self):
+        driver = FakeDriver(
+            url="chrome-error://chromewebdata/",
+            title="This site can't be reached",
+            body="The webpage might be temporarily down.",
+            html="<html><body>ERR_HTTP_RESPONSE_CODE_FAILURE</body></html>",
+        )
+
+        with mock.patch.object(realestate_page_state.time, "sleep") as sleep:
+            result = wait_for_detail_page_state(driver, timeout=25)
+
+        self.assertEqual(result.state, PageState.CHROME_ERROR)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":
