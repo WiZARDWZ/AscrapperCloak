@@ -1,5 +1,15 @@
 # ascrapper
 
+## Runtime profiles
+
+Development now uses one explicit switch in `config.py`:
+
+```python
+RUNTIME_PROFILE = "windows_dev"  # or "ubuntu_prod"
+```
+
+Windows/PyCharm setup is documented in `docs/WINDOWS_DEV.md`. Ubuntu release steps are in `docs/UBUNTU_RELEASE.md`; the existing detailed deployment guide remains in `README_DEPLOY_UBUNTU.md`.
+
 ## Pipeline / Monitor
 - اجرای کامل: `python monitor.py --mode full --url "<AREA_SEARCH_URL>"`
 - چک سبک (فقط module1 + full_scan=False): `python monitor.py --mode light --pages 1 --url "<AREA_SEARCH_URL>"`

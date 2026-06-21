@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import sys
 import time
 
@@ -9,7 +8,8 @@ from chrome_options_helper import build_chrome_driver, cleanup_chrome_driver
 
 
 def main() -> int:
-    print(f"HEADLESS={os.getenv('HEADLESS', '0')}")
+    print(f"RUNTIME_PROFILE={config.RUNTIME_PROFILE}")
+    print(f"HEADLESS={int(config.HEADLESS)}")
     print(f"BROWSER_ENGINE={getattr(config, 'BROWSER_ENGINE', 'cloak')}")
     print(f"CLOAK_PROFILE_DIR={getattr(config, 'CLOAK_PROFILE_DIR', 'rea_profile')}")
     print(f"CLOAK_VIEWPORT={getattr(config, 'CLOAK_VIEWPORT_WIDTH', 1365)}x{getattr(config, 'CLOAK_VIEWPORT_HEIGHT', 768)}")

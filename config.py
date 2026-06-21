@@ -4,15 +4,87 @@ import platform
 import re
 import shutil
 from importlib.util import find_spec
+from pathlib import Path
 
-if find_spec("dotenv") is not None:
+# config.py
+PROJECT_ROOT = str(Path(__file__).resolve().parent)
+AREA_SEARCH_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
+
+# Primary local-development switch. Keep real credentials out of public commits.
+# Valid values: "windows_dev", "ubuntu_prod".
+RUNTIME_PROFILE = "windows_dev"
+RUNTIME_PROFILE = os.getenv("RUNTIME_PROFILE", RUNTIME_PROFILE).strip().lower()
+
+WINDOWS_DEV_CONFIG = {
+    "DB_DRIVER": "ODBC Driver 18 for SQL Server",
+    "DB_HOST": "localhost",
+    "DB_PORT": "",
+    "DB_NAME": "AScrapper",
+    "DB_USER": "",
+    "DB_PASSWORD": "",
+    "DB_ENCRYPT": "yes",
+    "DB_TRUST_SERVER_CERTIFICATE": "yes",
+    "DB_TIMEOUT": 30,
+    "DB_TRUSTED_CONNECTION": "yes",
+    # Local-only convenience fields. Do not commit real tokens/passwords to a public repository.
+    "TELEGRAM_BOT_TOKEN": "",
+    "OUTPUT_DIR": str(Path(PROJECT_ROOT) / "output"),
+    "LOG_DIR": str(Path(PROJECT_ROOT) / "logs"),
+    "RUNTIME_DIR": str(Path(PROJECT_ROOT) / "runtime"),
+    "CLOAK_PROFILE_DIR": str(Path(PROJECT_ROOT) / "runtime" / "rea-profile"),
+    "HEADLESS": False,
+    "CLOAK_HEADLESS": False,
+    "BROWSER_ENGINE": "cloak",
+    "CLOAK_VIEWPORT": (1365, 768),
+    "SCRAPER_LOG_LEVEL": "DEBUG",
+    "LOAD_DOTENV": False,
+}
+
+UBUNTU_PROD_CONFIG = {
+    "DB_DRIVER": "ODBC Driver 18 for SQL Server",
+    "DB_HOST": "localhost",
+    "DB_PORT": "",
+    "DB_NAME": "AScrapper",
+    "DB_USER": "",
+    "DB_PASSWORD": "",
+    "DB_ENCRYPT": "yes",
+    "DB_TRUST_SERVER_CERTIFICATE": "yes",
+    "DB_TIMEOUT": 30,
+    "DB_TRUSTED_CONNECTION": "no",
+    "TELEGRAM_BOT_TOKEN": "",
+    "OUTPUT_DIR": str(Path(PROJECT_ROOT) / "output"),
+    "LOG_DIR": str(Path(PROJECT_ROOT) / "logs"),
+    "RUNTIME_DIR": str(Path(PROJECT_ROOT) / "runtime"),
+    "CLOAK_PROFILE_DIR": str(Path(PROJECT_ROOT) / "runtime" / "rea-profile"),
+    "HEADLESS": False,
+    "CLOAK_HEADLESS": False,
+    "BROWSER_ENGINE": "cloak",
+    "CLOAK_VIEWPORT": (1365, 768),
+    "SCRAPER_LOG_LEVEL": "INFO",
+    "LOAD_DOTENV": True,
+}
+
+RUNTIME_PROFILES = {
+    "windows_dev": WINDOWS_DEV_CONFIG,
+    "ubuntu_prod": UBUNTU_PROD_CONFIG,
+}
+if RUNTIME_PROFILE not in RUNTIME_PROFILES:
+    raise ValueError(
+        f"RUNTIME_PROFILE must be one of {', '.join(sorted(RUNTIME_PROFILES))}; "
+        f"got {RUNTIME_PROFILE!r}"
+    )
+ACTIVE_RUNTIME_CONFIG = dict(RUNTIME_PROFILES[RUNTIME_PROFILE])
+
+# Ubuntu keeps the existing .env workflow. Windows/PyCharm uses visible Python
+# configuration by default; set LOAD_DOTENV=1 explicitly if a local .env is desired.
+_load_dotenv_default = bool(ACTIVE_RUNTIME_CONFIG["LOAD_DOTENV"])
+if find_spec("dotenv") is not None and (
+    os.getenv("LOAD_DOTENV", "1" if _load_dotenv_default else "0").strip().lower()
+    in {"1", "true", "yes", "y", "on"}
+):
     from dotenv import load_dotenv
 
     load_dotenv()
-
-# config.py
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-AREA_SEARCH_URL = "https://www.realestate.com.au/buy/in-petersham,+nsw+2049/list-1?activeSort=list-date"
 
 
 def _env_first(*names: str, default: str = "") -> str:
@@ -73,6 +145,14 @@ def _viewport_env(name: str, default_width: int, default_height: int) -> tuple[i
     return int(match.group(1)), int(match.group(2))
 
 
+def get_runtime_profile_config(profile: str | None = None) -> dict:
+    """Return a copy of one profile's explicit defaults for diagnostics/tests."""
+    name = str(profile or RUNTIME_PROFILE).strip().lower()
+    if name not in RUNTIME_PROFILES:
+        raise ValueError(f"Unknown runtime profile: {name!r}")
+    return dict(RUNTIME_PROFILES[name])
+
+
 def _windows_default_chrome_path() -> str:
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
@@ -85,22 +165,26 @@ def _windows_default_chrome_path() -> str:
 
 
 # Core paths/settings
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", ACTIVE_RUNTIME_CONFIG["TELEGRAM_BOT_TOKEN"])
 DB_PATH = os.getenv("DB_PATH", "realestate.db")
 # SQL Server connection settings
-DB_DRIVER = _env_first("DB_DRIVER", "SQLSERVER_DRIVER", default="ODBC Driver 18 for SQL Server")
-DB_HOST = _env_first("DB_HOST", "SQLSERVER_HOST", "SQLSERVER_SERVER", default="localhost")
-DB_PORT = _env_first("DB_PORT", "SQLSERVER_PORT", default="")
-DB_NAME = _env_first("DB_NAME", "SQLSERVER_DATABASE", default="AScrapper")
-DB_USER = _env_first("DB_USER", "SQLSERVER_USERNAME", default="")
-DB_PASSWORD = _env_first("DB_PASSWORD", "SQLSERVER_PASSWORD", default="")
-DB_ENCRYPT = _env_first("DB_ENCRYPT", "SQLSERVER_ENCRYPT", default="yes")
-DB_TRUST_SERVER_CERTIFICATE = _env_first("DB_TRUST_SERVER_CERTIFICATE", "SQLSERVER_TRUST_SERVER_CERTIFICATE", default="yes")
-DB_TIMEOUT = int(_env_first("DB_TIMEOUT", "SQLSERVER_TIMEOUT", default="30"))
+DB_DRIVER = _env_first("DB_DRIVER", "SQLSERVER_DRIVER", default=ACTIVE_RUNTIME_CONFIG["DB_DRIVER"])
+DB_HOST = _env_first("DB_HOST", "SQLSERVER_HOST", "SQLSERVER_SERVER", default=ACTIVE_RUNTIME_CONFIG["DB_HOST"])
+DB_PORT = _env_first("DB_PORT", "SQLSERVER_PORT", default=ACTIVE_RUNTIME_CONFIG["DB_PORT"])
+DB_NAME = _env_first("DB_NAME", "SQLSERVER_DATABASE", default=ACTIVE_RUNTIME_CONFIG["DB_NAME"])
+DB_USER = _env_first("DB_USER", "SQLSERVER_USERNAME", default=ACTIVE_RUNTIME_CONFIG["DB_USER"])
+DB_PASSWORD = _env_first("DB_PASSWORD", "SQLSERVER_PASSWORD", default=ACTIVE_RUNTIME_CONFIG["DB_PASSWORD"])
+DB_ENCRYPT = _env_first("DB_ENCRYPT", "SQLSERVER_ENCRYPT", default=ACTIVE_RUNTIME_CONFIG["DB_ENCRYPT"])
+DB_TRUST_SERVER_CERTIFICATE = _env_first(
+    "DB_TRUST_SERVER_CERTIFICATE",
+    "SQLSERVER_TRUST_SERVER_CERTIFICATE",
+    default=ACTIVE_RUNTIME_CONFIG["DB_TRUST_SERVER_CERTIFICATE"],
+)
+DB_TIMEOUT = int(_env_first("DB_TIMEOUT", "SQLSERVER_TIMEOUT", default=str(ACTIVE_RUNTIME_CONFIG["DB_TIMEOUT"])))
 DB_TRUSTED_CONNECTION = _env_first(
     "DB_TRUSTED_CONNECTION",
     "SQLSERVER_TRUSTED_CONNECTION",
-    default="yes" if os.name == "nt" and not DB_USER else "no",
+    default=ACTIVE_RUNTIME_CONFIG["DB_TRUSTED_CONNECTION"],
 )
 
 # Backward-compatible names used by the current codebase.
@@ -113,9 +197,10 @@ SQLSERVER_TRUSTED_CONNECTION = DB_TRUSTED_CONNECTION
 SQLSERVER_ENCRYPT = DB_ENCRYPT
 SQLSERVER_TRUST_SERVER_CERTIFICATE = DB_TRUST_SERVER_CERTIFICATE
 AUTO_APPROVE_TELEGRAM_USERS = os.getenv("AUTO_APPROVE_TELEGRAM_USERS", "true").lower() == "true"
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
-LOG_DIR = os.getenv("LOG_DIR", "logs")
-RUNTIME_DIR = os.getenv("RUNTIME_DIR", "runtime")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", ACTIVE_RUNTIME_CONFIG["OUTPUT_DIR"])
+LOG_DIR = os.getenv("LOG_DIR", ACTIVE_RUNTIME_CONFIG["LOG_DIR"])
+RUNTIME_DIR = os.getenv("RUNTIME_DIR", ACTIVE_RUNTIME_CONFIG["RUNTIME_DIR"])
+HEADLESS = _bool_env("HEADLESS", bool(ACTIVE_RUNTIME_CONFIG["HEADLESS"]))
 EXCEL_EXPORT_MODE = os.getenv("EXCEL_EXPORT_MODE", "normal").lower()
 if EXCEL_EXPORT_MODE not in {"normal", "debug"}:
     EXCEL_EXPORT_MODE = "normal"
@@ -161,7 +246,7 @@ def get_profile_settings(profile: str) -> dict:
         "EXTRA_CHROME_LIGHT_FLAGS": False,
         "MAX_PAGES_MODULE1": None,
         # for Linux runs with visible browser (HEADLESS=0), Xvfb should be used by runner/deploy scripts
-        "USE_XVFB": (os.name != "nt") and (os.getenv("HEADLESS", "0") == "0"),
+        "USE_XVFB": (os.name != "nt") and not HEADLESS,
     }
 
 
@@ -223,13 +308,22 @@ MODULE3_RETRY_SAME_LISTING_AFTER_429 = 1
 MODULE3_STOP_ON_429_ROTATION_LIMIT = False
 
 BROWSER_RECOVERY_ON_429 = True
-BROWSER_PROFILE_BASE_DIR = "rea_profile"
+BROWSER_PROFILE_BASE_DIR = os.getenv(
+    "BROWSER_PROFILE_BASE_DIR",
+    os.getenv(
+        "CLOAK_PROFILE_DIR",
+        os.getenv("CHROME_PROFILE_DIR", ACTIVE_RUNTIME_CONFIG["CLOAK_PROFILE_DIR"]),
+    ),
+)
 BROWSER_PROFILE_BACKUP_PREFIX = "rea_profile_429_backup_"
 BROWSER_PROFILE_GENERATED_PREFIX = "rea_profile_gen_"
 BROWSER_MAX_PROFILE_ROTATIONS_PER_RUN = 2
 BROWSER_COOLDOWN_ON_429_SECONDS = 60
 BROWSER_USE_RUNTIME_PROFILE_STATE = _bool_env("BROWSER_USE_RUNTIME_PROFILE_STATE", True)
-BROWSER_PROFILE_STATE_PATH = "output/browser_profile_state.json"
+BROWSER_PROFILE_STATE_PATH = os.getenv(
+    "BROWSER_PROFILE_STATE_PATH",
+    str(Path(OUTPUT_DIR) / "browser_profile_state.json"),
+)
 BROWSER_KILL_CHROME_ON_RECOVERY = False
 REA_RATE_LIMIT_BACKOFF_SECONDS = int(os.getenv("REA_RATE_LIMIT_BACKOFF_SECONDS", "21600"))
 BROWSER_BLOCK_GRACE_SECONDS = float(os.getenv("BROWSER_BLOCK_GRACE_SECONDS", "30"))
@@ -263,7 +357,7 @@ MAX_CONCURRENT_ENRICH_JOBS = PROFILE_SETTINGS["MAX_CONCURRENT_ENRICH"]
 MAX_PAGES_MODULE1 = PROFILE_SETTINGS["MAX_PAGES_MODULE1"] if PROFILE_SETTINGS["MAX_PAGES_MODULE1"] is not None else MAX_PAGES_MODULE1
 CHROME_WINDOW_SIZE = PROFILE_SETTINGS["CHROME_WINDOW_SIZE"]
 IMAGES_DISABLED = PROFILE_SETTINGS["IMAGES_DISABLED"]
-BROWSER_ENGINE = os.getenv("BROWSER_ENGINE", "cloak").strip().lower() or "cloak"
+BROWSER_ENGINE = os.getenv("BROWSER_ENGINE", ACTIVE_RUNTIME_CONFIG["BROWSER_ENGINE"]).strip().lower() or "cloak"
 _MODULE1_PAGINATION_NAV_MODE_DEFAULT = "click_next" if BROWSER_ENGINE == "cloak" else "direct_url"
 MODULE1_PAGINATION_NAV_MODE = os.getenv("MODULE1_PAGINATION_NAV_MODE", _MODULE1_PAGINATION_NAV_MODE_DEFAULT).strip().lower() or _MODULE1_PAGINATION_NAV_MODE_DEFAULT
 if MODULE1_PAGINATION_NAV_MODE not in {"click_next", "direct_url", "fresh_context_per_page"}:
@@ -276,8 +370,11 @@ _MODULE2_WINDOW_NAV_MODE_DEFAULT = "fresh_context_on_failure" if BROWSER_ENGINE 
 MODULE2_WINDOW_NAV_MODE = os.getenv("MODULE2_WINDOW_NAV_MODE", _MODULE2_WINDOW_NAV_MODE_DEFAULT).strip().lower() or _MODULE2_WINDOW_NAV_MODE_DEFAULT
 if MODULE2_WINDOW_NAV_MODE not in {"direct_url", "fresh_context_on_failure", "fresh_context_per_window"}:
     MODULE2_WINDOW_NAV_MODE = _MODULE2_WINDOW_NAV_MODE_DEFAULT
-CLOAK_PROFILE_DIR = os.getenv("CLOAK_PROFILE_DIR", os.getenv("CHROME_PROFILE_DIR", "rea_profile"))
-CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", _bool_env("HEADLESS", False))
+CLOAK_PROFILE_DIR = os.getenv(
+    "CLOAK_PROFILE_DIR",
+    os.getenv("CHROME_PROFILE_DIR", ACTIVE_RUNTIME_CONFIG["CLOAK_PROFILE_DIR"]),
+)
+CLOAK_HEADLESS = _bool_env("CLOAK_HEADLESS", HEADLESS)
 CLOAK_PROXY = _optional_str_env("CLOAK_PROXY")
 CLOAK_GEOIP = _bool_env("CLOAK_GEOIP", False)
 CLOAK_HUMANIZE = _bool_env("CLOAK_HUMANIZE", BROWSER_ENGINE == "cloak" and not CLOAK_HEADLESS)
@@ -286,7 +383,11 @@ CLOAK_HUMAN_CONFIG = _json_object_env("CLOAK_HUMAN_CONFIG_JSON")
 CLOAK_FINGERPRINT_SEED = _optional_str_env("CLOAK_FINGERPRINT_SEED")
 CLOAK_FINGERPRINT_PLATFORM = os.getenv("CLOAK_FINGERPRINT_PLATFORM", "windows")
 CLOAK_FINGERPRINT_STORAGE_QUOTA = _optional_str_env("CLOAK_FINGERPRINT_STORAGE_QUOTA")
-_CLOAK_VIEWPORT_DEFAULT = _viewport_env("CLOAK_VIEWPORT", 1365, 768)
+_CLOAK_VIEWPORT_DEFAULT = _viewport_env(
+    "CLOAK_VIEWPORT",
+    ACTIVE_RUNTIME_CONFIG["CLOAK_VIEWPORT"][0],
+    ACTIVE_RUNTIME_CONFIG["CLOAK_VIEWPORT"][1],
+)
 CLOAK_VIEWPORT_WIDTH = int(os.getenv("CLOAK_VIEWPORT_WIDTH", str(_CLOAK_VIEWPORT_DEFAULT[0])))
 CLOAK_VIEWPORT_HEIGHT = int(os.getenv("CLOAK_VIEWPORT_HEIGHT", str(_CLOAK_VIEWPORT_DEFAULT[1])))
 CLOAK_LOCALE = os.getenv("CLOAK_LOCALE", "en-AU")
@@ -317,7 +418,7 @@ NETWORK_DEBUG = _bool_env("NETWORK_DEBUG", False)
 NETWORK_DEBUG_TOP_N = int(os.getenv("NETWORK_DEBUG_TOP_N", "30"))
 USE_TEMP_CHROME_PROFILE = _bool_env("USE_TEMP_CHROME_PROFILE", False)
 USE_PERSISTENT_CHROME_PROFILE = _bool_env("USE_PERSISTENT_CHROME_PROFILE", True)
-CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", "rea_profile")
+CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", CLOAK_PROFILE_DIR)
 CHROME_PROFILE_DIRECTORY = os.getenv("CHROME_PROFILE_DIRECTORY", "Default")
 CLEAR_CHROME_CACHE_ON_START = False
 CLEAR_CHROME_CACHE_ON_EXIT = False
@@ -420,7 +521,7 @@ BASELINE_PROGRESS_LOG_INTERVAL = int(os.getenv("BASELINE_PROGRESS_LOG_INTERVAL",
 BASELINE_DETAIL_MAX_SECONDS_PER_JOB = _optional_int_env("BASELINE_DETAIL_MAX_SECONDS_PER_JOB", None)
 SETUP_DETAIL_BATCH_DELAY_SECONDS = int(os.getenv("SETUP_DETAIL_BATCH_DELAY_SECONDS", "30"))
 SETUP_DETAIL_BATCH_DELAY_JITTER_SECONDS = int(os.getenv("SETUP_DETAIL_BATCH_DELAY_JITTER_SECONDS", "30"))
-SCRAPER_LOG_LEVEL = os.getenv("SCRAPER_LOG_LEVEL", "INFO").upper()
+SCRAPER_LOG_LEVEL = os.getenv("SCRAPER_LOG_LEVEL", ACTIVE_RUNTIME_CONFIG["SCRAPER_LOG_LEVEL"]).upper()
 SCRAPER_VERBOSE_PAGE_STATE = os.getenv("SCRAPER_VERBOSE_PAGE_STATE", "0").lower() in {"1", "true", "yes", "on"}
 SCRAPER_VERBOSE_NETWORK = os.getenv("SCRAPER_VERBOSE_NETWORK", "0").lower() in {"1", "true", "yes", "on"}
 SCRAPER_VERBOSE_TARGET_IDS = os.getenv("SCRAPER_VERBOSE_TARGET_IDS", "0").lower() in {"1", "true", "yes", "on"}
@@ -454,7 +555,11 @@ def mask_sensitive_text(value) -> str:
 
 
 def is_production() -> bool:
-    return _bool_env("PRODUCTION", False) or os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}
+    return (
+        RUNTIME_PROFILE == "ubuntu_prod"
+        or _bool_env("PRODUCTION", False)
+        or os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"}
+    )
 
 
 def db_uses_trusted_connection() -> bool:
@@ -499,6 +604,7 @@ def effective_chrome_binary() -> str:
 
 def safe_runtime_summary() -> dict:
     return {
+        "runtime_profile": RUNTIME_PROFILE,
         "python": platform.python_version(),
         "platform": platform.platform(),
         "db_host": DB_HOST,
@@ -508,10 +614,11 @@ def safe_runtime_summary() -> dict:
         "db_encrypt": DB_ENCRYPT,
         "db_trust_server_certificate": DB_TRUST_SERVER_CERTIFICATE,
         "db_trusted_connection": DB_TRUSTED_CONNECTION,
-        "headless": os.getenv("HEADLESS", "0"),
+        "headless": str(HEADLESS).lower(),
         "perf_profile": PERF_PROFILE,
         "output_dir": OUTPUT_DIR,
         "log_dir": LOG_DIR,
+        "runtime_dir": RUNTIME_DIR,
         "browser_engine": BROWSER_ENGINE,
         "operational_price_monitoring_enabled": str(ENABLE_OPERATIONAL_PRICE_MONITORING).lower(),
         "cloak_profile_dir": CLOAK_PROFILE_DIR,

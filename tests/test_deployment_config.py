@@ -13,6 +13,13 @@ from tools import cloak_smoke_common
 
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_runtime_summary_exposes_resolved_profile_and_paths(self):
+        summary = config.safe_runtime_summary()
+        self.assertEqual(summary["runtime_profile"], config.RUNTIME_PROFILE)
+        self.assertEqual(summary["runtime_dir"], config.RUNTIME_DIR)
+        self.assertEqual(summary["output_dir"], config.OUTPUT_DIR)
+        self.assertEqual(summary["headless"], str(config.HEADLESS).lower())
+
     def test_env_can_disable_resource_blocking(self):
         overrides = {
             "LOW_BANDWIDTH_MODE": "0",

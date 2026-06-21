@@ -218,10 +218,6 @@ def _bool(value) -> bool:
 
 
 def _cloak_headless() -> bool:
-    if os.getenv("CLOAK_HEADLESS") is not None:
-        return _bool(os.getenv("CLOAK_HEADLESS"))
-    if os.getenv("HEADLESS") is not None:
-        return _bool(os.getenv("HEADLESS", "0"))
     return bool(getattr(config, "CLOAK_HEADLESS", False))
 
 

@@ -145,6 +145,7 @@ ensure_env_file() {
   echo "[env] Creating .env if missing and appending missing keys only..."
   run_as_user "mkdir -p '$APP_DIR' && touch '$ENV_FILE' && chmod 600 '$ENV_FILE'"
   ensure_env_key "TELEGRAM_BOT_TOKEN" ""
+  ensure_env_key "RUNTIME_PROFILE" "ubuntu_prod"
   ensure_env_key "DB_HOST" "127.0.0.1"
   ensure_env_key "DB_PORT" "1433"
   ensure_env_key "DB_NAME" ""

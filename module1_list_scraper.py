@@ -104,7 +104,7 @@ def is_linux() -> bool:
 
 
 def is_headless_enabled() -> bool:
-    return os.getenv("HEADLESS", "0") == "1"
+    return bool(config.HEADLESS)
 
 
 def _verbose_page_state_enabled() -> bool:
